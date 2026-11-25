@@ -42,15 +42,38 @@ module enabled and a real mount, and `fskit/scripts/package.sh`, which needs the
 Developer ID certificate. A release still needs a person.
 
 `.github/workflows/ci.yml` runs the same script on `macos-26` and caches the
-toolchains. There is no git remote yet, so nothing runs it automatically; until
-there is one, `tools/install-hooks.sh` installs a pre-push hook that runs
-`tools/ci.sh --quick`.
+toolchains. The fork at `github.com/thechrisu/ttntfs` runs it on every push
+to main. `tools/install-hooks.sh` installs a pre-push hook that runs
+`tools/pre-push.sh` (below).
 
 Why any of this exists: until 2026-09-14 nothing ran these suites unless someone
 typed the command, and two failures sat unnoticed for a day each. `logfile_unit`
 hung inside ASan's own initialiser, so its 243 checks never executed; and a
 stale header aborted `ntfslog` on every fixture. Both were caught by tests that
 already existed. A test nobody runs is not coverage.
+
+## Fast local checks before pushing: `tools/pre-push.sh`
+
+```
+tools/pre-push.sh    # darwin cross-check, shellcheck, python, YAML, ci.sh --quick
+```
+
+This is what the pre-push hook runs, and it is the answer to "for every CI
+check that fails, is there a fast local check". The stages, fast first:
+
+| Stage | What it catches |
+|---|---|
+| `tools/check-darwin.sh` | macOS-only build breakage the Linux build cannot see. Preprocesses the whole C tree for `x86_64-apple-darwin` with no SDK (system headers are empty stubs in `tools/darwin-stubs/` that deliberately define nothing). It caught the `__GLIBC_PREREQ` failure of CI run 45661009566 — verified by negative test: restoring the buggy header makes it fail. Preprocess-only: it does not type-check or compile, which still needs the macOS SDK and stays CI's job. Requires clang. |
+| shellcheck on `tools/*.sh` | shell bugs in the test infrastructure itself |
+| `python3 -m py_compile` on `tools/*.py` | syntax errors in the guard / push helpers |
+| YAML parse of `.github/workflows/*.yml` | a workflow that GitHub would refuse |
+| `tools/ci.sh --quick` | toolchain + ctest + UBSan (skips the fixture suite) |
+
+Not in the hook, by design: the fixture suite (`tools/run-tests.sh all`) is
+slow — run it explicitly before pushing a change to the core; the Swift unit
+tests, the app build, and the mount test need xcodebuild / signing / a real
+mount and are CI-only or manual. See `docs/GAPS.md` §6 for the full
+CI-stage-to-local-check mapping.
 
 ## Checking what we wrote: ntfsprogs-plus
 

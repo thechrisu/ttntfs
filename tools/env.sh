@@ -1,4 +1,5 @@
 # Shared environment for the tools/ scripts. Source it, do not run it.
+# shellcheck shell=bash
 #
 #   . "$(dirname "$0")/env.sh"
 #
@@ -47,7 +48,8 @@ ensure_autotools() {
 	# GitHub macOS runner -- fails here with everything installed.
 	if command -v autoreconf >/dev/null 2>&1 && command -v glibtoolize >/dev/null 2>&1 &&
 	   ! command -v libtoolize >/dev/null 2>&1; then
-		export LIBTOOLIZE="$(command -v glibtoolize)"
+		LIBTOOLIZE="$(command -v glibtoolize)"
+		export LIBTOOLIZE
 		return 0
 	fi
 	if command -v autoreconf >/dev/null 2>&1 && command -v libtoolize >/dev/null 2>&1; then
@@ -83,7 +85,8 @@ ensure_autotools() {
 # tools/ is modified. Set NTFS_CMAKE=/path/to/cmake to override.
 ensure_cmake() {
 	if [ -n "${NTFS_CMAKE:-}" ]; then
-		export PATH="$(dirname "$NTFS_CMAKE"):$PATH"
+		PATH="$(dirname "$NTFS_CMAKE"):$PATH"
+		export PATH
 	fi
 	if command -v cmake >/dev/null 2>&1; then return 0; fi
 	local py

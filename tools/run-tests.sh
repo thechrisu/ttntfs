@@ -160,8 +160,13 @@ build_core() {
 	local bdir="$NTFS_TOOLS_DIR/build/core"
 	note "no $NTFS_ROOT/build/libntfscore.a; building the core into $bdir"
 	ensure_cmake || die "no cmake"
-	run core-configure cmake -S "$NTFS_ROOT" -B "$bdir" -DNTFS_BUILD_TESTS=OFF \
-		$([ "$SANITIZE" = 1 ] && echo -DNTFS_SANITIZE=ON) || { cat "$LOGDIR/core-configure.log"; die "core configure failed"; }
+	if [ "$SANITIZE" = 1 ]; then
+		run core-configure cmake -S "$NTFS_ROOT" -B "$bdir" -DNTFS_BUILD_TESTS=OFF \
+			-DNTFS_SANITIZE=ON || { cat "$LOGDIR/core-configure.log"; die "core configure failed"; }
+	else
+		run core-configure cmake -S "$NTFS_ROOT" -B "$bdir" -DNTFS_BUILD_TESTS=OFF \
+			|| { cat "$LOGDIR/core-configure.log"; die "core configure failed"; }
+	fi
 	run core-build cmake --build "$bdir" -j "$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" || {
 		tail -40 "$LOGDIR/core-build.log"; die "core build failed (see $LOGDIR/core-build.log)"; }
 	CORE_LIB="$bdir/libntfscore.a"

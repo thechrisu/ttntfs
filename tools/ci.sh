@@ -20,7 +20,7 @@
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 QUICK=0
 for a in "$@"; do
