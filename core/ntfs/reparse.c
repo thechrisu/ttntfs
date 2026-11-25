@@ -677,6 +677,16 @@ bool ntfs_symlink_target_is_windows_safe(const __le16 *target, int len)
  * ni->target is filled with the POSIX form so that getattr reports the right
  * size and readlink takes the fast path, matching the WSL setter.
  */
+bool ntfs_win_symlink_fits(int target_len)
+{
+	/* sizeof(*reparse) + sizeof(*sl) + 2 * (target_len * 2):
+	 * header, symlink header, substitute + print name in UTF-16. */
+	return target_len > 0 &&
+	       (s64)sizeof(struct reparse_point) +
+	       (s64)sizeof(struct ntfs_win_symlink) +
+	       (s64)target_len * 4 <= NTFS_MAX_REPARSE_DATA_BUFFER_SIZE;
+}
+
 int ntfs_reparse_set_win_symlink(struct ntfs_inode *ni,
 		const __le16 *target, int target_len)
 {
@@ -688,6 +698,11 @@ int ntfs_reparse_set_win_symlink(struct ntfs_inode *ni,
 
 	if (target_len <= 0 || target_len > 4096)
 		return -EINVAL;
+	/* Refuse before anything is written: a buffer past the 16 KiB
+	 * reparse limit used to be attempted anyway, the attribute write
+	 * failed halfway, and the volume was marked read-only. */
+	if (!ntfs_win_symlink_fits(target_len))
+		return -ENAMETOOLONG;
 	ulen = ntfs_ucstonls(ni->vol, target, target_len, &utarget, 0);
 	if (ulen <= 0)
 		return -EINVAL;

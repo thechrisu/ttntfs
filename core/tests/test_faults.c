@@ -54,6 +54,16 @@
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
 
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
+
 static int failures, checks;
 #define CHECK(cond) do {						\
 	checks++;							\
@@ -89,7 +99,7 @@ static int make_image(const char *tag, unsigned mb)
 {
 	char cmd[2048];
 
-	snprintf(img, sizeof(img), "/tmp/ttntfs-faults-%d-%s.img", (int)getpid(), tag);
+	snprintf(img, sizeof(img), "%s/ttntfs-faults-%d-%s.img", scratch_dir(), (int)getpid(), tag);
 	snprintf(cmd, sizeof(cmd),
 		 "dd if=/dev/zero of='%s' bs=1m count=%u >/dev/null 2>&1 && "
 		 "'%s' -Q -F -L FAULT '%s' >/dev/null 2>&1",
@@ -119,7 +129,7 @@ static void check_image(const char *tag)
 	char cmd[2048], out[1024];
 	int rc;
 
-	snprintf(out, sizeof(out), "/tmp/ttntfs-faults-%d-fsck.txt", (int)getpid());
+	snprintf(out, sizeof(out), "%s/ttntfs-faults-%d-fsck.txt", scratch_dir(), (int)getpid());
 	snprintf(cmd, sizeof(cmd), "'%s' -n '%s' >'%s' 2>&1",
 		 tool("NTFS_NTFSCK", "tools/.local-plus/sbin/ntfsck"), img, out);
 	rc = system(cmd);
@@ -573,7 +583,7 @@ static void test_not_ntfs_is_einval(void)
 		ntfs_volume_t *vol = NULL;
 		int err;
 
-		snprintf(img, sizeof(img), "/tmp/ttntfs-faults-%d-notntfs.img", (int)getpid());
+		snprintf(img, sizeof(img), "%s/ttntfs-faults-%d-notntfs.img", scratch_dir(), (int)getpid());
 		snprintf(cmd, sizeof(cmd),
 			 "dd if=/dev/zero of='%s' bs=1m count=8 >/dev/null 2>&1", img);
 		if (system(cmd) != 0) {

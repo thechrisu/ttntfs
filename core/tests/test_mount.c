@@ -39,6 +39,16 @@
 #include "ntfs_logfile.h"
 #include "logfile_layout.h"
 
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
+
 static int failures, checks;
 #define CHECK(cond) do {						\
 	checks++;							\
@@ -66,7 +76,7 @@ static int copy_fixture(const char *name)
 	ssize_t n;
 
 	snprintf(src, sizeof(src), "%s/%s", images_dir(), name);
-	snprintf(scratch, sizeof(scratch), "/tmp/ttntfs-test-%d-%s", (int)getpid(), name);
+	snprintf(scratch, sizeof(scratch), "%s/ttntfs-test-%d-%s", scratch_dir(), (int)getpid(), name);
 	in = open(src, O_RDONLY);
 	if (in < 0)
 		return -1;

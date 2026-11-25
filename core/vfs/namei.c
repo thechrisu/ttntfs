@@ -532,7 +532,8 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			 * wsl_symlinks mount option forces the old behaviour.
 			 */
 			if (!NVolWslSymlinks(vol) &&
-			    ntfs_symlink_target_is_windows_safe(target, target_len))
+			    ntfs_symlink_target_is_windows_safe(target, target_len) &&
+			    ntfs_win_symlink_fits(target_len))
 				err = ntfs_reparse_set_win_symlink(ni, target, target_len);
 			else
 				err = ntfs_reparse_set_wsl_symlink(ni, target, target_len);
@@ -1240,6 +1241,7 @@ struct inode *ntfs_vfs_create(struct inode *dir, const char *name, int len,
 	 */
 	dir_link = S_ISLNK(mode) && !NVolWslSymlinks(vol) &&
 		   ntfs_symlink_target_is_windows_safe(utarget, utarget_len) &&
+		   ntfs_win_symlink_fits(utarget_len) &&
 		   symlink_target_is_dir_here(dir, target);
 
 	ni = __ntfs_create(NULL, dir, uname, uname_len, mode, 0, utarget,

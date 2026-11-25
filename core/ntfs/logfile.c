@@ -53,11 +53,19 @@ static bool ntfs_check_restart_page_header(struct inode *vi,
 		ntfs_error(vi->i_sb, "Found restart area in incorrect position in LogFile.");
 		return false;
 	}
-	/* We only know how to handle version 1.1. */
-	if (le16_to_cpu(rp->major_ver) != 1 ||
-	    le16_to_cpu(rp->minor_ver) != 1) {
+	/* We only know how to handle versions 1.1 and 2.0. Version 2.0 is
+	 * what a mounted Windows 8/10/11 volume carries, i.e. every dirty
+	 * volume from a modern PC; its restart page layout is the same one
+	 * the checks below validate, which is why ntfsprogs-plus accepts it
+	 * too. The port's own logfile parser (core/logfile) already handles
+	 * 2.0, so rejecting it here only made every mount of a modern
+	 * volume log an error. */
+	if ((le16_to_cpu(rp->major_ver) != 1 ||
+	     le16_to_cpu(rp->minor_ver) != 1) &&
+	    (le16_to_cpu(rp->major_ver) != 2 ||
+	     le16_to_cpu(rp->minor_ver) != 0)) {
 		ntfs_error(vi->i_sb,
-			"LogFile version %i.%i is not supported.  (This driver supports version 1.1 only.)",
+			"LogFile version %i.%i is not supported.  (This driver supports versions 1.1 and 2.0 only.)",
 			(int)le16_to_cpu(rp->major_ver),
 			(int)le16_to_cpu(rp->minor_ver));
 		return false;

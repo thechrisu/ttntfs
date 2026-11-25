@@ -99,13 +99,25 @@ target_link_libraries(ntfsplatform PUBLIC Threads::Threads)
 add_subdirectory(core)
 
 # ---- merged archive: build/libntfscore.a -----------------------------------
+# Apple libtool is macOS-only and does not exist on Linux (GNU libtool is a
+# different tool with a different CLI). On non-Apple, merge with GNU ar's
+# MRI script via tools/merge-static-libs.sh.
 set(NTFS_MERGED_LIB ${CMAKE_BINARY_DIR}/libntfscore.a)
-add_custom_command(
-  OUTPUT ${NTFS_MERGED_LIB}
-  COMMAND libtool -static -o ${NTFS_MERGED_LIB} $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
-  DEPENDS ntfscore ntfsplatform
-  COMMENT "Merging libntfscore.a"
-  VERBATIM)
+if(APPLE)
+  add_custom_command(
+    OUTPUT ${NTFS_MERGED_LIB}
+    COMMAND libtool -static -o ${NTFS_MERGED_LIB} $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
+    DEPENDS ntfscore ntfsplatform
+    COMMENT "Merging libntfscore.a"
+    VERBATIM)
+else()
+  add_custom_command(
+    OUTPUT ${NTFS_MERGED_LIB}
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/merge-static-libs.sh ${NTFS_MERGED_LIB} $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
+    DEPENDS ntfscore ntfsplatform ${CMAKE_CURRENT_SOURCE_DIR}/tools/merge-static-libs.sh
+    COMMENT "Merging libntfscore.a"
+    VERBATIM)
+endif()
 add_custom_target(ntfscore_merged ALL DEPENDS ${NTFS_MERGED_LIB})
 
 # ---- tests -----------------------------------------------------------------

@@ -388,7 +388,11 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 					ntfs_error(vol->sb, "Failed to allocate memory.");
 					goto out;
 				}
-				memcpy(rl2, rl, rlsize);
+				/* rl is NULL and rlsize is 0 on the first
+				 * allocation: memcpy(NULL, 0) is UB and
+				 * UBSan flags it (nonnull). */
+				if (rlsize)
+					memcpy(rl2, rl, rlsize);
 				kvfree(rl);
 				rl = rl2;
 				rlsize += PAGE_SIZE;

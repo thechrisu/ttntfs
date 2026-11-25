@@ -7,7 +7,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only pushes must not spend macOS minutes (10x multiplier).
+    paths-ignore: ['docs/**', '**.md']
   pull_request:
+    paths-ignore: ['docs/**', '**.md']
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +18,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # CI minutes are precious (user, 2026-11-25): at most 20% of the monthly
+  # included minutes may go to this repo's macOS runs. This job runs first,
+  # on ubuntu-latest (seconds, ~1 billed minute), and the macOS jobs only
+  # run when it allows. tools/ci-budget-guard.py does the counting from
+  # the Actions API; it fails safe (deny) on any API error, and allows
+  # unconditionally for a public repo, where GitHub does not bill standard
+  # runners at all. See the script header for the caveats (calendar month
+  # vs billing month, this repo only).
+  budget-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The guard reads this workflow's runs via the Actions API, and the
+    # checkout step reads the repo. Explicit, so a restrictive repo-wide
+    # default token permission cannot silently make the guard fail safe.
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      allow: ${{ steps.guard.outputs.allow }}
+      used_billed_minutes: ${{ steps.guard.outputs.used_billed_minutes }}
+      budget_billed_minutes: ${{ steps.guard.outputs.budget_billed_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the 20% CI minutes budget
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Billing day-of-month from github.com/settings/billing (1 = the
+          # calendar month). Set this to the account's real billing day.
+          BILLING_DAY: "1"
+        run: python3 tools/ci-budget-guard.py
+
   checks:
+    needs: budget-guard
+    if: needs.budget-guard.outputs.allow == 'true'
     # macos-26 is arm64 and generally available (it is what macos-latest points
     # at). Pinned rather than `latest` so an image roll cannot change what the
     # driver is built against without a commit. It must be macOS 26: the
@@ -54,6 +92,66 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-logs
+          path: |
+            tools/build/test-logs
+            tools/build/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Experimental headless mount test. Manual trigger only (Actions >
+  # CI > Run workflow), and allowed to fail: it cannot pass until the app
+  # is signed with the managed com.apple.developer.fskit.fsmodule
+  # entitlement (fskit/README.md, "Signing and enabling the extension").
+  # Stock runners have no signing identity, fskitd refuses an unsigned
+  # extension, and mount-test.sh then fails at step 1 (not registered).
+  # The enable step itself is scriptable (fskit/scripts/enable-module.sh
+  # edits the enabled-modules list directly — the System Settings toggle
+  # is broken for third-party modules on macOS 26.3), so signing is the
+  # only remaining gate. The day signing secrets exist, this job is the
+  # whole test: build, install, enable, mount --rw, exercise, ntfsck.
+  # Until then it documents each attempt in its logs.
+  mount-test:
+    needs: budget-guard
+    runs-on: macos-26
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch' && needs.budget-guard.outputs.allow == 'true'
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools macOS does not ship
+        run: brew install autoconf automake libtool pkg-config xcodegen
+
+      - name: Cache the NTFS toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/.local
+            tools/.local-plus
+          key: ntfstools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build-ntfsprogs.sh', 'tools/build-ntfsprogs-plus.sh', 'tools/env.sh') }}
+
+      - name: Build everything (tools/ci.sh)
+        run: tools/ci.sh
+
+      - name: Install the app and try to enable the extension
+        run: |
+          APP="/tmp/ttntfs-ci-dd/Build/Products/Debug/TT NTFS Native.app"
+          [ -d "$APP" ] || { echo "app not built at $APP"; exit 1; }
+          cp -R "$APP" /Applications/
+          open -a "TT NTFS Native" || true
+          sleep 5
+          fskit/scripts/enable-module.sh || echo "enable-module.sh failed (expected without signing)"
+          pluginkit -m -i ch.techtag.ntfs.extension -v || true
+
+      - name: Mount test (read-write)
+        run: fskit/scripts/mount-test.sh --rw
+
+      - name: Mount test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-test-logs
           path: |
             tools/build/test-logs
             tools/build/*.log

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Copyright (c) 2026 TechTag GmbH */
+#define _GNU_SOURCE	/* pthread_setname_np() on Linux */
+#define _FILE_OFFSET_BITS 64
 /*
  * Workqueues over one pthread per queue (linux/workqueue.h).
  *
@@ -41,7 +43,13 @@ static void *worker_main(void *arg)
 {
 	struct workqueue_struct *wq = arg;
 
+	/* macOS: pthread_setname_np(name) names the current thread.
+	 * Linux glibc: pthread_setname_np(thread, name). */
+#ifdef __APPLE__
 	pthread_setname_np(wq->name);
+#else
+	pthread_setname_np(pthread_self(), wq->name);
+#endif
 	pthread_mutex_lock(&wq->lock);
 	for (;;) {
 		struct work_struct *work;

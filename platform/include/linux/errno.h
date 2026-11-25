@@ -3,6 +3,16 @@
 #ifndef _LINUX_ERRNO_H
 #define _LINUX_ERRNO_H
 
+/* On Linux, glibc's <errno.h> -> <bits/errno.h> -> <linux/errno.h>, which
+ * resolves to *this* file (platform/include is on the include path), so
+ * including <errno.h> here first would recurse into this file, hit the
+ * include guard, and leave EIO/EINVAL/... undefined. Pull the real
+ * kernel errno header in first, via #include_next, so the constants
+ * exist before <errno.h> tries (and fails) to get them from us.
+ * On macOS there is no next <linux/errno.h>, so this is Linux-only. */
+#ifdef __linux__
+#include_next <linux/errno.h>
+#endif
 #include <errno.h>
 
 /* Linux errno values that macOS lacks or names differently. Values are

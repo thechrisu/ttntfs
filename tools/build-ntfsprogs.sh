@@ -69,7 +69,10 @@ esac
 
 # --- unpack ----------------------------------------------------------------
 rm -rf "$SRCDIR"
-tar xzf "$TARBALL" -C "$SRCROOT"
+# --no-same-owner: the tarball is owned by uid 1000, and extracting as
+# root in a user-namespaced container cannot chown to that uid, which
+# makes tar exit non-zero and aborts the build under set -e.
+tar --no-same-owner -xzf "$TARBALL" -C "$SRCROOT"
 [ -d "$SRCDIR" ] || { echo "tarball did not unpack to $SRCDIR" >&2; ls "$SRCROOT"; exit 1; }
 cd "$SRCDIR"
 if [ ! -x ./configure ]; then
@@ -120,8 +123,15 @@ echo "==> configuring ntfs-3g $VERSION for $ARCH into $NTFS_LOCAL"
 # the default search path becomes $SDK/usr/local/include instead.
 SDK="$(xcrun --show-sdk-path 2>/dev/null || true)"
 export CC="${CC:-cc}"
-export CFLAGS="${CFLAGS:--O2 -g -arch $ARCH${SDK:+ -isysroot $SDK}}"
-export LDFLAGS="${LDFLAGS:--arch $ARCH${SDK:+ -isysroot $SDK}}"
+# -arch / -isysroot are clang-on-macOS only: gcc on Linux rejects -arch.
+# Keep them on Darwin, plain -O2 -g elsewhere.
+if [ "$(uname -s)" = Darwin ]; then
+	export CFLAGS="${CFLAGS:--O2 -g -arch $ARCH${SDK:+ -isysroot $SDK}}"
+	export LDFLAGS="${LDFLAGS:--arch $ARCH${SDK:+ -isysroot $SDK}}"
+else
+	export CFLAGS="${CFLAGS:--O2 -g}"
+	export LDFLAGS="${LDFLAGS:-}"
+fi
 export ac_cv_header_libintl_h=no
 # --exec-prefix is required: without it configure sets rootlibdir=/lib and
 # rootbindir=/bin (so a boot-time automounter can find the FUSE driver) and

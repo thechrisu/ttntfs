@@ -18,7 +18,14 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
 #include <malloc/malloc.h>
+#else
+/* Linux: malloc_size() is macOS-only; glibc's equivalent is
+ * malloc_usable_size() in <malloc.h>. */
+#include <malloc.h>
+#define malloc_size(p) malloc_usable_size((void *)(p))
+#endif
 #include <pthread.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
@@ -34,6 +41,19 @@ void *platform_malloc(size_t size, gfp_t gfp)
 	void *p = malloc(size ? size : 1);
 	if (p && (gfp & __GFP_ZERO))
 		memset(p, 0, size);
+	/* Zero the slack between the requested size and the allocator's
+	 * usable size. On macOS malloc_size() == requested size, so this
+	 * is a no-op. On Linux glibc malloc_usable_size() rounds a 16-byte
+	 * request up to 24, and krealloc() below uses the usable size as
+	 * the old size: without this, bytes 16..23 would keep heap garbage
+	 * and a __GFP_ZERO krealloc would leave them unzeroed, failing
+	 * test_bdev's krealloc check (and, in real use, leaking stale
+	 * bytes into a supposedly zeroed tail). */
+	if (p && size) {
+		size_t usable = malloc_size(p);
+		if (usable > size)
+			memset((char *)p + size, 0, usable - size);
+	}
 	return p;
 }
 
@@ -54,6 +74,14 @@ void *krealloc(const void *p, size_t new_size, gfp_t gfp)
 	n = realloc((void *)p, new_size);
 	if (n && (gfp & __GFP_ZERO) && new_size > old_size)
 		memset((char *)n + old_size, 0, new_size - old_size);
+	/* Zero the new allocation's slack too, for the same reason as in
+	 * platform_malloc(): the next krealloc must not see stale bytes
+	 * between the requested size and the usable size. */
+	if (n && new_size) {
+		size_t usable = malloc_size(n);
+		if (usable > new_size)
+			memset((char *)n + new_size, 0, usable - new_size);
+	}
 	return n;
 }
 

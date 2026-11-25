@@ -52,6 +52,16 @@
 #include <linux/math64.h>
 #include "../ntfs/time.h"
 
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
+
 static int failures, checks;
 #define CHECK(cond) do {						\
 	checks++;							\
@@ -94,7 +104,7 @@ static int copy_fixture(const char *tag)
 	ssize_t n;
 
 	snprintf(src, sizeof(src), "%s/basic-4k.img", images_dir());
-	snprintf(scratch, sizeof(scratch), "/tmp/ttntfs-links-%d-%s.img",
+	snprintf(scratch, sizeof(scratch), "%s/ttntfs-links-%d-%s.img", scratch_dir(),
 		 (int)getpid(), tag);
 	in = open(src, O_RDONLY);
 	if (in < 0)

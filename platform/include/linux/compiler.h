@@ -7,6 +7,9 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define __packed __attribute__((packed))
 #define __aligned(x) __attribute__((aligned(x)))
+/* glibc's <sys/cdefs.h> already defines __always_inline; redefining it
+ * is a warning on Linux (and would be an error under -Werror). */
+#undef __always_inline
 #define __always_inline inline __attribute__((always_inline))
 #define __maybe_unused __attribute__((unused))
 #define __always_unused __attribute__((unused))

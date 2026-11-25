@@ -46,6 +46,16 @@
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
 
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
+
 /*
  * ntfs_setxattr()'s flags now come from ntfscore.h (core/include/
  * ntfs_xattr_flags.h) as NTFS_XATTR_CREATE / NTFS_XATTR_REPLACE, and
@@ -125,7 +135,7 @@ static int copy_fixture(const char *name, const char *tag)
 	ssize_t n;
 
 	snprintf(src, sizeof(src), "%s/%s", images_dir(), name);
-	snprintf(scratch, sizeof(scratch), "/tmp/ttntfs-names-%d-%s.img",
+	snprintf(scratch, sizeof(scratch), "%s/ttntfs-names-%d-%s.img", scratch_dir(),
 		 (int)getpid(), tag);
 	in = open(src, O_RDONLY);
 	if (in < 0)

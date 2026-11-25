@@ -53,6 +53,16 @@
 #include "ntfsport/bdev.h"
 #include "ntfs_image.h"
 
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
+
 static int failures, checks;
 #define CHECK(cond) do {						\
 	checks++;							\
@@ -635,7 +645,7 @@ static char scratch[512];
 
 static void scratch_path(const char *tag)
 {
-	snprintf(scratch, sizeof(scratch), "/tmp/ttntfs-bigdir-%d-%s.img", (int)getpid(), tag);
+	snprintf(scratch, sizeof(scratch), "%s/ttntfs-bigdir-%d-%s.img", scratch_dir(), (int)getpid(), tag);
 }
 
 /* A deterministic shuffle: the same permutation on every run and every host, so
@@ -1278,7 +1288,7 @@ int main(void)
 			"file, will not run (tools/build-ntfsprogs-plus.sh)\n",
 			tool_path("NTFS_NTFSCK", "tools/.local-plus/sbin/ntfsck"));
 
-	snprintf(base_img, sizeof(base_img), "/tmp/ttntfs-bigdir-%d-base.img", (int)getpid());
+	snprintf(base_img, sizeof(base_img), "%s/ttntfs-bigdir-%d-base.img", scratch_dir(), (int)getpid());
 	if (make_image(base_img, 64) != 0) {
 		fprintf(stderr, "SKIP test_bigdir: mkntfs failed on %s\n", base_img);
 		return 0;

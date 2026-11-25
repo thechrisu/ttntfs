@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Copyright (c) 2026 TechTag GmbH */
+#define _GNU_SOURCE	/* fallocate() / FALLOC_FL_* on Linux */
+#define _FILE_OFFSET_BITS 64
 /*
  * ntfsport/bdev.h over a regular file or a /dev node (bdev_file.c).
  *
@@ -25,7 +27,26 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#ifdef __APPLE__
 #include <sys/disk.h>
+#endif
+#ifdef __linux__
+/* Linux block-device ioctls. Do not #include <linux/fs.h> here: the
+ * platform's own linux/fs.h shadows the system one on the include path.
+ * The constants are stable kernel ABI. */
+#ifndef BLKGETSIZE64
+#define BLKGETSIZE64 _IOR(0x12, 114, size_t)
+#endif
+#ifndef BLKSSZGET
+#define BLKSSZGET _IO(0x12, 104)
+#endif
+#ifndef BLKPBSZGET
+#define BLKPBSZGET _IO(0x12, 123)
+#endif
+#ifndef BLKDISCARD
+#define BLKDISCARD _IO(0x12, 119)
+#endif
+#endif
 #include <pthread.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -145,12 +166,14 @@ static ssize_t file_pwrite(struct ntfs_bdev *dev, const void *buf, size_t count,
 
 static int file_flush(struct ntfs_bdev *dev)
 {
+#ifdef __APPLE__
 	if (fcntl(bf(dev)->fd, F_FULLFSYNC) == 0)
 		return 0;
 	/* Only fall back when the file system does not implement it; an
 	 * I/O error means the device may not have the data. */
 	if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL && errno != EOPNOTSUPP)
 		return -errno;
+#endif
 	if (fsync(bf(dev)->fd) == 0)
 		return 0;
 	return errno == EINVAL || errno == ENOTSUP ? 0 : -errno;	/* not a syncable fd */
@@ -158,6 +181,7 @@ static int file_flush(struct ntfs_bdev *dev)
 
 static int file_discard(struct ntfs_bdev *dev, u64 offset, u64 length)
 {
+#ifdef __APPLE__
 	if (bf(dev)->is_device) {
 		dk_extent_t ext = { .offset = offset, .length = length };
 		dk_unmap_t um = { .extents = &ext, .extentsCount = 1, .options = 0 };
@@ -171,6 +195,19 @@ static int file_discard(struct ntfs_bdev *dev, u64 offset, u64 length)
 			return 0;
 		return errno == ENOTTY || errno == ENOTSUP || errno == EINVAL ? -EOPNOTSUPP : -errno;
 	}
+#else
+	/* Linux: BLKDISCARD on devices, fallocate punch-hole on files. */
+	if (bf(dev)->is_device) {
+		u64 range[2] = { offset, length };
+		if (ioctl(bf(dev)->fd, BLKDISCARD, range) == 0)
+			return 0;
+		return errno == ENOTTY || errno == EOPNOTSUPP ? -EOPNOTSUPP : -errno;
+	}
+	if (fallocate(bf(dev)->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+		      (off_t)offset, (off_t)length) == 0)
+		return 0;
+	return errno == ENOTTY || errno == EOPNOTSUPP || errno == EINVAL ? -EOPNOTSUPP : -errno;
+#endif
 }
 
 static void file_close(struct ntfs_bdev *dev)
@@ -228,6 +265,7 @@ static struct ntfs_bdev *open_common(int fd, bool owns_fd, bool read_only, const
 		uint64_t count = 0;
 
 		f->is_device = true;
+#ifdef __APPLE__
 		if (ioctl(fd, DKIOCGETBLOCKSIZE, &bs) != 0 || !bs)
 			bs = 512;
 		if (ioctl(fd, DKIOCGETBLOCKCOUNT, &count) != 0)
@@ -241,6 +279,23 @@ static struct ntfs_bdev *open_common(int fd, bool owns_fd, bool read_only, const
 		}
 		if (ioctl(fd, DKIOCGETPHYSICALBLOCKSIZE, &pbs) != 0 || !pbs)
 			pbs = bs;
+#else
+		/* Linux: BLKSSZGET / BLKGETSIZE64 / BLKPBSZGET. */
+		if (ioctl(fd, BLKSSZGET, &bs) != 0 || !bs)
+			bs = 512;
+		{
+			u64 bytes = 0;
+			if (ioctl(fd, BLKGETSIZE64, &bytes) == 0 && bytes)
+				count = bytes / bs;
+		}
+		if (!count) {
+			off_t end = lseek(fd, 0, SEEK_END);
+			if (end > 0)
+				count = (uint64_t)end / bs;
+		}
+		if (ioctl(fd, BLKPBSZGET, &pbs) != 0 || !pbs)
+			pbs = bs;
+#endif
 		dev->logical_block_size = bs;
 		dev->physical_block_size = pbs;
 		dev->size_bytes = (u64)bs * count;

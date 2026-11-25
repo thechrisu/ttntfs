@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
+#define _GNU_SOURCE	/* SEEK_DATA/SEEK_HOLE, fallocate() on Linux */
+#define _FILE_OFFSET_BITS 64
 /*
  * test_geometry.c - sector size, cluster size, and volumes big enough that the
  * arithmetic has to be 64-bit.
@@ -45,6 +47,16 @@
 
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
+
+/* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
+ * some machines and the 16 TiB geometry image needs ~600 MiB while
+ * mkntfs materialises $Bitmap. */
+static const char *scratch_dir(void)
+{
+	const char *t = getenv("TMPDIR");
+	return t && *t ? t : "/tmp";
+}
+
 
 static int failures, checks, skipped, last_checks;
 
@@ -200,12 +212,17 @@ static u64 resparsify(const char *path)
 			hole = st.st_size;
 		for (off_t p = data; p < hole; p += CHUNK) {
 			size_t len = (size_t)((hole - p < CHUNK) ? hole - p : CHUNK);
-			fpunchhole_t ph = { 0, 0, p, (off_t)len };
 
 			if (pread(fd, buf, len, p) != (ssize_t)len)
 				break;
-			if (memcmp(buf, zero, len) == 0)
+			if (memcmp(buf, zero, len) == 0) {
+#ifdef __APPLE__
+				fpunchhole_t ph = { 0, 0, p, (off_t)len };
 				(void)fcntl(fd, F_PUNCHHOLE, &ph);
+#else
+				(void)fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, p, (off_t)len);
+#endif
+			}
 		}
 		pos = hole;
 	}
@@ -1418,7 +1435,7 @@ int main(void)
 {
 	char probe[512];
 
-	snprintf(workdir, sizeof(workdir), "/tmp/ttntfs-geometry-%d", (int)getpid());
+	snprintf(workdir, sizeof(workdir), "%s/ttntfs-geometry-%d", scratch_dir(), (int)getpid());
 	if (mkdir(workdir, 0755) != 0 && errno != EEXIST) {
 		fprintf(stderr, "cannot create %s: %s\n", workdir, strerror(errno));
 		return 1;

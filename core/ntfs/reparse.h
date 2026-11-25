@@ -29,6 +29,17 @@ struct ntfs_win_symlink {
 
 #define SYMLINK_FLAG_RELATIVE	cpu_to_le32(0x00000001)
 
+/* [MS-FSCC] 2.1.2: a reparse data buffer, header included, is at most
+ * 16 KiB. A native symlink stores its target twice in UTF-16 (substitute
+ * and print name), so a target longer than 4091 UTF-16 units cannot be
+ * expressed in the native tag at all -- 8 + 12 + 4 * 4092 = 16388. */
+#define NTFS_MAX_REPARSE_DATA_BUFFER_SIZE	16384
+
+/* True when a native Windows symlink for @target_len UTF-16 units fits in
+ * a reparse data buffer; false when the caller must fall back to the WSL
+ * tag, which stores the target once, in UTF-8. */
+bool ntfs_win_symlink_fits(int target_len);
+
 int ntfs_reparse_set_win_symlink(struct ntfs_inode *ni,
 		const __le16 *target, int target_len);
 

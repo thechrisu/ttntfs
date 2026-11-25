@@ -793,8 +793,12 @@ static struct inode **snapshot_inodes(struct super_block *sb, size_t *count, boo
 	}
 	sb_unlock(sb);
 	/* Rank ascending, then newest first within a rank. i_seq is unique, so
-	 * this is a total order and qsort's instability does not matter. */
-	qsort(arr, n, sizeof(*arr), cmp_sync_order);
+	 * this is a total order and qsort's instability does not matter.
+	 * qsort(NULL, 0, ...) is UB (UBSan: null pointer passed as an
+	 * argument declared nonnull), and n == 0 with arr == NULL is the
+	 * normal empty-snapshot case, so skip the sort then. */
+	if (n)
+		qsort(arr, n, sizeof(*arr), cmp_sync_order);
 	*count = n;
 	return arr;
 }
