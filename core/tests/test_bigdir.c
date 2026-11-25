@@ -20,6 +20,11 @@
  *   index_root_boundary   the move out of the resident $INDEX_ROOT into an
  *                         $INDEX_ALLOCATION (ntfs_ir_reparent), found by
  *                         watching the on-disk MFT record rather than assumed.
+ *   index_root_oversized_reparent
+ *                         upstream dc09bf79b76f: the reparent that would
+ *                         overflow a 512-byte index block -- the root
+ *                         holds 536 entry bytes against a 488-byte
+ *                         capacity, so the create must fail with -EIO.
  *   multilevel_growth     a few thousand entries: many ntfs_ib_split() calls,
  *                         a root that itself has to be reparented, and the
  *                         resulting tree read back after a remount.
@@ -158,9 +163,40 @@ static bool fsck_ok(const char *img, const char *what)
 static void cleanup_image(const char *path)
 {
 	if (failures)
-		fprintf(stderr, "  keeping %s for inspection\n", path);
+		fprintf(stderr, "  keeping %s for inspection\\n", path);
 	else
 		unlink(path);
+}
+
+/*
+ * Count how many "is corrupted" reports ntfsck -n makes on the image.
+ * The oversized-root fixture is, by construction, exactly one such
+ * report: a root whose index_length exceeds its 512-byte block size is
+ * the only state that can trigger the upstream check, and ntfsck's $IR
+ * check flags exactly that. A failed create must not add a second one.
+ * Returns -1 when ntfsck is unavailable (then the caller skips).
+ */
+static int fsck_corrupted_count(const char *img)
+{
+	static const char *ck;
+	char cmd[2048];
+	char line[64];
+	FILE *p;
+	int n = -1;
+
+	if (!ck)
+		ck = tool_path("NTFS_NTFSCK", "tools/.local-plus/sbin/ntfsck");
+	if (!have_tool(ck))
+		return -1;
+	snprintf(cmd, sizeof(cmd), "'%s' -n '%s' 2>&1 | grep -c 'is corrupted'",
+		 ck, img);
+	p = popen(cmd, "r");
+	if (!p)
+		return -1;
+	if (fgets(line, sizeof(line), p))
+		n = atoi(line);
+	pclose(p);
+	return n;
 }
 
 static bool fsck_available(void)
@@ -775,6 +811,210 @@ out:
 	printf("test_index_root_boundary\n");
 }
 
+/* ---- 1b. the reparent that would overflow a small index block -------- */
+
+/*
+ * Upstream dc09bf79b76f: ntfs_ir_to_ib() copied every entry of the
+ * resident $INDEX_ROOT into a freshly allocated index block with no
+ * capacity check -- a heap buffer overflow when the root held more
+ * entry bytes than the block. The check it adds is in ntfs_ir_to_ib():
+ * the root's entry bytes must fit in allocated_size - entries_offset
+ * of the new block, else NULL and the create fails with -EIO.
+ *
+ * A driver-created directory can never reach that state on its own, so
+ * the test builds it by hand, in two steps:
+ *
+ *   1. The port refuses to grow $INDEX_ROOT once the MFT record is
+ *      within 120 bytes of full (ntfs_attr_record_resize), and the
+ *      smallest index block the loader accepts is 512 bytes, whose
+ *      capacity is 488 bytes -- while a record that still carries
+ *      $EA/$EA_INFORMATION/$SECURITY_DESCRIPTOR reparents with only
+ *      328 entry bytes in the root. So the record is first emptied of
+ *      those three attributes (224 bytes) and the block size cut to
+ *      512, by tools/mkfixtures/patch_ib_size.py: the root can then
+ *      grow to 536 entry bytes (five 11-character entries) before the
+ *      120-byte headroom rule forces a reparent on the sixth.
+ *   2. The sixth create then reparents with 536 > 488 bytes in the
+ *      root. With the fix it fails with -EIO, the error the upstream
+ *      commit returns, before anything is written, and the five
+ *      entries already there are still lookable-up by name. Without
+ *      the fix the create fails with -EIO too -- but only after the
+ *      overflow: ntfs_ir_to_ib() memcpys 536 bytes into the 512-byte
+ *      block, the corrupt block (index_length 552) is written out and
+ *      the root nill'd, and the next index operation trips the
+ *      validator. The directory is left unreadable: every lookup
+ *      fails with -EIO, in-session and after a remount. That is what
+ *      the lookup checks below catch -- the -EIO check alone cannot
+ *      tell the two apart, the lookups can. The failed create adds no
+ *      further damage: ntfsck reports the same single known $IR flag
+ *      before and after it (see below).
+ *
+ * NOTE: readdir() on the directory after the failed create trips a
+ * separate, pre-existing validator overreach (ntfs_index_entry_
+ * inconsistent() rejects a root whose index_length exceeds
+ * block_size -- a state only this failed reparent can produce), so
+ * the test verifies by lookup, not by readdir. That is out of scope
+ * for this port; the entries themselves are intact.
+ *
+ * NOTE: the image is not ntfsck-clean, and cannot be: any root that
+ * can trigger the upstream check has, by construction, an
+ * index_length above its block size, which ntfsck's $IR check flags
+ * ("$IR index block size is corrupted"). That flag is present as
+ * soon as the fifth entry lands, before any failed create, and the
+ * test asserts it stays at exactly one report across the failure
+ * rather than asserting a clean fsck.
+ */
+static void test_index_root_oversized_reparent(void)
+{
+	struct session s;
+	ntfs_inode_t *dir = NULL, *f = NULL;
+	const char *py = getenv("NTFS_PATCH_IB_SIZE");
+	char cmd[2048];
+	char name[NAME_MAX_LEN];
+	uint64_t dir_no;
+	int err, rc, i;
+
+	scratch_path("ibsize");
+	if (copy_base(scratch) != 0) {
+		fprintf(stderr, "SKIP test_index_root_oversized_reparent: no base image\n");
+		return;
+	}
+	if (!py || !*py) {
+		fprintf(stderr, "SKIP test_index_root_oversized_reparent: NTFS_PATCH_IB_SIZE not set\n");
+		unlink(scratch);
+		return;
+	}
+
+	/* Phase 1: a driver-created directory with three entries. */
+	err = session_open(&s, scratch);
+	CHECKF(err == 0, "mount failed: %d", err);
+	if (err) goto out;
+	err = ntfs_mkdir(s.root, "grow", 0040755, &dir);
+	CHECKF(err == 0, "mkdir failed: %d", err);
+	if (err) goto close1;
+	dir_no = ntfs_inode_number(dir);
+
+	for (i = 0; i < 3; i++) {
+		snprintf(name, sizeof(name), "entry-%05d", i);
+		err = ntfs_create(dir, name, 0100644, &f);
+		CHECKF(err == 0, "create('%s') failed: %d", name, err);
+		if (err) goto close1;
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	CHECK(ntfs_volume_sync(s.vol) == 0);
+close1:
+	if (dir)
+		ntfs_inode_put(dir);
+	dir = NULL;
+	session_close(&s);
+	if (err) goto out;
+
+	/* Phase 2: shrink the block, free the record, on the bare image. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu >/dev/null 2>&1",
+		 py, scratch, (unsigned long long)dir_no);
+	rc = system(cmd);
+	CHECKF(rc == 0, "patch_ib_size.py failed (rc %d)", rc);
+	if (rc != 0) goto out;
+
+	/* Phase 3: grow the root to 536 entry bytes. */
+	err = session_open(&s, scratch);
+	CHECKF(err == 0, "remount failed: %d", err);
+	if (err) goto out;
+	err = ntfs_lookup(s.root, "grow", &dir);
+	CHECKF(err == 0, "lookup('grow') failed after patch: %d", err);
+	if (err) goto close2;
+
+	for (i = 3; i < 5; i++) {
+		snprintf(name, sizeof(name), "entry-%05d", i);
+		err = ntfs_create(dir, name, 0100644, &f);
+		CHECKF(err == 0, "create('%s') failed: %d", name, err);
+		if (err) goto close2;
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	CHECK(ntfs_volume_sync(s.vol) == 0);
+close2:
+	if (dir)
+		ntfs_inode_put(dir);
+	dir = NULL;
+	session_close(&s);
+	if (err) goto out;
+
+	/* Baseline: the fixture's one known ntfsck flag, present before
+	 * any failed create (a root above its block size). */
+	if (fsck_available()) {
+		rc = fsck_corrupted_count(scratch);
+		CHECKF(rc == 1, "ntfsck reported %d corrupted items before the "
+		       "failed create, want 1", rc);
+		if (rc != 1) goto out;
+	}
+
+	/* Phase 4: the sixth create reparents -- and must fail with -EIO. */
+	err = session_open(&s, scratch);
+	CHECKF(err == 0, "remount failed: %d", err);
+	if (err) goto out;
+	err = ntfs_lookup(s.root, "grow", &dir);
+	CHECKF(err == 0, "lookup('grow') failed before the reparent: %d", err);
+	if (err) goto close3;
+
+	err = ntfs_create(dir, "entry-00005", 0100644, &f);
+	CHECKF(err == -EIO,
+	       "oversized reparent: create returned %d, want -EIO", err);
+	if (err == 0) {
+		/* The create succeeded outright: the overflow went through
+		 * and the reparent completed with a corrupt block. */
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+
+	/* The five entries already there must still be lookable-up. */
+	for (i = 0; i < 5; i++) {
+		snprintf(name, sizeof(name), "entry-%05d", i);
+		err = ntfs_lookup(dir, name, &f);
+		CHECKF(err == 0, "lookup('%s') failed after the failed reparent: %d",
+		       name, err);
+		if (err == 0) {
+			ntfs_inode_put(f);
+			f = NULL;
+		}
+	}
+close3:
+	if (dir)
+		ntfs_inode_put(dir);
+	session_close(&s);
+
+	/* No new damage: still exactly the one known ntfsck flag. */
+	if (fsck_available()) {
+		rc = fsck_corrupted_count(scratch);
+		CHECKF(rc == 1, "ntfsck reported %d corrupted items after the "
+		       "failed create, want 1", rc);
+	}
+
+	/* And after a remount, from disk rather than from cache. */
+	if (session_open(&s, scratch) == 0) {
+		if (ntfs_lookup(s.root, "grow", &dir) == 0) {
+			for (i = 0; i < 5; i++) {
+				snprintf(name, sizeof(name), "entry-%05d", i);
+				err = ntfs_lookup(dir, name, &f);
+				CHECKF(err == 0, "lookup('%s') failed after remount: %d",
+				       name, err);
+				if (err == 0) {
+					ntfs_inode_put(f);
+					f = NULL;
+				}
+			}
+			ntfs_inode_put(dir);
+		} else {
+			CHECKF(false, "the directory itself vanished across a remount");
+		}
+		session_close(&s);
+	}
+out:
+	cleanup_image(scratch);
+	printf("test_index_root_oversized_reparent\n");
+}
+
 /* ---- 2. several thousand entries: splits, and a root that reparents --- */
 
 /*
@@ -1299,6 +1539,7 @@ int main(void)
 	}
 
 	test_index_root_boundary();
+	test_index_root_oversized_reparent();
 	test_multilevel_growth();
 	test_delete_orders();
 	test_delete_middle();

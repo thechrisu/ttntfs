@@ -395,6 +395,19 @@ decompressors in the port). The pin does not move until the port
 items land — moving it now would just re-baseline the drift report
 around 61 known-missing fixes.
 
+Porting progress (one commit per item, in the order above):
+- 2026-11-25: `dc09bf79b76f` (index_root heap OOB write, the worst
+  single item) — verbatim capacity check in `ntfs_ir_to_ib()`;
+  regression test `test_index_root_oversized_reparent` in
+  `core/tests/test_bigdir.c` with fixture patcher
+  `tools/mkfixtures/patch_ib_size.py`. Without the fix the reparent
+  overflows the 512-byte block and leaves the directory unreadable
+  (every lookup -EIO); with it the create fails cleanly with -EIO
+  and the entries survive. Evidence: bigdir 507 checks 0 failures
+  with the fix, 10 lookup failures without it; plain ctest 15/15,
+  UBSan ctest 15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1. 60 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
