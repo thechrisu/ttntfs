@@ -14,10 +14,16 @@
 #   4. workflow YAML     .github/workflows/*.yml parse check
 #   5. ci.sh --quick     toolchain + ctest + UBSan (skips the fixture
 #                        suite; the full suite is what CI is for)
+#   6. fuzz check        tools/fuzz.sh check: the standalone runner mounts
+#                        every seed and fails cleanly on every regression
+#                        image (the leak half needs ASan, so it is the CI
+#                        fuzz job's job, not pre-push's)
 #
 # Not covered here, by design -- CI owns them:
 #   - the fixture suite (tools/run-tests.sh all): slow; run it
 #     explicitly before pushing a change to the core if you can
+#   - the ASan leak regression (tools/fuzz.sh regression): needs Clang;
+#     run it explicitly, and the CI fuzz job runs it weekly
 #   - Swift unit tests and the app build: need xcodebuild / macOS SDK
 #   - the mount test: needs a signed FSKit extension and a real mount
 #
@@ -91,14 +97,23 @@ stage_ci_quick() {
 	return 0
 }
 
+stage_fuzz_check() {
+	# Needs the normal build dir (ci.sh --quick above builds it) and
+	# the seed corpus (generated on first run). TMPDIR: /tmp is a 512M
+	# tmpfs on some machines; the harness mounts 4 MiB images, so the
+	# default is fine, but respect an explicit TMPDIR when set.
+	TMPDIR="${TMPDIR:-/tmp}" "$HERE/fuzz.sh" check
+}
+
 run_stage "darwin preprocess (macOS-only breakage)" stage_darwin
 run_stage "shellcheck (tools/*.sh)" stage_shellcheck
 run_stage "python compile (tools/*.py)" stage_python
 run_stage "workflow YAML syntax" stage_workflows
 run_stage "ci.sh --quick (toolchain + ctest + UBSan)" stage_ci_quick
+run_stage "fuzz check (seeds + regression images)" stage_fuzz_check
 
 printf '\n==================== pre-push summary ====================\n'
 printf '%s\n' "${results[@]}"
 printf 'total %ss\n' "$(( $(date +%s) - start_all ))"
-echo "(fixture suite, Swift tests, app build and mount test are CI-only; see header)"
+echo "(fixture suite, ASan fuzz regression, Swift tests, app build and mount test are CI-only; see header)"
 exit $fail

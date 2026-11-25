@@ -58,6 +58,10 @@ option(NTFS_SANITIZE "Deprecated: same as -DNTFS_ASAN=ON -DNTFS_UBSAN=ON" OFF)
 option(NTFS_UBSAN "Build with UndefinedBehaviorSanitizer (use a separate build dir)" OFF)
 option(NTFS_ASAN "Build the tests with AddressSanitizer (hangs on macOS 26)" OFF)
 option(NTFS_BUILD_TESTS "Build the unit tests" ON)
+option(NTFS_FUZZ "Build the libFuzzer target (Clang only; use a separate build dir)" OFF)
+if(NTFS_FUZZ AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
+  message(FATAL_ERROR "NTFS_FUZZ needs Clang (libFuzzer is Clang-only); configure with CC=clang")
+endif()
 
 set(NTFS_C_FLAGS -Wall -Wextra -Wno-unused-parameter -Werror=implicit-function-declaration
     -fno-strict-aliasing -fwrapv)
@@ -83,6 +87,19 @@ if(NTFS_SAN_LIST)
   add_compile_options(-fno-sanitize-recover=undefined)
 else()
   message(STATUS "sanitizers: none")
+endif()
+
+if(NTFS_FUZZ)
+  # libFuzzer coverage instrumentation on everything, driver libraries
+  # included: without coverage signal from driver code the fuzzer is
+  # blind mutation and catches nothing inside the parser. address+undefined
+  # is what catches the crafted-image heap overflows this harness exists
+  # for. The link line gets address+undefined only: -fsanitize=fuzzer on
+  # the link is what pulls in libFuzzer's main, and that belongs on the
+  # ntfs_fuzz target alone (see the tests section below), or every
+  # executable in this build would gain a second main.
+  add_compile_options(-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -g -O1)
+  add_link_options(-fsanitize=address,undefined)
 endif()
 
 find_package(Threads REQUIRED)
@@ -269,5 +286,34 @@ if(NTFS_BUILD_TESTS)
     add_executable(stress_pagecache platform/pagecache/tests/stress_pagecache.c)
     target_link_libraries(stress_pagecache ntfsplatform)
     add_test(NAME pagecache_stress COMMAND stress_pagecache 3)
+  endif()
+
+  # Fuzz harness (GAPS.md §5.2): the same source as the libFuzzer target,
+  # with a plain main() that mounts and walks each image once. That is the
+  # deterministic corpus check tools/fuzz.sh runs (and pre-push runs);
+  # sanitizer aborts still fire on a crash. It builds in both modes: in a
+  # fuzz build its link line carries address+undefined (global, above)
+  # but not -fsanitize=fuzzer, so it keeps its own main.
+  add_executable(ntfs_fuzz_standalone core/fuzz/fuzz_mount.c)
+  target_compile_definitions(ntfs_fuzz_standalone PRIVATE NTFS_FUZZ_STANDALONE)
+  target_link_libraries(ntfs_fuzz_standalone ntfscore ntfsplatform)
+  target_include_directories(ntfs_fuzz_standalone PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+
+  # The libFuzzer binary itself (Clang only, -DNTFS_FUZZ=ON, own build
+  # dir so the instrumentation does not leak into the library the app
+  # links):
+  #   CC=clang cmake -S . -B build-fuzz -DNTFS_FUZZ=ON
+  #   cmake --build build-fuzz --target ntfs_fuzz
+  #   tools/fuzz.sh run 300
+  if(NTFS_FUZZ)
+    add_executable(ntfs_fuzz core/fuzz/fuzz_mount.c)
+    target_link_options(ntfs_fuzz PRIVATE
+      -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+    target_link_libraries(ntfs_fuzz ntfscore ntfsplatform)
+    target_include_directories(ntfs_fuzz PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   endif()
 endif()

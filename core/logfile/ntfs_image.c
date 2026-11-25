@@ -101,6 +101,7 @@ static int decode_runs(const uint8_t *mp, uint32_t mp_len, uint64_t svcn,
 	uint64_t vcn = svcn;
 	int64_t lcn = 0;
 	uint32_t i = 0, cap = 0;
+	int rc = 0;
 
 	*out = NULL;
 	*n = 0;
@@ -109,8 +110,10 @@ static int decode_runs(const uint8_t *mp, uint32_t mp_len, uint64_t svcn,
 		uint64_t len = 0;
 		int64_t d = 0;
 		uint32_t k;
-		if (!ls || ls > 8 || os > 8 || i + ls + os > mp_len)
-			return -EINVAL;
+		if (!ls || ls > 8 || os > 8 || i + ls + os > mp_len) {
+			rc = -EINVAL;
+			goto fail;
+		}
 		for (k = 0; k < ls; k++)
 			len |= (uint64_t)mp[i + k] << (8 * k);
 		i += ls;
@@ -121,14 +124,18 @@ static int decode_runs(const uint8_t *mp, uint32_t mp_len, uint64_t svcn,
 				d |= -((int64_t)1 << (8 * os));
 			i += os;
 			lcn += d;
-			if (lcn < 0)
-				return -EINVAL;
+			if (lcn < 0) {
+				rc = -EINVAL;
+				goto fail;
+			}
 		}
 		if (*n == cap) {
 			cap = cap ? cap * 2 : 8;
 			struct ntfs_img_run *nr = realloc(*out, cap * sizeof(*nr));
-			if (!nr)
-				return -ENOMEM;
+			if (!nr) {
+				rc = -ENOMEM;
+				goto fail;
+			}
 			*out = nr;
 		}
 		(*out)[*n].vcn = vcn;
@@ -138,6 +145,19 @@ static int decode_runs(const uint8_t *mp, uint32_t mp_len, uint64_t svcn,
 		vcn += len;
 	}
 	return 0;
+
+fail:
+	/*
+	 * A malformed run list must not leave a half-built list behind:
+	 * the callers treat any error as "no run list" and never free
+	 * *out. The fuzzer found the leak (GAPS.md §5.2): a $LogFile
+	 * whose run list decoded far enough to allocate, then hit a bad
+	 * pair, leaked the partial list on every mount attempt.
+	 */
+	free(*out);
+	*out = NULL;
+	*n = 0;
+	return rc;
 }
 
 /* Read MFT record @no through the $MFT run list (record 0 via mft_lcn). */
@@ -354,15 +374,36 @@ static int ntfs_image_parse(struct ntfs_image *img, uint32_t cluster_size,
 	if (memcmp(bs + 3, "NTFS    ", 8))
 		return seterr(img, -EINVAL, "not an NTFS boot sector and not a $LogFile dump");
 	img->sector_size = lf_get16(bs + 0x0b);
-	img->cluster_size = img->sector_size * bs[0x0d];
-	if (bs[0x0d] > 0x80)	/* Windows 10+: sectors per cluster as a power of two */
+	if (bs[0x0d] >= 0xf4) {
+		/*
+		 * Windows 10+: sectors per cluster as a power of two. Same
+		 * 0xf4 threshold as the driver's parse_ntfs_boot_sector:
+		 * below it the byte is a plain count, and 1u << (256 - spc)
+		 * would shift by up to 127 -- undefined behaviour. The
+		 * fuzzer found the analogous shift below (GAPS.md §5.2).
+		 * With the 0xf4 threshold the shift is 1..12, always defined.
+		 */
 		img->cluster_size = img->sector_size * (1u << (256 - bs[0x0d]));
+	} else {
+		img->cluster_size = img->sector_size * bs[0x0d];
+	}
 	img->total_sectors = lf_get64(bs + 0x28);
 	img->mft_lcn = lf_get64(bs + 0x30);
 	img->mftmirr_lcn = lf_get64(bs + 0x38);
+	/*
+	 * The record-size byte is signed: negative means 2^(-cpr) bytes.
+	 * -cpr runs to 128 for a crafted boot sector, and 1u << 56 is
+	 * undefined behaviour -- the fuzzer's finding (GAPS.md §5.2).
+	 * The check below only allows up to 65536, so reject anything
+	 * that would shift past that before shifting.
+	 */
 	cpr = (int8_t)bs[0x40];
+	if (cpr < -16)
+		return seterr(img, -EINVAL, "implausible boot sector geometry");
 	img->mft_record_size = cpr < 0 ? 1u << -cpr : (uint32_t)cpr * img->cluster_size;
 	cpr = (int8_t)bs[0x44];
+	if (cpr < -16)
+		return seterr(img, -EINVAL, "implausible boot sector geometry");
 	img->index_block_size = cpr < 0 ? 1u << -cpr : (uint32_t)cpr * img->cluster_size;
 	if (!img->sector_size || !img->cluster_size || img->mft_record_size < 512 ||
 	    img->mft_record_size > 65536 || (img->mft_record_size & 511))
@@ -387,12 +428,22 @@ static int ntfs_image_parse(struct ntfs_image *img, uint32_t cluster_size,
 	err = read_mft_record(img, 2, rec);
 	if (err) {
 		free(rec);
+		/* $MFT's run list is already decoded; the callers return
+		 * on a failed open without closing the image, so a failed
+		 * parse must leave nothing allocated behind. Same below. */
+		free(img->mft_runs);
+		img->mft_runs = NULL;
+		img->n_mft_runs = 0;
 		return seterr(img, err, "cannot read MFT record 2 ($LogFile)");
 	}
 	err = find_data_runs(img, rec, &img->log_runs, &img->n_log_runs, &img->log_size);
 	free(rec);
-	if (err)
+	if (err) {
+		free(img->mft_runs);
+		img->mft_runs = NULL;
+		img->n_mft_runs = 0;
 		return seterr(img, err, "$LogFile: no usable $DATA run list");
+	}
 	return 0;
 }
 
@@ -400,6 +451,7 @@ int ntfs_image_open(struct ntfs_image *img, const char *path, bool writable,
 		    uint32_t cluster_size, uint32_t mft_record_size)
 {
 	struct stat st;
+	int err;
 
 	memset(img, 0, sizeof(*img));
 	img->io.ctx = img;
@@ -410,10 +462,26 @@ int ntfs_image_open(struct ntfs_image *img, const char *path, bool writable,
 	if (img->fd < 0)
 		return seterr(img, -errno, "cannot open file");
 	img->writable = writable;
-	if (fstat(img->fd, &st))
-		return seterr(img, -errno, "fstat failed");
+	if (fstat(img->fd, &st)) {
+		err = -errno;
+		close(img->fd);
+		img->fd = -1;
+		return seterr(img, err, "fstat failed");
+	}
 	img->file_size = (uint64_t)st.st_size;
-	return ntfs_image_parse(img, cluster_size, mft_record_size, true);
+	/*
+	 * A failed parse leaves nothing allocated behind (see
+	 * ntfs_image_parse), and the callers return on a failed open
+	 * without closing the image, so close the fd here too -- the
+	 * same leak family as the run lists above, one descriptor
+	 * per failed open instead of one allocation.
+	 */
+	err = ntfs_image_parse(img, cluster_size, mft_record_size, true);
+	if (err) {
+		close(img->fd);
+		img->fd = -1;
+	}
+	return err;
 }
 
 void ntfs_image_close(struct ntfs_image *img)

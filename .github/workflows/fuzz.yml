@@ -1,0 +1,110 @@
+name: Fuzz
+
+# Weekly + manual fuzz of the on-disk NTFS parser (GAPS.md §5.2).
+#
+# Deliberately a separate workflow from CI, not a job in ci.yml: ci.yml
+# has workflow-level concurrency ci-${{ github.ref }} with
+# cancel-in-progress, so a scheduled fuzz run starting while a push run
+# was in flight would CANCEL the push run's checks job. This workflow has
+# its own group (fuzz-${{ github.ref }}) and never touches ci.yml's.
+#
+# The job FAILS if the fuzzer finds a crash, timeout, or leak -- that is
+# the point. Crash artifacts are uploaded for triage; a finding is fixed
+# in its own commit with a regression image (tools/fuzz/mkregression.py),
+# never left in the crashes directory.
+#
+# Runs on ubuntu-latest, not macos-26: Clang's libFuzzer is proven there,
+# Linux minutes are 1x (macOS is 10x), and the parser is platform code.
+# The budget guard still gates it on the same 20% CI-minutes budget as
+# CI, even though a public repo does not bill standard runners at all
+# (the guard allows unconditionally there).
+
+on:
+  schedule:
+    # Sunday 03:00 UTC.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Mutation run length in seconds (default 300)"
+        required: false
+        default: "300"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Same guard as CI (tools/ci-budget-guard.py): at most 20% of the
+  # monthly included minutes may go to this repo's runs. Runs first, on
+  # ubuntu-latest (seconds); the fuzz job only runs when it allows.
+  budget-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      allow: ${{ steps.guard.outputs.allow }}
+      used_billed_minutes: ${{ steps.guard.outputs.used_billed_minutes }}
+      budget_billed_minutes: ${{ steps.guard.outputs.budget_billed_minutes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the 20% CI minutes budget
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BILLING_DAY: "1"
+        run: python3 tools/ci-budget-guard.py
+
+  fuzz:
+    needs: budget-guard
+    if: needs.budget-guard.outputs.allow == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clang (libFuzzer) and the toolchain build tools
+        run: |
+          command -v clang >/dev/null 2>&1 || sudo apt-get update -qq && sudo apt-get install -y -qq clang
+          command -v cmake >/dev/null 2>&1 || sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+          command -v autoconf >/dev/null 2>&1 || sudo apt-get update -qq && sudo apt-get install -y -qq autoconf automake libtool pkg-config
+
+      # mkntfs (seed generation) comes from the same pinned ntfsprogs
+      # build CI uses; the cache key matches ci.yml's, modulo runner OS.
+      - name: Cache the NTFS toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/.local
+            tools/.local-plus
+          key: ntfstools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/build-ntfsprogs.sh', 'tools/build-ntfsprogs-plus.sh', 'tools/env.sh') }}
+
+      - name: Build the NTFS toolchain (cache miss only)
+        run: tools/build-ntfsprogs.sh
+
+      # Deterministic first: seeds mount, regression images fail cleanly.
+      - name: Fuzz corpus check (seeds + regression images)
+        run: tools/fuzz.sh check
+
+      # ASan+LSan regression: the two leaks the fuzzer found in its first
+      # runs must stay fixed. Exits 77 with a LeakSanitizer report if
+      # either comes back.
+      - name: Fuzz regression (ASan+LSan leak checks)
+        run: tools/fuzz.sh regression
+
+      # Then the mutation run. Fails on any crash, timeout, OOM, or leak.
+      - name: Fuzz the parser
+        run: tools/fuzz.sh run ${{ inputs.seconds || '300' }}
+
+      - name: Crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: tools/fuzz/crashes/
+          if-no-files-found: ignore
+          retention-days: 14

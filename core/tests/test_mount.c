@@ -24,6 +24,12 @@
  *   one_flush_per_sync   sync_blockdev() and blkdev_issue_flush() both mapped to
  *                        a device flush, so every fsync issued two and a volume
  *                        sync three (fixed a0e6310). Nothing counted them.
+ *   boot_sector_refusals crafted boot-sector geometry bytes shifted
+ *                        without validation: clusters_per_mft_record -56
+ *                        is 1 << 56, undefined behaviour (fuzzer finding,
+ *                        GAPS.md §5.2), and sectors_per_cluster 0 wraps
+ *                        ffs(0) - 1 into a huge shift. The mount must be
+ *                        refused.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -196,6 +202,99 @@ static struct mount_outcome mount_it(const char *path)
 	r.logfile_clean = info.logfile_clean;
 	ntfs_unmount(vol);
 	return r;
+}
+
+/* Read-only mount, no journal replay and no fallback: exercises
+ * parse_ntfs_boot_sector() directly. The fuzz target always mounts
+ * read-write with replay, so replay's own geometry parse runs first
+ * there; this is the only test that reaches the driver's copy of the
+ * boot-sector shifts (GAPS.md §5.2). Returns the mount error (0 on
+ * success); unmounts on success. */
+static int mount_ro(const char *path)
+{
+	struct ntfs_mount_options o = { .flags = NTFS_MOUNT_RDONLY,
+					.uid = 0, .gid = 0, .fmask = 022, .dmask = 022 };
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	int err;
+
+	dev = ntfs_bdev_open_path(path, false);
+	if (!dev)
+		return -ENOENT;
+	err = ntfs_mount(dev, &o, &vol);
+	if (err) {
+		ntfs_bdev_close(dev);
+		return err;
+	}
+	ntfs_unmount(vol);
+	return 0;
+}
+
+static int patch_byte(const char *path, uint64_t off, uint8_t v)
+{
+	int fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+	if (pwrite(fd, &v, 1, (off_t)off) != 1) {
+		close(fd);
+		return -EIO;
+	}
+	close(fd);
+	return 0;
+}
+
+/*
+ * Boot-sector geometry bytes are attacker-controlled, and
+ * parse_ntfs_boot_sector() shifted them without validating first:
+ * clusters_per_mft_record (0x40) and clusters_per_index_record (0x44)
+ * are signed, so -56 became 1 << 56 -- undefined behaviour, caught by
+ * the fuzzer in the logfile tool's copy of the parse (GAPS.md §5.2).
+ * Sectors per cluster (0x0d) of zero made ffs(0) - 1 wrap into a huge
+ * shift. The mount must be refused, not mounted with a garbage
+ * geometry (on x86 the shift masks and the old code "worked", so this
+ * test pins the refusal; the UB itself is caught by the fuzzer
+ * regression image tools/fuzz/regression/ubsan-boot-cpr.img, run under
+ * ASan+UBSan with -fno-sanitize-recover=all).
+ */
+static void test_boot_sector_geometry_refusals(void)
+{
+	static const struct {
+		uint64_t off;
+		uint8_t value;
+		const char *what;
+		bool expect_fail;
+	} cases[] = {
+		{ 0, 0, "unpatched control", false },
+		{ 0x40, 0xC8, "clusters_per_mft_record -56", true },
+		{ 0x44, 0xC8, "clusters_per_index_record -56", true },
+		{ 0x0d, 0x00, "sectors_per_cluster 0", true },
+	};
+
+	printf("test_boot_sector_geometry_refusals\n");
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		int err;
+
+		if (copy_fixture("basic-4k.img") != 0) {
+			fprintf(stderr, "SKIP test_boot_sector_geometry_refusals: no fixture\n");
+			return;
+		}
+		if (cases[i].off && patch_byte(scratch, cases[i].off, cases[i].value) != 0) {
+			fprintf(stderr, "SKIP %s: cannot patch fixture\n", cases[i].what);
+			unlink(scratch);
+			continue;
+		}
+		err = mount_ro(scratch);
+		if (cases[i].expect_fail) {
+			CHECK(err != 0);
+			if (!err)
+				fprintf(stderr, "FAIL %s: crafted boot sector mounted\n", cases[i].what);
+		} else {
+			CHECK(err == 0);
+			if (err)
+				fprintf(stderr, "FAIL %s: clean fixture refused (%d)\n", cases[i].what, err);
+		}
+		unlink(scratch);
+	}
 }
 
 /* ---- 1. the clean rule, and the two implementations agreeing ---------- */
@@ -614,6 +713,7 @@ int main(void)
 	test_nonempty_journal_rw();
 	test_probe_light_matches();
 	test_one_flush_per_sync();
+	test_boot_sector_geometry_refusals();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

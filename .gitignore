@@ -15,3 +15,12 @@ build-ubsan/
 # They are junk over generated output; delete them when they appear.
 * [0-9].xcodeproj/
 * [0-9].xcworkspace/
+
+# Fuzz harness (GAPS.md §5.2): generated seed corpus, grown corpus
+# entries, regression images, and crash artifacts. Seeds regenerate with
+# tools/fuzz.sh; regression images regenerate with tools/fuzz/mkregression.py;
+# a crash worth keeping becomes a regression test, not a corpus blob.
+tools/fuzz/corpus/
+tools/fuzz/regression/
+tools/fuzz/crashes/
+build-fuzz/

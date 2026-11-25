@@ -227,13 +227,58 @@ changes.
 path and cannot run in CI without signing. It runs manually on the
 maintainer's machine. No local substitute exists on this VM.
 
-### 5.2 No fuzzing of the on-disk parser — open
+### 5.2 No fuzzing of the on-disk parser — done
 NTFS-3G's 2026 CVEs were crafted-image heap overflows in its parser;
 the same class of risk applies to any NTFS parser, including this
 one. Fix: add a fuzz harness (libFuzzer target or a `ntfscli`-based
 corpus runner), seed it with the fixture images, run it in CI on a
 schedule, and fix what it finds. Verify: harness runs, corpus grows,
 first findings triaged.
+
+Done (round 4). Harness: `core/fuzz/fuzz_mount.c` (libFuzzer target +
+standalone runner; mounts the input as a temp-file image, RW with
+$LogFile replay, bounded walk), `tools/fuzz/mkseeds.c` (3 deterministic
+4 MiB seeds: basic / 512 B clusters / compressed), `tools/fuzz.sh`
+(seeds / check / regression / build / run), CI workflow
+`.github/workflows/fuzz.yml` (weekly Sunday 03:00 UTC + dispatch,
+ubuntu-latest, own concurrency group `fuzz-${{ github.ref }}` so it can
+never cancel a push run, gated on the same 20% budget guard as CI).
+`tools/pre-push.sh` runs `tools/fuzz.sh check` (seeds mount, regression
+images fail cleanly); the ASan+LSan leak regression is CI's job.
+
+First findings, all fixed in the same commit with deterministic
+regression images (`tools/fuzz/mkregression.py`, generated, never
+committed; each verified non-vacuous -- it fails on the unfixed code
+and passes on the fixed code):
+- 43-byte volume-label leak: `ntfs_fill_super()` freed the volume
+  with a bare `kfree(vol)` on mount failure; `volume_label` is only
+  freed in `ntfs_volume_free()`. Regression `leak-volume-label.img`
+  ($Secure record magic zeroed; label read, then load fails).
+- 192-byte $LogFile run-list leak: `decode_runs()` left a half-built
+  list on error and `ntfs_image_parse()` never freed the $MFT runs when
+  a later step failed; `ntfs_image_open()` also leaked its fd on a
+  failed parse. Regression `leak-logfile-runs.img` (first pair valid,
+  terminator replaced with a zero-length pair).
+- Shift-overflow UB: boot sector clusters-per-MFT-record -56 made
+  `ntfs_image_parse()` compute `1u << 56`. Fixed there (bound -cpr to
+  -16; sectors-per-cluster threshold aligned to the driver's 0xf4) and
+  in the driver's `parse_ntfs_boot_sector()` (same shifts, plus a zero
+  sectors-per-cluster guard and `INT_MAX` guards on the positive
+  branches) -- the driver's copy is reachable on a read-only mount,
+  where replay does not run first, and is pinned by a new
+  `test_boot_sector_geometry_refusals()` case in `test_mount.c`.
+  Regression `ubsan-boot-cpr.img` (record-size byte set to -56).
+
+Evidence: plain ctest 15/15, UBSan ctest 15/15, fixture suite 265/0/0,
+`tools/fuzz.sh check` (3 seeds mount, 3 regressions fail as expected),
+`tools/fuzz.sh regression` (ASan+LSan, exit 0), 600 s fuzz run
+(9,498 exec, 43 exec/s, 352 new units, 1 UBSan finding -- the shift
+above) and a post-fix 300 s run (clean), ntfsck clean on all 3 seeds.
+
+Follow-ups (not done): a dirty-$LogFile seed (replay only ever sees
+clean logs from the seeds) and a read-only-mount fuzz variant (the
+target mounts RW with replay, so `ntfs_fill_super()`'s own geometry
+parse is only reached after replay accepts the image).
 
 ### 5.3 Upstream tracking has no automation — open
 Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`
@@ -264,6 +309,7 @@ plus the check CI cannot do for itself:
 | fixtures | run `tools/run-tests.sh all` explicitly before pushing core changes | slow; CI is the backstop |
 | Swift tests, app build | none — need xcodebuild / macOS SDK | CI owns these |
 | mount test | none — needs signing + real mount | manual, maintainer only |
+| fuzz (weekly workflow, not `ci.sh`) | `tools/fuzz.sh check` (seeds + regression images) in `tools/pre-push.sh`; `tools/fuzz.sh regression` for the ASan+LSan leak checks | `.github/workflows/fuzz.yml`: weekly + dispatch, ubuntu-latest, own concurrency group, fails on any crash/leak; the mutation run itself is CI-only (300 s) |
 | (no CI stage) | `tools/check-darwin.sh` | preprocesses the C tree for x86_64-apple-darwin; catches macOS-only breakage the Linux build cannot see (it caught the `__GLIBC_PREREQ` failure of run 45661009566 — verified by negative test) |
 | (no CI stage) | shellcheck on `tools/*.sh`, `py_compile` on `tools/*.py`, YAML parse of `.github/workflows/*.yml` | no linters existed before 2026-11-25; these are the first ones |
 

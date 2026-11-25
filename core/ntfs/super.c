@@ -628,6 +628,19 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
 		return false;
 	}
 
+	/*
+	 * A zero sectors-per-cluster makes ffs(0) - 1 wrap to a huge
+	 * shift below (undefined behaviour). A cluster holds at least
+	 * one sector, so zero is never a valid boot sector. Same class
+	 * as the record-size shifts the fuzzer found (GAPS.md §5.2);
+	 * this copy is reachable on a read-only mount, where $LogFile
+	 * replay -- and its own geometry parse -- does not run first.
+	 */
+	if (!b->bpb.sectors_per_cluster) {
+		ntfs_error(vol->sb,
+			"Sectors per cluster is zero.  This is not supported.");
+		return false;
+	}
 	if (b->bpb.sectors_per_cluster >= 0xf4)
 		sectors_per_cluster = 1U << -(s8)b->bpb.sectors_per_cluster;
 	else
@@ -654,16 +667,43 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
 	clusters_per_mft_record = b->clusters_per_mft_record;
 	ntfs_debug("clusters_per_mft_record = %i (0x%x)",
 			clusters_per_mft_record, clusters_per_mft_record);
-	if (clusters_per_mft_record > 0)
-		vol->mft_record_size = vol->cluster_size <<
-				(ffs(clusters_per_mft_record) - 1);
-	else
+	if (clusters_per_mft_record > 0) {
+		int shift = ffs(clusters_per_mft_record) - 1;
+		/*
+		 * cluster_size << shift must fit in an int: a crafted boot
+		 * sector with a huge sector size and cluster count overflows
+		 * the signed shift (undefined behaviour). Anything that
+		 * overflows is rejected by the PAGE_SIZE check below anyway,
+		 * so this changes no valid mount.
+		 */
+		if (vol->cluster_size > (INT_MAX >> shift)) {
+			ntfs_error(vol->sb,
+				"Mft record size (%i clusters of %i bytes) is not supported.",
+				clusters_per_mft_record, vol->cluster_size);
+			return false;
+		}
+		vol->mft_record_size = vol->cluster_size << shift;
+	} else {
 		/*
 		 * When mft_record_size < cluster_size, clusters_per_mft_record
 		 * = -log2(mft_record_size) bytes. mft_record_size normaly is
 		 * 1024 bytes, which is encoded as 0xF6 (-10 in decimal).
+		 *
+		 * The byte is attacker-controlled: -clusters_per_mft_record
+		 * runs to 128, and 1 << 56 is undefined behaviour. The
+		 * fuzzer found it in the logfile tool's copy of this parse
+		 * (GAPS.md §5.2); this copy is reachable on a read-only
+		 * mount, where replay does not run first. Bound the shift
+		 * to what the PAGE_SIZE check below would accept anyway.
 		 */
+		if (-clusters_per_mft_record > 16) {
+			ntfs_error(vol->sb,
+				"Mft record size encoding (%i) is not supported.",
+				clusters_per_mft_record);
+			return false;
+		}
 		vol->mft_record_size = 1 << -clusters_per_mft_record;
+	}
 	vol->mft_record_size_mask = vol->mft_record_size - 1;
 	vol->mft_record_size_bits = ffs(vol->mft_record_size) - 1;
 	ntfs_debug("vol->mft_record_size = %i (0x%x)", vol->mft_record_size,
@@ -690,17 +730,36 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
 	clusters_per_index_record = b->clusters_per_index_record;
 	ntfs_debug("clusters_per_index_record = %i (0x%x)",
 			clusters_per_index_record, clusters_per_index_record);
-	if (clusters_per_index_record > 0)
-		vol->index_record_size = vol->cluster_size <<
-				(ffs(clusters_per_index_record) - 1);
-	else
+	if (clusters_per_index_record > 0) {
+		int shift = ffs(clusters_per_index_record) - 1;
+		/* As for the $MFT record size above: the shift must fit in
+		 * an int. (There is no PAGE_SIZE check for the index record
+		 * size below, so the overflow bound is the only guard.) */
+		if (vol->cluster_size > (INT_MAX >> shift)) {
+			ntfs_error(vol->sb,
+				"Index record size (%i clusters of %i bytes) is not supported.",
+				clusters_per_index_record, vol->cluster_size);
+			return false;
+		}
+		vol->index_record_size = vol->cluster_size << shift;
+	} else {
 		/*
 		 * When index_record_size < cluster_size,
 		 * clusters_per_index_record = -log2(index_record_size) bytes.
 		 * index_record_size normaly equals 4096 bytes, which is
 		 * encoded as 0xF4 (-12 in decimal).
+		 *
+		 * Same bound as the $MFT record size above: the byte is
+		 * attacker-controlled and 1 << 56 is undefined behaviour.
 		 */
+		if (-clusters_per_index_record > 16) {
+			ntfs_error(vol->sb,
+				"Index record size encoding (%i) is not supported.",
+				clusters_per_index_record);
+			return false;
+		}
 		vol->index_record_size = 1 << -clusters_per_index_record;
+	}
 	vol->index_record_size_mask = vol->index_record_size - 1;
 	vol->index_record_size_bits = ffs(vol->index_record_size) - 1;
 	ntfs_debug("vol->index_record_size = %i (0x%x)",
@@ -2610,6 +2669,19 @@ iput_tmp_ino_err_out_now:
 	/* Errors at this stage are irrelevant. */
 err_out_now:
 	sb->s_fs_info = NULL;
+	/*
+	 * The volume label is allocated by load_system_files() and freed
+	 * by ntfs_volume_free() -- the unmount path. A mount that fails
+	 * after the label is read never reaches ntfs_volume_free(): it
+	 * frees the volume here, with a bare kfree(vol), and the label
+	 * leaked. The fuzzer found it (GAPS.md §5.2): a volume with a
+	 * label whose $Secure fails to load leaked 43 bytes per mount
+	 * attempt, every mount, in the driver and in the kernel module
+	 * this was ported from. Free it here; it is NULL on every path
+	 * that fails before the label is read, and kfree(NULL) is safe.
+	 */
+	kfree(vol->volume_label);
+	vol->volume_label = NULL;
 	kfree(vol);
 	/*
 	 * PORT: upstream returns -EINVAL for every failure above. Here -EINVAL
