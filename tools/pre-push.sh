@@ -18,6 +18,12 @@
 #                        every seed and fails cleanly on every regression
 #                        image (the leak half needs ASan, so it is the CI
 #                        fuzz job's job, not pre-push's)
+#   7. upstream port-diff tools/upstream-drift.sh port-diff: what the port
+#                        changed against the pinned pristine copy. Local,
+#                        <1s, informational -- always passes. The numbers
+#                        are the discipline (GAPS.md §5.3); the network
+#                        half (upstream vs latest tag) is the weekly CI
+#                        job's job, not pre-push's.
 #
 # Not covered here, by design -- CI owns them:
 #   - the fixture suite (tools/run-tests.sh all): slow; run it
@@ -105,12 +111,17 @@ stage_fuzz_check() {
 	TMPDIR="${TMPDIR:-/tmp}" "$HERE/fuzz.sh" check
 }
 
+stage_upstream_port_diff() {
+	"$HERE/upstream-drift.sh" port-diff
+}
+
 run_stage "darwin preprocess (macOS-only breakage)" stage_darwin
 run_stage "shellcheck (tools/*.sh)" stage_shellcheck
 run_stage "python compile (tools/*.py)" stage_python
 run_stage "workflow YAML syntax" stage_workflows
 run_stage "ci.sh --quick (toolchain + ctest + UBSan)" stage_ci_quick
 run_stage "fuzz check (seeds + regression images)" stage_fuzz_check
+run_stage "upstream port-diff (core/ntfs vs pinned pristine)" stage_upstream_port_diff
 
 printf '\n==================== pre-push summary ====================\n'
 printf '%s\n' "${results[@]}"

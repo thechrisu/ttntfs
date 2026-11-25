@@ -1,0 +1,74 @@
+name: Upstream drift
+
+# Weekly + manual check that the port has not drifted away from
+# upstream Linux fs/ntfs (GAPS.md §5.3).
+#
+# Deliberately a separate workflow from CI, not a job in ci.yml, for
+# the same reason as fuzz.yml: ci.yml has workflow-level concurrency
+# ci-${{ github.ref }} with cancel-in-progress, so a scheduled run
+# starting while a push run was in flight would CANCEL the push run's
+# checks job. This workflow has its own group (drift-${{ github.ref }})
+# and never touches ci.yml's.
+#
+# No budget guard: the job runs on ubuntu-latest only (~1 minute, no
+# macOS minutes at all), and the 20% rule is about macOS minutes. A
+# public repo does not bill standard runners anyway.
+#
+# The job FAILS when upstream has moved since the pin -- that is the
+# point. The report artifact lists exactly what changed (files with
+# per-file +/-, and the commits that touched fs/ntfs), so the triage
+# is: merge the upstream fix into core/ntfs/ where it applies, or
+# record why not in docs/GAPS.md, then move the pin per
+# upstream/UPSTREAM.md. A red weekly job that nobody triages is the
+# failure mode; the report is what makes triage cheap.
+
+on:
+  schedule:
+    # Sunday 04:00 UTC (staggered an hour after the fuzz job).
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Target tag to compare against (default: latest stable v7.x)"
+        required: false
+        default: ""
+
+concurrency:
+  group: drift-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No network needed: what the port changed against the pin.
+      # Informational -- always passes; the numbers are the discipline.
+      - name: Port diff (core/ntfs vs pinned pristine copy)
+        run: tools/upstream-drift.sh port-diff
+
+      # Needs the network: what upstream did since the pin. Fails
+      # (exit 1) when there is drift to triage; the report is
+      # uploaded either way. GH_TOKEN raises the API rate limit
+      # from 60 to 5000 requests/hour for the commit list.
+      - name: Upstream drift (pinned tag vs latest stable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            tools/upstream-drift.sh upstream --tag "${{ inputs.tag }}" --out drift-report.txt
+          else
+            tools/upstream-drift.sh upstream --out drift-report.txt
+          fi
+
+      - name: Drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-drift-report
+          path: drift-report.txt
+          if-no-files-found: error
+          retention-days: 30

@@ -68,12 +68,49 @@ check that fails, is there a fast local check". The stages, fast first:
 | `python3 -m py_compile` on `tools/*.py` | syntax errors in the guard / push helpers |
 | YAML parse of `.github/workflows/*.yml` | a workflow that GitHub would refuse |
 | `tools/ci.sh --quick` | toolchain + ctest + UBSan (skips the fixture suite) |
+| `tools/fuzz.sh check` | seeds mount, regression images fail cleanly (standalone runner) |
+| `tools/upstream-drift.sh port-diff` | what the port changed vs the pinned pristine copy (informational, <1s) |
 
 Not in the hook, by design: the fixture suite (`tools/run-tests.sh all`) is
 slow — run it explicitly before pushing a change to the core; the Swift unit
 tests, the app build, and the mount test need xcodebuild / signing / a real
 mount and are CI-only or manual. See `docs/GAPS.md` §6 for the full
 CI-stage-to-local-check mapping.
+
+## Upstream drift: `tools/upstream-drift.sh`
+
+Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`, so
+kernel fixes can be merged (design rule 1 in `docs/PORTING.md`). The pin
+(tag `v7.1`, commit in `upstream/UPSTREAM.md`) is the one source of truth.
+
+```sh
+tools/upstream-drift.sh port-diff                    # core/ntfs vs the pinned pristine copy; no network
+tools/upstream-drift.sh upstream                     # pin vs latest stable v7.x; exits 1 on drift
+tools/upstream-drift.sh upstream --tag v7.2          # pin vs a named tag
+tools/upstream-drift.sh upstream --out drift.txt     # same report to a file (the CI artifact)
+tools/test-upstream-drift.sh                         # self-test, no network (fixture repo, both exit paths)
+```
+
+`upstream` first verifies the vendored pristine copy still matches the
+pinned tag byte-for-byte (a hand-edited `upstream/` is an error, exit 2),
+then diffs the pinned `fs/ntfs` against the target's (per-file +/-, new
+and removed files, including new subdirectories such as the WOF codec
+`lib/` added in v7.3) and lists the commits that touched `fs/ntfs` in
+between (GitHub API, path-filtered, paginated). The fetch is cheap on
+purpose: only the two tag tips are fetched, depth 1, trees excluded
+(`--filter=tree:0`), then `fs/ntfs` is sparse-checked out at each tag
+— a full clone of torvalds/linux, or `git archive` in a blob-filtered
+clone, downloads the whole history / whole tree and takes minutes.
+
+`.github/workflows/upstream-drift.yml` runs it weekly (Sunday 04:00 UTC,
+own concurrency group so it can never cancel a push run) and on demand.
+The job fails on drift, which is the point: the report artifact is the
+triage list. First report, 2026-11-25: v7.1 → v7.3 is 31 files changed
+(+2944 −1411) and 124 commits — including WOF (LZX/XPRESS) support,
+EA-stream fixes, compression-write fixes, a `$MFTMirr` write-offset fix
+and an index_root heap OOB fix. Triage of those is a separate item
+(`docs/GAPS.md` §5.3); the pin moves only after a triage, by refreshing
+`upstream/` per `upstream/UPSTREAM.md`.
 
 ## Checking what we wrote: ntfsprogs-plus
 

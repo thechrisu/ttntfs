@@ -280,11 +280,55 @@ clean logs from the seeds) and a read-only-mount fuzz variant (the
 target mounts RW with replay, so `ntfs_fill_super()`'s own geometry
 parse is only reached after replay accepts the image).
 
-### 5.3 Upstream tracking has no automation — open
+### 5.3 Upstream tracking has no automation — done 2026-11-25
 Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`
-so kernel fixes can be merged. Today that is a manual discipline.
-Fix: a script that diffs the vendored files against a pinned upstream
-tag and reports drift, run in CI on a schedule.
+so kernel fixes can be merged. `tools/upstream-drift.sh` now does it,
+with `tools/upstream_drift.py` (GitHub API: tag dates + paginated
+path-filtered commit list) and `tools/test-upstream-drift.sh`
+(self-test, no network, fixture repo):
+- `port-diff`: core/ntfs vs the pinned pristine copy, no network,
+  per-file +/-, upstream-only and port-only files. Also stage 7 of
+  `tools/pre-push.sh` (informational, <1s). Current numbers: 18 files
+  differ, +1004 −115; reparse.c (+370) and reparse.h (+42 on a 21-line
+  file) are the most diverged.
+- `upstream [--tag TAG] [--out FILE]`: verifies the vendored pristine
+  copy still matches the pinned tag byte-for-byte (mismatch is an
+  error, exit 2), diffs pinned fs/ntfs against the target tag, lists
+  the commits touching fs/ntfs in between. Exits 0 clean, 1 on drift.
+  Fetch is cheap by design: only the two tag tips, depth 1, trees
+  excluded (`--filter=tree:0`), then fs/ntfs sparse-checked out at
+  each tag — a full clone, or `git archive` in a blob-filtered clone,
+  downloads the whole history/tree and takes minutes (both tried).
+- `.github/workflows/upstream-drift.yml`: weekly Sunday 04:00 UTC +
+  dispatch, ubuntu-latest, own concurrency group (can never cancel a
+  push run), no budget guard (no macOS minutes; ~1 min/week). Fails
+  on drift; the report is uploaded as an artifact.
+
+Evidence: `upstream --tag v7.1` exits 0 in ~17 s (pristine copy
+matches v7.1 byte-for-byte, 52 files); `upstream` vs latest v7.3
+exits 1 in ~25 s with the full report (saved to /tmp/drift-v73.txt);
+self-test 15/15 PASS (clean/drift/mismatch exit paths, --out matches
+stdout, port-diff baseline reproduced); pre-push 7/7 (see below).
+
+First report, 2026-11-25: v7.1 → v7.3 is 31 files changed (+2944
+−1411) and 124 commits. Headliners: WOF support (new `lib/`,
+`wof.c`, `ntfs_codec.h`; LZX/XPRESS decompressors), `quota.c`/`quota.h`
+removed, and fixes in exactly the areas the port has touched —
+compress.c (+201 −170: compressed-write ordering, context reuse,
+initialized size after writes), ea.c (+242 −74: EA stream rewrite
+before metadata update, empty-pair removal, HasEA on setxattr
+failure), reparse.c (+468 −67: native-symlink support in 7.2,
+simplified `ntfs_reparse_set_native_symlink`), attrib.c (+472 −151),
+mft.c (+370 −229: `$MFTMirr` write offset spanning folios, runlist
+lock, `$MFT` repack), index.c (+238 −103: index_root heap OOB write
+in `ntfs_ir_to_ib`, index root relocation), plus boot-sector
+validation (`sectors_per_cluster`, MFT LCNs — the same class the
+§5.2 fuzz fix addressed) and runlist realloc hardening.
+
+Follow-up (not done): triage those 124 commits — merge what applies
+to core/ntfs/, record what does not in this doc, then move the pin
+(refresh upstream/ per upstream/UPSTREAM.md). The pin does not move
+until the triage does.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
@@ -310,6 +354,7 @@ plus the check CI cannot do for itself:
 | Swift tests, app build | none — need xcodebuild / macOS SDK | CI owns these |
 | mount test | none — needs signing + real mount | manual, maintainer only |
 | fuzz (weekly workflow, not `ci.sh`) | `tools/fuzz.sh check` (seeds + regression images) in `tools/pre-push.sh`; `tools/fuzz.sh regression` for the ASan+LSan leak checks | `.github/workflows/fuzz.yml`: weekly + dispatch, ubuntu-latest, own concurrency group, fails on any crash/leak; the mutation run itself is CI-only (300 s) |
+| upstream drift (weekly workflow, not `ci.sh`) | `tools/upstream-drift.sh port-diff` in `tools/pre-push.sh` (informational); `tools/test-upstream-drift.sh` for the script itself | `.github/workflows/upstream-drift.yml`: weekly + dispatch, ubuntu-latest, own concurrency group, fails on drift; the network half (`upstream` vs latest tag) is CI-only |
 | (no CI stage) | `tools/check-darwin.sh` | preprocesses the C tree for x86_64-apple-darwin; catches macOS-only breakage the Linux build cannot see (it caught the `__GLIBC_PREREQ` failure of run 45661009566 — verified by negative test) |
 | (no CI stage) | shellcheck on `tools/*.sh`, `py_compile` on `tools/*.py`, YAML parse of `.github/workflows/*.yml` | no linters existed before 2026-11-25; these are the first ones |
 
