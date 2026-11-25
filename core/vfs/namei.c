@@ -423,15 +423,17 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	 * listed twelve of our files as "not compressed". Finding 25.
 	 */
 	/*
-	 * Only subdirectories inherit today. For a regular file, marking the
-	 * inode compressed would send its first write through the
-	 * resident-to-non-resident conversion of a compressed attribute, which
-	 * produces a corrupt file (see NV_Compression in core/ntfs/super.c). So
-	 * a file created here is uncompressed and correct, and the folder's
-	 * marker is carried down to child folders so that Windows, or a future
-	 * build with the writer fixed, compresses what is created in them.
+	 * Only subdirectories inherited, until the fresh-file compressed
+	 * writer was fixed (finding 25, fork). For a regular file, marking
+	 * the inode compressed used to send its first write through the
+	 * resident-to-non-resident conversion of a compressed attribute,
+	 * which produced a corrupt file (see NV_Compression in
+	 * core/ntfs/super.c). With the writer fixed, regular files inherit
+	 * too: the file is created compressed and its first write goes
+	 * through the compressed path.
 	 */
-	inherit_compressed = NInoCompressed(dir_ni) && S_ISDIR(mode);
+	inherit_compressed = NInoCompressed(dir_ni) &&
+			(S_ISDIR(mode) || S_ISREG(mode));
 	if (inherit_compressed) {
 		si->file_attributes |= FILE_ATTR_COMPRESSED;
 		ni->flags |= FILE_ATTR_COMPRESSED;

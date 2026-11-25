@@ -384,8 +384,20 @@ static void test_create_in_compressed_directory(void)
 			snprintf(name, sizeof(name), "c%d-file.bin", i);
 			rc = ntfs_create(dir, name, 0100644, &f);
 			if (!rc) {
+				struct ntfs_attr fa;
+
 				CHECK_EQ(ntfs_write(f, big, sizeof(big), 0), (ssize_t)sizeof(big),
 					 "200 KB write into a file in a compressed dir");
+				/*
+				 * Finding 25: the file must come out compressed,
+				 * not merely correct. 200 KB of one byte compresses
+				 * to a few clusters; an uncompressed file reports
+				 * alloc_size == size.
+				 */
+				CHECK(ntfs_getattr(f, &fa) == 0);
+				CHECK_EQ(fa.compressed, 1,
+					 "a file created in a compressed dir must be compressed");
+				CHECK(fa.alloc_size < fa.size);
 				ntfs_inode_put(f); f = NULL;
 			}
 		}
@@ -402,12 +414,13 @@ static void test_create_in_compressed_directory(void)
 	}
 
 	/*
-	 * The files must read back intact, through our own reader, after a
-	 * remount. This is the guard against enabling compression inheritance
-	 * (NV_Compression in core/ntfs/super.c) before the fresh-file compressed
-	 * writer is fixed: with the flag on, these files report their full size
-	 * and return EIO -- measured 2026-09-18. Today they are uncompressed and
-	 * correct, which is the intended state until that writer works.
+	 * The files must be compressed, stored smaller than their logical
+	 * size, and read back intact, through our own reader, after a
+	 * remount. Before the fresh-file writer was fixed (finding 25),
+	 * enabling compression inheritance made these files report their
+	 * full size and return EIO -- measured 2026-09-18 -- because the
+	 * runlist terminator landed inside the last hole block and the
+	 * final compression block was unreadable after a remount.
 	 *
 	 * And a subdirectory made here must carry the compression marker on, so
 	 * Windows compresses what it creates inside it.
@@ -444,9 +457,11 @@ static void test_create_in_compressed_directory(void)
 			if (ntfs_lookup(dir, name, &f)) { failures++; checks++; continue; }
 			CHECK(ntfs_getattr(f, &fa) == 0);
 			CHECK_EQ(fa.size, (int64_t)sizeof(big), "size after remount");
+			CHECK_EQ(fa.compressed, 1, "still compressed after remount");
+			CHECK(fa.alloc_size < fa.size);
 			n = ntfs_read(f, back, sizeof(back), 0);
 			CHECK_EQ(n, (ssize_t)sizeof(big), "read after remount -- EIO here is what "
-				 "enabling NV_Compression without fixing the fresh-file writer causes");
+				 "a runlist terminator inside the last hole block causes");
 			if (n == (ssize_t)sizeof(big))
 				CHECK_EQ(memcmp(back, big, sizeof(big)), 0, "content after remount");
 			ntfs_inode_put(f); f = NULL;
@@ -918,13 +933,14 @@ out:
 
 /*
  * A compressed file small enough to live inside its MFT record has no
- * compression block at all, and core/vfs/api.c's do_write() only routes to
- * ntfs_compress_write() when the inode is already non-resident. So growing this
- * file runs the ordinary non-resident write path against an attribute that is
- * flagged compressed. That is legal on disk -- a compression unit whose whole
- * 16 clusters are allocated is stored raw, which is what comes out -- but it is
- * the one place where a compressed file is written by code that knows nothing
- * about compression, so it is worth holding still.
+ * compression block at all. Growing it past the resident limit converts it
+ * to non-resident as compressed, and do_write() then routes the write
+ * through ntfs_compress_write(). A write that stays resident keeps the
+ * ordinary path, which is legal on disk -- a compression unit whose whole
+ * 16 clusters are allocated is stored raw -- but a write that grows past
+ * the resident limit must go through the compressed writer, or the raw
+ * data lands in a compressed attribute's clusters in a shape no reader
+ * can decode (finding 25).
  */
 static void test_resident_compressed_grow(void)
 {

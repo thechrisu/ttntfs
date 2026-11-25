@@ -737,7 +737,7 @@ grow the index root; long names overflow it into an INDX block at once, after
 which inserts stop resizing the root. Short names grow it in several resident
 resizes first. `test_create_in_compressed_directory` does that.
 
-## Finding 25 (gap, not fixed): files we create in a compressed folder are not compressed
+## Finding 25 (gap, FIXED 2026-11-25): files we create in a compressed folder are not compressed
 
 `compact` on the round-trip folder: `1 are compressed and 12 are not`. The one is
 Windows'. Ours carry attributes `0x00000000` where Windows and ntfs-3g inherit
@@ -746,6 +746,15 @@ space saving the folder promises is simply not delivered for anything written
 from the Mac. Feature gap. Implementing it means setting the flag and the
 compression unit at create and routing the first write through the compressed
 path, which exists and is now verified (below).
+
+Fixed 2026-11-25 (see `docs/GAPS.md` §1.1): `super.c` sets `NV_Compression`,
+`namei.c` inherits COMPRESSED for regular files, `do_write()` routes
+non-resident compressed writes through `ntfs_compress_write()`, and
+`ntfs_non_resident_attr_expand()` rounds the runlist terminator up to a
+compression-block boundary. `test_compress` 412 checks 0 failures; ntfs-3g
+reads a 200,000-byte file written into a compressed folder in full. A
+Windows round trip (`chkdsk` clean, byte-for-byte) is still outstanding --
+needs a Windows machine.
 
 ## Phase 2 compressed round trip: CLOSED (2026-09-18)
 

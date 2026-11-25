@@ -4275,6 +4275,25 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
 		return -EFBIG;
 
 	/*
+	 * PORT: a compressed attribute's allocation is a whole number of
+	 * compression blocks. The hole entries appended below come a
+	 * block at a time, but the terminator is placed at first_free_vcn;
+	 * with that unrounded the terminator lands inside the last hole
+	 * block and the runlist is malformed. Two failures came out of
+	 * it (finding 25): ntfs_write_cb()'s punch of a block past the
+	 * terminator fails with -EINVAL, so extending an existing
+	 * compressed file past its allocation failed; and a reader
+	 * walking the final block past the terminator fails with
+	 * ntfs_rl_vcn_to_lcn(), so a fresh file in a compressed folder
+	 * read EIO after a remount -- ntfs-3g read the first three
+	 * blocks and failed at the fourth. Round it up here, so every
+	 * caller gets a well-formed runlist whatever prealloc it passed.
+	 */
+	if (NInoCompressed(ni) && ni->itype.compressed.block_clusters)
+		first_free_vcn = round_up(first_free_vcn,
+				ni->itype.compressed.block_clusters);
+
+	/*
 	 * Compare the new allocation with the old one and only allocate
 	 * clusters if there is a change.
 	 */

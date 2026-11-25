@@ -16,16 +16,31 @@ then performance, then integration, then testing/shipping.
 
 ## 1. Data safety — fix first, these can eat data
 
-### 1.1 Compressed-file creation corrupts files — open
-The flag exists (`NV_Compression`) but turning it on corrupts files: a
-fresh compressed attribute's resident-to-non-resident conversion breaks
-on the first write past one compression unit (65,536 bytes OK, 65,537
-fails with EIO). Fix the writer in `ntfs_attr_make_non_resident` / the
-first writeback, then set `NV_Compression`.
-Verify: `test_create_in_compressed_directory` (fails 12 ways if the
-flag is set first) plus a Windows round trip — Windows must read what
-we wrote byte for byte and `chkdsk` must stay clean. This is the
-biggest open correctness bug (`docs/TODO.md` finding 25).
+### 1.1 Compressed-file creation corrupts files — done (2026-11-25)
+Files created in a Windows-compressed folder now come out compressed and
+read back intact. Two root causes, both in the fork's write path, not
+upstream's flag: (1) `do_write()` routed a fresh compressed file -- still
+resident -- through the ordinary write path, so raw data landed in a
+compressed attribute's clusters in a shape no reader can decode (65,536
+bytes OK, 65,537 EIO); it now pre-expands and routes non-resident
+compressed writes through `ntfs_compress_write()`. (2)
+`ntfs_non_resident_attr_expand()` placed the runlist terminator inside
+the last hole block for compressed attributes (`first_free_vcn`
+unrounded), so the final block was unreadable after a remount and the
+extend punch failed with -EINVAL; `first_free_vcn` is now rounded up to
+a compression-block boundary for compressed attributes. Gates flipped
+with the fix: `super.c` sets `NV_Compression` (volumes >= 3, <= 4K
+clusters), `namei.c` inherits COMPRESSED for regular files as well as
+directories. `test_create_in_compressed_directory` now asserts the
+created files carry the flag, are stored smaller than their logical
+size, and read back after a remount.
+Evidence: `test_compress` 412 checks 0 failures; plain ctest 15/15;
+UBSan ctest 15/15; `tools/run-tests.sh all` 265 passed 0 failed 0
+skipped with `NTFS_REQUIRE_FSCK=1`; ntfs-3g `ntfscat` reads a 200,000-byte
+file written into a compressed folder in full (was 196,608 then "Failed
+to read a compressed cluster" at 0x30000), our `cat` the same;
+`tools/pre-push.sh` green. Still outstanding: a Windows round trip
+(`chkdsk` clean, byte-for-byte read-back) -- needs a Windows machine.
 
 ### 1.2 No journal writing, only replay — open, large
 The driver replays Windows' `$LogFile` on mount but never writes its

@@ -1162,12 +1162,44 @@ static ssize_t do_write(struct inode *vi, const void *buf, size_t count, loff_t 
 	old_data_size = ni->data_size;
 	old_init_size = ni->initialized_size;
 
-	if (NInoNonResident(ni) && NInoCompressed(ni)) {
-		struct iov_iter from;
+	if (NInoCompressed(ni)) {
+		/*
+		 * PORT: a fresh compressed file starts resident, and the
+		 * compressed writer only runs on non-resident attributes.
+		 * Growing it through the ordinary path instead wrote raw
+		 * data into a compressed attribute's clusters: legal only
+		 * when a whole compression block is allocated, so the last
+		 * partial block came out as raw data in some clusters and
+		 * holes in the rest -- a shape no reader can decode. The
+		 * first read of that block failed with "Still have pages
+		 * left", errors=remount-ro took the volume read-only, and
+		 * after a remount the runlist did not map at all
+		 * (finding 25, measured on the 200 KB write in
+		 * test_create_in_compressed_directory).
+		 *
+		 * Grow it first: the expand converts the attribute (as
+		 * compressed) when the write no longer fits resident, and
+		 * is a no-op otherwise. A write that stays resident keeps
+		 * the ordinary path below, which stores it raw in the MFT
+		 * record -- the same as Windows does for small compressed
+		 * files.
+		 */
+		if (end > ni->data_size) {
+			mutex_lock(&ni->mrec_lock);
+			err = ntfs_attr_expand(ni, end, 0);
+			mutex_unlock(&ni->mrec_lock);
+			if (err) {
+				ret = err;
+				goto done;
+			}
+		}
+		if (NInoNonResident(ni)) {
+			struct iov_iter from;
 
-		iov_iter_init_src(&from, buf, count);
-		ret = ntfs_compress_write(ni, pos, count, &from);
-		goto done;
+			iov_iter_init_src(&from, buf, count);
+			ret = ntfs_compress_write(ni, pos, count, &from);
+			goto done;
+		}
 	}
 
 	/* Grow the attribute (may turn a resident one non-resident). */
