@@ -13,8 +13,18 @@
  * system does not, so callers using strlcpy() directly (bdev_file.c,
  * fs_parser.c, mem.c, test_bdev.c) work everywhere. macOS keeps the
  * system one. strlcpy_() is implemented directly, so it never depends
- * on which case applies. */
-#if defined(__linux__) && !(defined(__GLIBC__) && __GLIBC_PREREQ(2, 38))
+ * on which case applies.
+ * NOTE: __GLIBC_PREREQ may only be mentioned inside a nested #if that is
+ * skipped entirely on non-glibc targets. A single-line #if with && still
+ * expands it on macOS, where it is undefined -- that broke the macOS CI
+ * build (checks run 45661009566). */
+#if defined(__linux__)
+# ifdef __GLIBC__
+#  if __GLIBC_PREREQ(2, 38)
+#   define NTFS_HAVE_SYSTEM_STRLCPY 1
+#  endif
+# endif
+# ifndef NTFS_HAVE_SYSTEM_STRLCPY
 static inline size_t strlcpy(char *dst, const char *src, size_t size)
 {
 	size_t n = strlen(src);
@@ -25,6 +35,7 @@ static inline size_t strlcpy(char *dst, const char *src, size_t size)
 	}
 	return n;
 }
+# endif
 #endif
 static inline size_t strlcpy_(char *dst, const char *src, size_t size)
 {
