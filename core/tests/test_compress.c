@@ -1580,6 +1580,172 @@ out:
 	printf("test_attr_flags\n");
 }
 
+/* ---- a failed compressed rewrite must not lose the old block -------- */
+
+/*
+ * Upstream eb67671cd814: ntfs_write_cb() punched the old compression block
+ * and merged the new runlist into place BEFORE writing the new data, so any
+ * failure after the punch -- allocation, merge, mapping pairs, the write
+ * itself -- left the old block already freed and the runlist pointing at
+ * clusters that never received the new data. The fix allocates first, writes
+ * the new block, and only then punches the old one and merges.
+ *
+ * The failure this test can reach without fault injection is allocation:
+ * fill the volume until a one-cluster allocation fails, then overwrite a
+ * compressed block with incompressible data, which needs a whole new
+ * 16-cluster block. Before the fix the punch frees the old block's
+ * clusters, the allocation still fails (16 needed, ~1 freed), and the old
+ * data is gone; after the fix the allocation fails before anything is
+ * punched and the old block reads back intact after a remount.
+ *
+ * ENOSPC does not set volume errors (lcnalloc.c only sets them when a
+ * rollback fails), so filling the volume must not take it read-only; the
+ * test asserts that too, so a fill that silently went read-only shows up
+ * here instead of as a mysterious -EROFS on the overwrite.
+ */
+static const char *tool(const char *envvar, const char *fallback)
+{
+	const char *v = getenv(envvar);
+	return v && *v ? v : fallback;
+}
+
+/* A fresh mkntfs volume of @mb megabytes with 4 KiB clusters, so the
+ * compression block is the usual 64 KiB (16 clusters). */
+static int make_image(const char *tag, unsigned mb)
+{
+	char cmd[2048];
+
+	snprintf(scratch, sizeof(scratch), "%s/ttntfs-compress-%d-%s.img",
+		 scratch_dir(), (int)getpid(), tag);
+	snprintf(cmd, sizeof(cmd),
+		 "dd if=/dev/zero of='%s' bs=1M count=%u >/dev/null 2>&1 && "
+		 "'%s' -Q -F -c 4096 -L FULL '%s' >/dev/null 2>&1",
+		 scratch, mb, tool("NTFS_MKNTFS", "tools/.local/sbin/mkntfs"), scratch);
+	if (system(cmd) != 0) {
+		fprintf(stderr, "SKIP %s: could not build an image (mkntfs missing?)\n", tag);
+		scratch[0] = 0;
+		return -1;
+	}
+	return 0;
+}
+
+static void test_compressed_block_survives_failed_rewrite(void)
+{
+	static unsigned char old_block[CB_SIZE];
+	static unsigned char new_block[CB_SIZE];
+	static unsigned char back[CB_SIZE];
+	static unsigned char zero_chunk[CB_SIZE];
+	ntfs_inode_t *root = NULL, *f = NULL, *fill = NULL;
+	struct ntfs_volume_info info;
+	struct ntfs_attr a;
+	uint64_t off;
+	ssize_t w;
+
+	printf("test_compressed_block_survives_failed_rewrite\n");
+	if (make_image("full", 16) != 0)
+		return;
+	if (mount_scratch()) { failures++; checks++; unlink(scratch); return; }
+
+	memset(old_block, 'A', sizeof(old_block));
+	fill_random(new_block, sizeof(new_block), 21);
+
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+	CHECK_EQ(ntfs_create(root, "victim.bin", 0100644, &f), 0, "create victim");
+	if (!f) goto out;
+	CHECK_EQ(set_data_flags(f, FATTR_COMPRESSED), 0, "set compressed on victim");
+	CHECK_EQ(ntfs_write(f, old_block, CB_SIZE, 0), (ssize_t)CB_SIZE,
+		 "write compressible block");
+	CHECK(ntfs_getattr(f, &a) == 0 && a.compressed);
+	CHECK(a.alloc_size < a.size);
+	CHECK_EQ(ntfs_volume_sync(g_vol), 0, "volume sync");
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	umount_scratch();
+
+	/* The old block must be on the disk before the volume is filled:
+	 * anything read back from the page cache afterwards proves nothing. */
+	CHECK_EQ(mount_scratch(), 0, "remount");
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root after remount");
+	CHECK_EQ(ntfs_lookup(root, "victim.bin", &f), 0, "lookup victim after remount");
+	if (!f) goto out;
+	CHECK_EQ(read_exact(f, back, CB_SIZE, 0), 0, "read victim after remount");
+	CHECK(first_diff(old_block, back, CB_SIZE) < 0);
+	ntfs_inode_put(f);
+	f = NULL;
+
+	/* Fill the volume: 64 KiB chunks, then single clusters, until an
+	 * allocation fails. The MFT zone shrinks as the data zones run out
+	 * (lcnalloc.c), so a failed one-cluster write means there is
+	 * genuinely nothing left to allocate. */
+	CHECK_EQ(ntfs_create(root, "filler.bin", 0100644, &fill), 0, "create filler");
+	if (!fill) goto out;
+	memset(zero_chunk, 0, sizeof(zero_chunk));
+	off = 0;
+	for (;;) {
+		w = ntfs_write(fill, zero_chunk, sizeof(zero_chunk), off);
+		if (w != (ssize_t)sizeof(zero_chunk))
+			break;
+		off += (uint64_t)w;
+		if (off > (64u << 20))
+			break;
+	}
+	for (;;) {
+		w = ntfs_write(fill, zero_chunk, 4096, off);
+		if (w != 4096)
+			break;
+		off += (uint64_t)w;
+		if (off > (64u << 20))
+			break;
+	}
+	CHECK_EQ(ntfs_volume_get_info(g_vol, &info), 0, "volume info after fill");
+	CHECK(!info.read_only);
+	CHECK(info.free_clusters < 16);
+	ntfs_inode_put(fill);
+	fill = NULL;
+
+	/* The overwrite needs a whole new 16-cluster block for the
+	 * incompressible data and there is nothing left to allocate. */
+	CHECK_EQ(ntfs_lookup(root, "victim.bin", &f), 0, "lookup victim for overwrite");
+	if (!f) goto out;
+	w = ntfs_write(f, new_block, CB_SIZE, 0);
+	CHECK_EQ(w, -ENOSPC, "overwrite of a compressed block on a full volume "
+		 "must fail ENOSPC");
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	umount_scratch();
+
+	/* After a remount: the old block, byte for byte, from the disk. */
+	CHECK_EQ(mount_scratch(), 0, "remount after failed overwrite");
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root after failed overwrite");
+	CHECK_EQ(ntfs_lookup(root, "victim.bin", &f), 0, "lookup victim after failed overwrite");
+	if (f) {
+		CHECK_EQ(read_exact(f, back, CB_SIZE, 0), 0,
+			 "read victim after failed overwrite -- EIO or zeroes here is the "
+			 "old block already punched out from under the failed write");
+		CHECK(first_diff(old_block, back, CB_SIZE) < 0);
+		CHECK_EQ(data_size(f), CB_SIZE, "size after failed overwrite");
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	ntfs_inode_put(root);
+	root = NULL;
+	fsck("failed compressed rewrite");
+
+out:
+	if (f)
+		ntfs_inode_put(f);
+	if (fill)
+		ntfs_inode_put(fill);
+	if (root)
+		ntfs_inode_put(root);
+	umount_scratch();
+	unlink(scratch);
+}
+
 int main(void)
 {
 	static const struct { void (*fn)(void); const char *name; } groups[] = {
@@ -1595,6 +1761,8 @@ int main(void)
 		{ test_sparse_write,		 "sparse_write" },
 		{ test_encrypted_refused,	 "encrypted_refused" },
 		{ test_attr_flags,		 "attr_flags" },
+		{ test_compressed_block_survives_failed_rewrite,
+					 "failed_rewrite" },
 	};
 
 	/* Per-group counts, so a group that silently stopped checking anything

@@ -427,7 +427,28 @@ Porting progress (one commit per item, in the order above):
   case needs an attribute in an extent record). Evidence: attr_flags
   44 checks 0 failures with the fix, 5 failures without it; plain
   ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
-  0 failed with NTFS_REQUIRE_FSCK=1. 55 port items remain.
+  0 failed with NTFS_REQUIRE_FSCK=1.
+- 2026-11-25: `eb67671cd814` (compressed write punches old clusters
+  before the new data lands) — ported: `ntfs_write_cb()` now allocates
+  the new run, writes the new block, and only then punches the old
+  block and merges the runlist, with a shared `free_rlc` exit that
+  frees the new clusters on any failure after allocation. Upstream's
+  bio_alloc NULL check and `cb_clusters` alias do not apply (the port
+  writes through a single `ntfs_bdev_write`, no bio; the punch still
+  takes `ni->itype.compressed.block_clusters`). The port's punch
+  returns 0/-errno, so upstream's bare `if (err)` after the moved
+  punch ports verbatim. Regression test
+  `test_compressed_block_survives_failed_rewrite` in
+  `core/tests/test_compress.c`: a 16 MB volume is filled until a
+  one-cluster allocation fails, then a compressed block is overwritten
+  with incompressible data (needs a whole new 16-cluster block).
+  Without the fix the overwrite still fails ENOSPC but the old block
+  is already punched away and reads back wrong after a remount (1
+  failure); with the fix the old block reads back byte for byte.
+  Evidence: failed_rewrite 25 checks 0 failures with the fix, 1
+  failure without it; plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  54 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

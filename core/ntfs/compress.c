@@ -1441,10 +1441,6 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 
 	new_length = ntfs_bytes_to_cluster(vol, round_up(bio_size, vol->cluster_size));
 
-	err = ntfs_non_resident_attr_punch_hole(ni, new_vcn, ni->itype.compressed.block_clusters);
-	if (err < 0)
-		goto out;
-
 	rlc = ntfs_cluster_alloc(vol, new_vcn, new_length, -1, DATA_ZONE,
 			false, true, true);
 	if (IS_ERR(rlc)) {
@@ -1453,35 +1449,51 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 	}
 
 	bio_lcn = rlc->lcn;
+
+	/*
+	 * PORT: no bio in user space. The clusters were allocated as one run
+	 * above and the data already sits in a contiguous vmap of @pages
+	 * (@outbuf for compressed, @inbuf otherwise), so write it directly.
+	 *
+	 * Upstream eb67671cd814: do not discard the old compression block
+	 * until the new one is safe. The punch and the runlist merge used to
+	 * run before this write, so a failed write left the old block already
+	 * freed and the runlist pointing at clusters that never received the
+	 * new data.
+	 */
+	err = ntfs_bdev_write(vol->sb, pages == pages_disk ? outbuf : inbuf,
+			      ntfs_cluster_to_bytes(vol, bio_lcn), bio_size);
+	if (err)
+		goto free_rlc;
+
+	err = ntfs_non_resident_attr_punch_hole(ni, new_vcn,
+			ni->itype.compressed.block_clusters);
+	if (err)
+		goto free_rlc;
+
 	down_write(&ni->runlist.lock);
 	rl = ntfs_runlists_merge(&ni->runlist, rlc, 0, &new_rl_count);
 	if (IS_ERR(rl)) {
 		up_write(&ni->runlist.lock);
 		ntfs_error(vol->sb, "Failed to merge runlists");
 		err = PTR_ERR(rl);
-		if (ntfs_cluster_free_from_rl(vol, rlc))
-			ntfs_error(vol->sb, "Failed to free hot clusters.");
-		kvfree(rlc);
-		goto out;
+		goto free_rlc;
 	}
 
 	ni->runlist.count = new_rl_count;
 	ni->runlist.rl = rl;
+	rlc = NULL;
 
 	err = ntfs_attr_update_mapping_pairs(ni, 0);
 	up_write(&ni->runlist.lock);
-	if (err) {
+	if (err)
 		err = -EIO;
-		goto out;
-	}
+	goto out;
 
-	/*
-	 * PORT: no bio in user space. The clusters were allocated as one run
-	 * above and the data already sits in a contiguous vmap of @pages
-	 * (@outbuf for compressed, @inbuf otherwise), so write it directly.
-	 */
-	err = ntfs_bdev_write(vol->sb, pages == pages_disk ? outbuf : inbuf,
-			      ntfs_cluster_to_bytes(vol, bio_lcn), bio_size);
+free_rlc:
+	if (ntfs_cluster_free_from_rl(vol, rlc))
+		ntfs_error(vol->sb, "Failed to free hot clusters.");
+	kvfree(rlc);
 out:
 	vunmap(outbuf);
 	for (i = 0; i < pages_count; i++) {
