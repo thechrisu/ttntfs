@@ -91,6 +91,34 @@
 #include "ntfsport/bdev.h"
 #include "ntfs_image.h"
 #include "ntfs_logfile.h"
+#include "../ntfs/ea.h"
+#include <linux/fs.h>
+#include <linux/xattr.h>
+
+/* FILE_ATTR_* bits for ntfs_new_attr_flags() (core/ntfs/layout.h). */
+#define FATTR_SPARSE		0x00000200u
+#define FATTR_COMPRESSED	0x00000800u
+
+/*
+ * Set the sparse/compressed flags on a file's $DATA through the VFS
+ * setxattr handler (ntfs_xattr_handlers[0]->set, "system.ntfs_attrib"),
+ * the production entry point for ntfs_new_attr_flags(). The handler is
+ * used instead of calling ntfs_new_attr_flags() directly because the
+ * test API's ntfs_inode_t is an opaque handle: the function takes the
+ * VFS struct ntfs_inode *, which only the handler can reach from here.
+ * The handle IS the VFS struct inode * (api.c: VI(h)), so the cast is
+ * the same conversion the API layer uses. dentry and idmap are unused
+ * on this path (ea.c: ntfs_setxattr takes them as unused/ignored).
+ */
+static int set_data_flags(ntfs_inode_t *h, uint32_t fattr)
+{
+	uint32_t v = fattr; /* host-endian: the handler cpu_to_le32()s it */
+
+	return ntfs_xattr_handlers[0]->set(ntfs_xattr_handlers[0], NULL, NULL,
+					    (struct inode *)h,
+					    "system.ntfs_attrib",
+					    &v, sizeof(v), 0);
+}
 
 /* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
  * some machines and the 16 TiB geometry image needs ~600 MiB while
@@ -1374,6 +1402,184 @@ static void test_encrypted_refused(void)
 	unlink(scratch);
 }
 
+/* ---- 9. ntfs_new_attr_flags: the five-bug cluster -------------------- */
+
+/*
+ * Upstream 7ed0028126b5 + 9969d58a9b04 + 0ab6dc1ac460 + acb1095fd2db +
+ * 8d139e3635c8, ported as one commit: five bugs in ntfs_new_attr_flags(),
+ * the setxattr path that toggles the sparse/compressed flags on a file's
+ * $DATA. Each case below names the commit it pins.
+ *
+ *   7ed0028126b5  resident conversion: setting sparse/compressed on a
+ *                  resident $DATA must first convert it to non-resident.
+ *                  The old code just set the flag on the resident record
+ *                  and returned, so the data was written uncompressed
+ *                  under a COMPRESSED flag and read back as garbage after
+ *                  a remount. The remount before the read-back is
+ *                  essential: in-session the pagecache masks it.
+ *   9969d58a9b04  resource leak: the no-change early return skipped
+ *                  unmap_mft_record() and ntfs_attr_put_search_ctx().
+ *                  The leak itself is not observable from the test API
+ *                  (the map pin count lives in the VFS inode struct,
+ *                  which the test API intentionally does not expose),
+ *                  so the no-change path is exercised here (returns 0,
+ *                  file still usable) and the fix is proven by the
+ *                  byte-identical diff to upstream v7.3.
+ *   0ab6dc1ac460  payload before shrink: clearing compressed shrinks the
+ *                  record by 8 bytes, and resizing first moves the
+ *                  following attribute over the old mapping pairs, so
+ *                  the pairs must be moved before the resize. The
+ *                  following attribute here is a named $DATA stream.
+ *   acb1095fd2db  memmove overlap: when the record shrinks while the
+ *                  payload offsets increase, the name must not be moved
+ *                  before the mapping pairs. That combination cannot be
+ *                  produced by the flag toggle (the record changes by
+ *                  exactly +8/-8 for an empty file), so there is no
+ *                  behavioural test for it; it is carried verbatim (the
+ *                  function is byte-identical to upstream v7.3, modulo
+ *                  static) and the pre-shrink move it orders is
+ *                  exercised by the 0ab6 case.
+ *   8d139e3635c8  extent record pointer: the resize must use ctx->mrec
+ *                  (the record holding the attribute), not the base
+ *                  record m. It is only reachable for an attribute in
+ *                  an extent record, which the flag toggle cannot
+ *                  produce through the test API (the only caller
+ *                  targets the unnamed $DATA, which is always in the
+ *                  base record) -- so it too is carried verbatim and
+ *                  proven by the byte-identical diff, with no
+ *                  behavioural test.
+ */
+static void test_attr_flags(void)
+{
+	unsigned char *buf, *back;
+	ntfs_inode_t *root, *f = NULL;
+	struct ntfs_attr a;
+	int i;
+
+	if (copy_fixture("empty.img") != 0) {
+		fprintf(stderr, "SKIP test_attr_flags: no fixture\n");
+		return;
+	}
+	if (mount_scratch()) { failures++; checks++; unlink(scratch); return; }
+	buf = malloc(CB_SIZE);
+	back = malloc(CB_SIZE);
+	CHECK(buf != NULL && back != NULL);
+	if (!buf || !back) goto out;
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+
+	/* 7ed: an empty resident file, flagged compressed, must convert
+	 * before the flag is set -- then the data must survive a remount. */
+	CHECK_EQ(ntfs_create(root, "conv", 0100644, &f), 0, "create conv");
+	if (!f) goto out;
+	CHECK_EQ(set_data_flags(f, FATTR_COMPRESSED), 0,
+		 "set compressed on resident file");
+	CHECK(ntfs_getattr(f, &a) == 0 && a.compressed);
+	fill_random(buf, CB_SIZE, 7);
+	CHECK_EQ(ntfs_write(f, buf, CB_SIZE, 0), (ssize_t)CB_SIZE,
+		 "write compressed");
+	CHECK_EQ(ntfs_volume_sync(g_vol), 0, "volume sync");
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	umount_scratch();
+	CHECK_EQ(mount_scratch(), 0, "remount");
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root after remount");
+	CHECK_EQ(ntfs_lookup(root, "conv", &f), 0, "lookup conv after remount");
+	if (f) {
+		CHECK_EQ(read_exact(f, back, CB_SIZE, 0), 0,
+			 "read compressed after remount");
+		CHECK(first_diff(buf, back, CB_SIZE) < 0);
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	ntfs_inode_put(root);
+	fsck("resident conversion");
+	/* Fresh image for the next case, so a failure in one case cannot
+	 * cascade into the next: each case must fail on its own. */
+	umount_scratch();
+	unlink(scratch);
+	if (copy_fixture("empty.img") != 0) {
+		fprintf(stderr, "SKIP test_attr_flags: no fixture\n");
+		goto out;
+	}
+	if (mount_scratch()) { failures++; checks++; goto out; }
+
+	/* 9969: a no-change call must not leak the mapping. */
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+	CHECK_EQ(ntfs_create(root, "nochange", 0100644, &f), 0, "create nochange");
+	if (!f) goto out;
+	/* The no-change path must return 0 and leave the file usable.
+	 * (The leaked map pin count is not observable from the test API;
+	 * the fix is proven by the byte-identical diff to upstream v7.3.) */
+	for (i = 0; i < 10; i++)
+		CHECK_EQ(set_data_flags(f, 0), 0, "no-change set flags");
+	/* And the file is still fully usable afterwards. */
+	fill_random(buf, 4096, 9);
+	CHECK_EQ(ntfs_write(f, buf, 4096, 0), (ssize_t)4096, "write after no-change");
+	CHECK_EQ(read_exact(f, back, 4096, 0), 0, "read after no-change");
+	CHECK(first_diff(buf, back, 4096) < 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	/* Fresh image again, so this case fails on its own. */
+	umount_scratch();
+	unlink(scratch);
+	if (copy_fixture("empty.img") != 0) {
+		fprintf(stderr, "SKIP test_attr_flags: no fixture\n");
+		goto out;
+	}
+	if (mount_scratch()) { failures++; checks++; goto out; }
+
+	/* 0ab6: clear compressed with a following attribute, then re-enable.
+	 * The named stream is the following attribute: if its bytes are
+	 * copied as the mapping pairs, the re-enable corrupts the run list. */
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+	CHECK_EQ(ntfs_create(root, "shrink", 0100644, &f), 0, "create shrink");
+	if (!f) goto out;
+	CHECK_EQ(ntfs_setxattr(f, "tail", "tail-data", 9, 0), 0,
+		 "create following stream");
+	CHECK_EQ(set_data_flags(f, FATTR_COMPRESSED), 0, "set compressed");
+	CHECK_EQ(set_data_flags(f, 0), 0, "clear compressed");
+	CHECK_EQ(set_data_flags(f, FATTR_COMPRESSED), 0, "re-enable compressed");
+	{
+		char tail[16];
+		size_t len = 0;
+
+		CHECK_EQ(ntfs_getxattr(f, "tail", tail, sizeof(tail), &len), 0,
+			 "read following stream");
+		CHECK(len == 9 && memcmp(tail, "tail-data", 9) == 0);
+	}
+	fill_random(buf, CB_SIZE, 11);
+	CHECK_EQ(ntfs_write(f, buf, CB_SIZE, 0), (ssize_t)CB_SIZE,
+		 "write after shrink/re-enable");
+	CHECK_EQ(ntfs_volume_sync(g_vol), 0, "volume sync");
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	umount_scratch();
+	CHECK_EQ(mount_scratch(), 0, "remount");
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root after remount");
+	CHECK_EQ(ntfs_lookup(root, "shrink", &f), 0, "lookup shrink after remount");
+	if (f) {
+		CHECK_EQ(read_exact(f, back, CB_SIZE, 0), 0,
+			 "read after shrink/re-enable");
+		CHECK(first_diff(buf, back, CB_SIZE) < 0);
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	ntfs_inode_put(root);
+	fsck("shrink/re-enable");
+
+out:
+	if (f)
+		ntfs_inode_put(f);
+	free(buf);
+	free(back);
+	umount_scratch();
+	unlink(scratch);
+	printf("test_attr_flags\n");
+}
+
 int main(void)
 {
 	static const struct { void (*fn)(void); const char *name; } groups[] = {
@@ -1388,6 +1594,7 @@ int main(void)
 		{ test_sparse_fixtures,		 "sparse_fixtures" },
 		{ test_sparse_write,		 "sparse_write" },
 		{ test_encrypted_refused,	 "encrypted_refused" },
+		{ test_attr_flags,		 "attr_flags" },
 	};
 
 	/* Per-group counts, so a group that silently stopped checking anything

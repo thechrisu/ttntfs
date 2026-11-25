@@ -406,7 +406,28 @@ Porting progress (one commit per item, in the order above):
   and the entries survive. Evidence: bigdir 507 checks 0 failures
   with the fix, 10 lookup failures without it; plain ctest 15/15,
   UBSan ctest 15/15, `run-tests.sh all` 265 passed 0 failed with
-  NTFS_REQUIRE_FSCK=1. 60 port items remain.
+  NTFS_REQUIRE_FSCK=1.
+- 2026-11-25: the `ntfs_new_attr_flags` cluster — `7ed0028126b5`
+  (resident conversion), `9969d58a9b04` (no-change resource leak),
+  `0ab6dc1ac460` (payload before shrink), `acb1095fd2db` (memmove
+  overlap), `8d139e3635c8` (extent record pointer) — ported as one
+  commit: the composed function is byte-identical to upstream v7.3's
+  `ntfs_new_attr_flags` (208 lines, verified against torvalds/linux
+  v7.3 `fs/ntfs/ea.c`, sha b4fcfbe2da4c). Regression test
+  `test_attr_flags` in `core/tests/test_compress.c`, driven through
+  the VFS setxattr handler (`system.ntfs_attrib`) — the production
+  entry point — because the test API cannot reach the VFS
+  `struct ntfs_inode *`. The resident-conversion and shrink/re-enable
+  cases fail without the fix (lookup -95 after remount, ntfsck exit
+  4); the leak, memmove-overlap, and extent-pointer fixes are
+  carried verbatim and proven by the byte-identical diff (no
+  behavioural test is possible for them: the leak's map pin count is
+  not observable from the test API, the overlap trigger is
+  mathematically unreachable via the flag toggle, and the extent
+  case needs an attribute in an extent record). Evidence: attr_flags
+  44 checks 0 failures with the fix, 5 failures without it; plain
+  ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
+  0 failed with NTFS_REQUIRE_FSCK=1. 55 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
