@@ -23,4 +23,8 @@ build-ubsan/
 tools/fuzz/corpus/
 tools/fuzz/regression/
 tools/fuzz/crashes/
+tools/fuzz/mkseeds
 build-fuzz/
+
+# Python bytecode caches -- never committed.
+__pycache__/
