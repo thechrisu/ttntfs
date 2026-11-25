@@ -58,8 +58,9 @@ jobs:
     # at). Pinned rather than `latest` so an image roll cannot change what the
     # driver is built against without a commit. It must be macOS 26: the
     # deployment target is 26.0 and Options.swift imports FSKit, so an older
-    # image cannot build the Swift tests -- and the project is arm64-only, so an
-    # -intel label would not build at all.
+    # image cannot build the Swift tests. The app builds universal
+    # (arm64 + x86_64, GAPS.md §4.2), so an arm64 runner verifies both
+    # slices; no -intel label is needed.
     runs-on: macos-26
     timeout-minutes: 45
 

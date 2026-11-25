@@ -7,14 +7,12 @@
 # static library target `ntfslogfile`; the CLI and tests are added only when
 # this is the top-level project or NTFS_LOGFILE_TOOLS is ON.
 cmake_minimum_required(VERSION 3.20)
-# Build for the real host CPU even when cmake itself runs under Rosetta
-# (Intel Homebrew cmake spawns x86_64 compilers by default).
+# Universal binary on macOS, matching the top-level default (GAPS.md
+# §4.2): the app links build/libntfscore.a for both archs, so a
+# standalone build of this sub-project must also contain both slices.
+# An explicit -DCMAKE_OSX_ARCHITECTURES still wins.
 if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
-  execute_process(COMMAND sysctl -n hw.optional.arm64 OUTPUT_VARIABLE _ntfs_has_arm64
-                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(_ntfs_has_arm64 STREQUAL "1")
-    set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Target architecture" FORCE)
-  endif()
+  set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Target architectures" FORCE)
 endif()
 project(ntfslogfile C)
 

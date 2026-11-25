@@ -52,6 +52,18 @@ run_stage() {
 	return 0		# keep going: one failure should not hide the others
 }
 
+# A Mach-O file must carry both slices (GAPS.md §4.2). Prints the archs
+# it found, so a failure says which slice is missing. macOS-only (lipo).
+check_universal() {
+	local file="$1" archs
+	[ -f "$file" ] || { echo "not built: $file"; return 1; }
+	archs=$(lipo -archs "$file") || return 1
+	echo "$file: $archs"
+	echo "$archs" | grep -qw arm64 || { echo "missing arm64 slice: $file"; return 1; }
+	echo "$archs" | grep -qw x86_64 || { echo "missing x86_64 slice: $file"; return 1; }
+	return 0
+}
+
 # --- toolchain -------------------------------------------------------------
 # run-tests.sh builds ntfsprogs itself if missing, but doing it here keeps the
 # slow part in its own stage so a CI log shows where the time went.
@@ -68,6 +80,11 @@ stage_toolchain() {
 stage_ctest() {
 	cmake -S . -B build >/dev/null || return 1
 	cmake --build build -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null || return 1
+	# The Xcode app links build/libntfscore.a for both archs (GAPS.md
+	# §4.2). Linux has no lipo and builds single-arch; check only on macOS.
+	if [ "$(uname -s)" = Darwin ]; then
+		check_universal build/libntfscore.a || return 1
+	fi
 	ctest --test-dir build --output-on-failure
 }
 
@@ -105,11 +122,22 @@ stage_swift() {
 # Debug only: Release is Developer ID signed and CI has no certificate.
 stage_build_app() {
 	command -v xcodebuild >/dev/null 2>&1 || { echo "no xcodebuild"; return 1; }
+	local dd="${DERIVED_DATA:-/tmp/ttntfs-ci-dd}"
 	xcodebuild -project fskit/NTFS.xcodeproj -scheme NTFS -configuration Debug \
-		-derivedDataPath "${DERIVED_DATA:-/tmp/ttntfs-ci-dd}" \
+		-derivedDataPath "$dd" \
 		CODE_SIGNING_ALLOWED=NO build \
 		2>&1 | grep -E '^\*\* BUILD|error:' | tail -4
-	return "${PIPESTATUS[0]}"
+	[ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+	# Universal check (GAPS.md §4.2): the app and the extension must each
+	# carry both slices, or Intel Macs get a build that cannot run. lipo
+	# is macOS-only, and this stage only runs where xcodebuild exists.
+	local app_bin="$dd/Build/Products/Debug/TT NTFS Native.app/Contents/MacOS/TT NTFS Native"
+	local ext_bin
+	ext_bin=$(find "$dd/Build/Products/Debug/TT NTFS Native.app/Contents/PlugIns" -name NTFSExtension -type f 2>/dev/null | head -1)
+	[ -n "$ext_bin" ] || { echo "extension binary not found under PlugIns"; return 1; }
+	check_universal "$app_bin" || return 1
+	check_universal "$ext_bin" || return 1
+	return 0
 }
 
 run_stage "toolchain (ntfsprogs + ntfsprogs-plus)" stage_toolchain

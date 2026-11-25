@@ -12,7 +12,7 @@ public source settles it. This goes stale; re-check before quoting it.
 |---|---|---|---|---|---|---|---|
 | Mechanism | FSKit | UserFS plugin (Apple-private; not FSKit despite the `fskit` flag in `mount`) | **kext** | userland ntfs-3g + FUSE kext | FUSE kext; FSKit backend opt-in, experimental, slower | kext, or user-mode "Extension mode" | kext |
 | Full Security on Apple Silicon | yes | yes | **no, Reduced Security** | **no, Reduced Security** | no by default | yes in Extension mode | no |
-| x86_64 | **no** | yes | yes | yes (vendor table says sunset 2024; binary universal) | yes | yes | yes |
+| x86_64 | **yes** (universal, since 2026-11-25) | yes | yes | yes (vendor table says sunset 2024; binary universal) | yes | yes | yes |
 | Licence | GPL-2.0 | proprietary | proprietary | proprietary | GPL | proprietary | proprietary |
 | Price | free | free | $29.95 one-time per major version | $28.95 one-time, lifetime, 5 Macs | free | $19.95/yr or $49.95 | $14.95/mo or $49.95 |
 | Read / write | yes / yes | yes / **no** (write mode removed since Ventura) | yes / yes | yes / yes | yes / yes | yes / yes | yes / yes |

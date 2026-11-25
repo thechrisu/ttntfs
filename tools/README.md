@@ -55,7 +55,7 @@ already existed. A test nobody runs is not coverage.
 ## Fast local checks before pushing: `tools/pre-push.sh`
 
 ```
-tools/pre-push.sh    # darwin cross-check, shellcheck, python, YAML, ci.sh --quick
+tools/pre-push.sh    # darwin, shellcheck, python, YAML, ci.sh --quick, fuzz check, port-diff, archs
 ```
 
 This is what the pre-push hook runs, and it is the answer to "for every CI
@@ -70,6 +70,7 @@ check that fails, is there a fast local check". The stages, fast first:
 | `tools/ci.sh --quick` | toolchain + ctest + UBSan (skips the fixture suite) |
 | `tools/fuzz.sh check` | seeds mount, regression images fail cleanly (standalone runner) |
 | `tools/upstream-drift.sh port-diff` | what the port changed vs the pinned pristine copy (informational, <1s) |
+| `tools/check-archs.sh` | the Xcode ARCHS and the CMake `CMAKE_OSX_ARCHITECTURES` default both name arm64 and x86_64 (GAPS.md §4.2); the generated project sets ARCHS nowhere. The real universal build is CI's job (`tools/ci.sh` checks both slices with `lipo`). Verified by negative test: reverting either side makes it fail. |
 
 Not in the hook, by design: the fixture suite (`tools/run-tests.sh all`) is
 slow — run it explicitly before pushing a change to the core; the Swift unit

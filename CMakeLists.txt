@@ -11,14 +11,16 @@
 #   build/libntfscore.a   the two merged, what fskit/ and tools/ link
 #   tests          platform/tests, platform/pagecache/tests (ctest)
 cmake_minimum_required(VERSION 3.20)
-# Build for the real host CPU even when cmake itself runs under Rosetta
-# (Intel Homebrew cmake spawns x86_64 compilers by default).
+# Universal binary on macOS: the Xcode app and extension build for arm64
+# and x86_64 (fskit/Config/Shared.xcconfig ARCHS), and they link
+# build/libntfscore.a directly, so the core library must contain both
+# slices. Default to both when the user has not set
+# CMAKE_OSX_ARCHITECTURES explicitly (an explicit -D still wins). The old
+# default was arm64 only, which is why Intel Macs could never run the app
+# (GAPS.md §4.2). A plain cmake under Rosetta would otherwise default to
+# x86_64 only, which is the same trap in the other direction.
 if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
-  execute_process(COMMAND sysctl -n hw.optional.arm64 OUTPUT_VARIABLE _ntfs_has_arm64
-                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-  if(_ntfs_has_arm64 STREQUAL "1")
-    set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Target architecture" FORCE)
-  endif()
+  set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "Target architectures" FORCE)
 endif()
 project(ntfsport C)
 

@@ -91,7 +91,7 @@
 - [ ] Port ntfsprogs-plus's v2.0 acceptance into core/ntfs/logfile.c so the log
       stops saying "LogFile version 2.0 is not supported" on every mount.
 
-- [ ] x86_64 build. arm64 only; nothing has ever compiled for a second arch.
+- [x] x86_64 build. Universal since 2026-11-25 (fork commit, GAPS.md §4.2): CMake default `arm64;x86_64` in all three CMakeLists, Xcode `ARCHS = arm64 x86_64`, CI app-build stage checks both slices with `lipo`, `tools/check-archs.sh` pins the consistency locally. Still never *run* on Intel hardware.
 - [x] mkfs in the app: **decided against, 2026-09-19.** NTFS on a disk means the disk
       comes from or goes to Windows, and Windows formats it. A Mac user starting from
       a blank disk should use exFAT, which everything reads and writes natively. This

@@ -192,12 +192,27 @@ without Apple changing FSKit, or shipping an untested
 `/Library/Filesystems/ttntfs.fs` bundle (puts a file outside the app
 bundle — test it in a VM before ever shipping it).
 
-### 4.2 Arm64 only, no x86_64 app build — open
-The C core now builds and passes all tests on x86_64 Linux (fork
-commit 1d7f15ef), but the Xcode app never compiled for a second arch,
-so Intel Macs can't run it. Fix: add the arch to the Xcode project;
-CI's app-build stage (macos-26) verifies it compiles. No Intel
-hardware needed to verify the build.
+### 4.2 Arm64 only, no x86_64 app build — done (2026-11-25)
+
+The app and extension now build universal (arm64 + x86_64). Four pins
+changed in one commit: `CMAKE_OSX_ARCHITECTURES` defaults to
+`arm64;x86_64` in `CMakeLists.txt`, `core/logfile/CMakeLists.txt` and
+`platform/pagecache/CMakeLists.txt` (an explicit `-D` still wins), and
+`fskit/Config/Shared.xcconfig` sets `ARCHS = arm64 x86_64` — the
+generated project sets ARCHS nowhere, so the xcconfig is the single
+source of truth. CI verifies both slices with `lipo` in `tools/ci.sh`:
+`stage_ctest` checks `build/libntfscore.a`, `stage_build_app` checks
+the app and extension binaries. `tools/check-archs.sh` (pre-push
+stage 8) pins the four-way consistency locally and is verified by
+negative test. No arch-specific code stood in the way: the only inline
+asm in the tree is the arch-neutral `barrier()` memory clobber, and
+`tools/check-darwin.sh` already preprocesses the whole C tree for
+x86_64-apple-darwin.
+
+Still open: nothing has ever *run* on Intel hardware — the universal
+build is verified by compilation and `lipo` on the arm64 runner only.
+A first run on a real Intel Mac (or a Rosetta-less x86_64 VM) is the
+remaining check; no Intel hardware is available here.
 
 ### 4.3 macOS 26 only — wontfix unless demand appears
 Deployment target is 26.0, one FSKit API generation. 15.4+ support

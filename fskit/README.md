@@ -51,7 +51,7 @@ NTFS_CORE_MODE = real    # excludes the stub, links ../build/libntfscore.a
 That single line is the switch (or pass `NTFS_CORE_MODE=real` on the
 `xcodebuild` command line without editing anything). In `real` mode the CMake
 build must have produced `build/libntfscore.a` at the repository root first
-(`cmake -S . -B build && cmake --build build`, arm64). Header search paths
+(`cmake -S . -B build && cmake --build build`, universal arm64 + x86_64). Header search paths
 already include `core/include` and `platform/include`. Verified 2026-09-12: the
 real-mode link excludes the stub and resolves every `ntfs_*` and platform
 symbol from the archive.

@@ -113,8 +113,9 @@ Being explicit about this is the point of the document.
 * **Everything in the app that touches the system**: IOKit and Disk Arbitration
   enumeration, `SMAppService`, the uninstaller, the packager, and the SwiftUI
   views. `fskit/NTFSTests` covers the logic that could be separated from them.
-* **x86_64.** arm64 only, so nothing has ever been compiled for a second
-  architecture.
+* **x86_64.** Now built universal (arm64 + x86_64) since 2026-11-25;
+  the app-build stage checks both slices with `lipo`. Nothing has ever
+  been *run* on Intel hardware.
 * **Specific gaps the new suites named**, each because the code is unreachable
   from the public ABI or the input cannot be built here:
   hole punching (`FALLOC_FL_PUNCH_HOLE` is never passed by `ntfs_fallocate`);

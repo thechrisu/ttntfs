@@ -27,7 +27,7 @@ Foundational shims written by the integrator, shared by everyone:
 
 | Stream | Owns | Delivers |
 |---|---|---|
-| **compat** | `platform/include/linux/*` (all remaining shims), `platform/include/asm/*`, `platform/src/` (inode table, bdev_file, misc), `core/ntfs/` (Tier 0/1 sources), `CMakeLists.txt`, `core/CMakeLists.txt` | Tier 0/1 compile to `libntfscore.a` on macOS arm64 with `-Wall -Wextra`; `platform/src/inode.c` implements `fs.h`'s inode table; `bdev_file.c` implements `bdev.h` |
+| **compat** | `platform/include/linux/*` (all remaining shims), `platform/include/asm/*`, `platform/src/` (inode table, bdev_file, misc), `core/ntfs/` (Tier 0/1 sources), `CMakeLists.txt`, `core/CMakeLists.txt` | Tier 0/1 compile to `libntfscore.a` on macOS (universal arm64 + x86_64) with `-Wall -Wextra`; `platform/src/inode.c` implements `fs.h`'s inode table; `bdev_file.c` implements `bdev.h` |
 | **pagecache** | `platform/pagecache/` (+ additive changes to `pagemap.h`/`mm_types.h`) | Every function in `pagemap.h`, write-back thread, unit tests with a fake backend |
 | **vfs** (starts after compat) | `core/vfs/`, `core/include/` | `ntfscore.h` implemented on top of Tier 0/1: inode table glue, lookup/create/rename/unlink, read/write fast path, aops backend, xattr↔ADS, name policy |
 | **fskit** | `fskit/` | Xcode project: host app + FSKit extension + Swift/C bridge + `FSBlockDeviceResource` bdev; builds and mounts against `core/stub/` |

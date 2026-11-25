@@ -14,8 +14,8 @@ the macOS buffer cache rather than this driver. `fsck.ntfs` runs on every write
 test, and `tools/ci.sh` runs every suite that needs no hardware. **Phase 2 closed on 2026-09-14**: `chkdsk /f` found no problems on a volume
 this driver wrote, and the data verified byte-for-byte afterwards. The one
 remaining gate is phase 4: journal replay has still only run against synthetic
-logs. No
-x86_64 build, no `mkfs`/`fsck` in the app, no Homebrew cask. See
+logs. x86_64 build done (universal since 2026-11-25, GAPS.md §4.2), no
+`mkfs`/`fsck` in the app, no Homebrew cask. See
 `docs/progress/*.md` for the detail and the current numbers.
 
 ## 1. Why this source
