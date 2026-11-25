@@ -861,6 +861,13 @@ skip_attr_list_load:
 
 		if (ni->flags & FILE_ATTR_REPARSE_POINT)
 			lmode = ntfs_make_symlink(ni, dir_record);
+		else if (!dir_record && (ni->flags & FILE_ATTR_SYSTEM))
+			/* An ntfs-3g Interix symlink is a plain file record with
+			 * FILE_ATTR_SYSTEM and no reparse point; only the first
+			 * bytes of $DATA tell it from a regular file. A
+			 * directory record always has an I30 index, so the
+			 * !dir_record gate is ntfs-3g's "I30 index absent" rule. */
+			lmode = ntfs_make_interix_symlink(ni);
 
 		if (S_ISLNK(lmode)) {
 			/* The WSL $LXMOD EA may already have put S_IFDIR here for
@@ -2672,13 +2679,33 @@ int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni)
 int __ntfs_write_inode(struct inode *vi, int sync)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
-	struct ntfs_inode *mft_ni = NTFS_I(ni->vol->mft_ino);
+	struct ntfs_inode *mft_ni;
 	struct mft_record *m;
 	int err = 0;
 	bool need_iput = false;
 
 	ntfs_debug("Entering for %sinode 0x%llx.", NInoAttr(ni) ? "attr " : "",
 			ni->mft_no);
+
+	/*
+	 * PORT: ntfs_put_super releases the $MFT inode and NULLs
+	 * vol->mft_ino before the remaining inodes are evicted, and
+	 * put_super assumes none is dirty by then. That assumption is
+	 * false: $Volume is re-dirtied after the unmount sync by clearing
+	 * the dirty flag, and an attribute inode can keep its base inode
+	 * alive past put_super (it holds a reference on the base, and it
+	 * is evicted only in sb_free), so the base can still be dirty
+	 * when it is evicted here. Writing it back needs the $MFT inode
+	 * to write the record through, and there is none left; the volume
+	 * is going away and the write is discarded with it. Crash here
+	 * instead is not an option. Found by the Interix-symlink load
+	 * check, which creates $DATA attribute inodes for system files
+	 * (docs/GAPS.md §2.1); the reparse-point read path has the same
+	 * shape, so the guard protects it too.
+	 */
+	if (!ni->vol->mft_ino)
+		return -EIO;
+	mft_ni = NTFS_I(ni->vol->mft_ino);
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;

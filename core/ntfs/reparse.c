@@ -333,6 +333,143 @@ unsigned int ntfs_reparse_tag_dt_types(struct ntfs_volume *vol, unsigned long mr
 }
 
 /*
+ * ntfs-3g Interix symlinks (docs/GAPS.md §2.1).
+ *
+ * ntfs-3g's default symlink format, and the only one it wrote for years:
+ * a plain file record with FILE_ATTR_SYSTEM, no reparse point and no I30
+ * index, whose unnamed $DATA is the 8-byte magic "IntxLNK\1" followed by
+ * the target in UTF-16LE with no NUL terminator (libntfs/layout.h
+ * INTX_FILE; verified against ntfs-3g 2026.7.7 libntfs/dir.c
+ * ntfs_create_symlink and src/ntfs-3g.c ntfs_fuse_readlink).
+ *
+ * The checks mirror ntfs-3g's own readlink: $DATA must be longer than the
+ * magic -- a magic-only file is not a link, ntfs-3g's readlink rejects it
+ * with -EINVAL -- and no longer than magic + PATH_MAX UTF-16 units
+ * (-ENAMETOOLONG). The caller has already established SYSTEM, no reparse
+ * point and a non-directory record, which is ntfs-3g's
+ * ntfs_dir_entry_type rule (SYSTEM set, I30 index absent).
+ *
+ * The target is decoded with ntfs_ucstonls like the native-symlink path.
+ * ntfs-3g stores no terminator; a hand-crafted file may carry trailing
+ * NULs, which are trimmed, and an embedded NUL is refused rather than
+ * silently truncating the target at strlen().
+ *
+ * Returns S_IFLNK and fills ni->target (UTF-8, NUL-terminated) on a match,
+ * else 0. The target is a POSIX path as stored, so target_volume_abs
+ * stays false and ntfs_readlink/link_target work unchanged.
+ */
+static const u8 intx_symlink_magic[8] = { 'I', 'n', 't', 'x', 'L', 'N', 'K', 1 };
+/* Magic plus PATH_MAX UTF-16 units: ntfs-3g's readlink limit. */
+#define INTX_SYMLINK_MAX_DATA	(8 + 2 * 4096)
+
+unsigned int ntfs_make_interix_symlink(struct ntfs_inode *ni)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct attr_record *a;
+	u8 *data = NULL;
+	unsigned char *s = NULL;
+	s64 size;
+	int slen;
+	unsigned int mode = 0;
+
+	if (!(ni->flags & FILE_ATTR_SYSTEM))
+		return 0;
+
+	/*
+	 * Find the unnamed $DATA and check its size in the MFT record
+	 * before reading it: this runs on every system file at load time,
+	 * and most of them -- $MFT, $LogFile, $UpCase -- are far too big
+	 * to be a link, or, like $Volume's empty $DATA, too small. The
+	 * lookup creates no attribute inode, so nothing is left cached
+	 * holding a reference on the base inode. That matters: an
+	 * attribute inode outlives the base inode's last ordinary
+	 * reference and is evicted only in sb_free, after ntfs_put_super
+	 * has released the $MFT inode -- and a base re-dirtied after the
+	 * unmount sync ($Volume, by clearing the dirty flag) then cannot
+	 * be written back. See the mft_ino guard in __ntfs_write_inode.
+	 */
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return 0;
+	if (ntfs_attr_lookup(AT_DATA, NULL, 0, 0, 0, NULL, 0, ctx)) {
+		ntfs_attr_put_search_ctx(ctx);
+		return 0;
+	}
+	a = ctx->attr;
+	size = ntfs_attr_size(a);
+	if (size <= 8 || size > INTX_SYMLINK_MAX_DATA) {
+		ntfs_attr_put_search_ctx(ctx);
+		return 0;
+	}
+	data = kvzalloc(size, GFP_NOFS);
+	if (!data) {
+		ntfs_attr_put_search_ctx(ctx);
+		return 0;
+	}
+	if (!a->non_resident) {
+		/* The value sits in the record: copy it out before the
+		 * search context, and its MFT record mapping, goes away. */
+		memcpy(data, (u8 *)a +
+		       le16_to_cpu(a->data.resident.value_offset), size);
+		ntfs_attr_put_search_ctx(ctx);
+	} else {
+		struct inode *vi;
+
+		ntfs_attr_put_search_ctx(ctx);
+		/* Non-resident: only now is an attribute inode needed, to
+		 * read through the runlist. */
+		vi = ntfs_attr_iget(VFS_I(ni), AT_DATA, NULL, 0);
+		if (IS_ERR(vi))
+			goto out;
+		if (ntfs_inode_attr_pread(vi, 0, size, data) != size) {
+			iput(vi);
+			goto out;
+		}
+		iput(vi);
+	}
+	if (memcmp(data, intx_symlink_magic, 8))
+		goto out;
+	slen = ntfs_ucstonls(ni->vol, (const __le16 *)(data + 8),
+			     (int)((size - 8) / 2), &s, 0);
+	if (slen <= 0)
+		goto out;
+	while (slen > 0 && s[slen - 1] == '\0')
+		slen--;
+	if (slen <= 0 || (int)strlen((char *)s) != slen)
+		goto out;
+	ni->target = kvzalloc(slen + 1, GFP_NOFS);
+	if (!ni->target)
+		goto out;
+	memcpy(ni->target, s, slen + 1);
+	mode = S_IFLNK;
+out:
+	kvfree(s);
+	kvfree(data);
+	return mode;
+}
+
+/*
+ * Directory-listing type for a possible Interix symlink. The index entry
+ * carries no reparse tag for one, only FILE_ATTR_SYSTEM, so the inode is
+ * the only witness; ntfs_iget runs the same load-time check, so a link
+ * reads S_IFLNK there and a plain SYSTEM file reads S_IFREG.
+ */
+unsigned int ntfs_interix_dt_types(struct ntfs_volume *vol, unsigned long mref)
+{
+	struct inode *vi;
+
+	vi = ntfs_iget(vol->sb, mref);
+	if (IS_ERR(vi))
+		return DT_UNKNOWN;
+	if (S_ISLNK(vi->i_mode)) {
+		iput(vi);
+		return DT_LNK;
+	}
+	iput(vi);
+	return DT_REG;
+}
+
+/*
  * Set the index for new reparse data
  */
 static int set_reparse_index(struct ntfs_inode *ni, struct ntfs_index_context *xr,

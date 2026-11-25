@@ -221,7 +221,7 @@ if(NTFS_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   add_test(NAME links COMMAND test_links)
   set_tests_properties(links PROPERTIES
-    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_NTFSINFO=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/bin/ntfsinfo;NTFS_PATCH_REPARSE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_reparse.py")
+    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_NTFSINFO=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/bin/ntfsinfo;NTFS_PATCH_REPARSE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_reparse.py;NTFS_PATCH_INTERIX=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_interix.py")
 
   # The three name and xattr decisions in PORTING.md section 6, which were
   # recorded and then enforced by nothing: Windows-illegal names rejected,

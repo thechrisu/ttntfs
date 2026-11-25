@@ -688,6 +688,11 @@ static inline int ntfs_filldir(struct ntfs_volume *vol,
 	} else if (ie->key.file_name.file_attributes &
 			FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT)
 		dt_type = DT_DIR;
+	else if (ie->key.file_name.file_attributes & FILE_ATTR_SYSTEM)
+		/* An ntfs-3g Interix symlink carries FILE_ATTR_SYSTEM and no
+		 * reparse tag, so only the inode knows; a directory has the
+		 * DUP flag above and never reaches this branch. */
+		dt_type = ntfs_interix_dt_types(vol, mref);
 	else
 		dt_type = DT_REG;
 

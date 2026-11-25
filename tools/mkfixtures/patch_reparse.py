@@ -184,8 +184,12 @@ def patch_record(vol, mftno, tag, value):
     return fn_name, parent
 
 
-def patch_index_entry(vol, parent, fn_name, mftno, tag):
-    """Find the parent's index entry for (mftno, name) and set the dup flags."""
+def patch_index_entry(vol, parent, fn_name, mftno, tag, flag=FILE_ATTR_REPARSE_POINT):
+    """Find the parent's index entry for (mftno, name) and set the dup flags.
+
+    @flag is the file-attribute bit to set (default REPARSE_POINT, as before);
+    @tag is the reparse tag to store in the $FILE_NAME union, or None to leave
+    the union alone (patch_interix.py sets SYSTEM with no tag)."""
     rec, _ = vol.read_mft_raw(parent)
     fixup_undo(rec)
     def scan_entries(buf, base, end, writeback):
@@ -201,9 +205,10 @@ def patch_index_entry(vol, parent, fn_name, mftno, tag):
             nlen = buf[fn + 0x40]
             name = bytes(buf[fn + 0x42:fn + 0x42 + 2 * nlen])
             if mref == mftno and name == fn_name:
-                fa = u32(buf, fn + 0x38) | FILE_ATTR_REPARSE_POINT
+                fa = u32(buf, fn + 0x38) | flag
                 struct.pack_into('<I', buf, fn + 0x38, fa)
-                struct.pack_into('<I', buf, fn + 0x3C, tag)
+                if tag is not None:
+                    struct.pack_into('<I', buf, fn + 0x3C, tag)
                 writeback()
                 return True
             p += elen

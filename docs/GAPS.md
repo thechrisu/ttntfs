@@ -79,13 +79,47 @@ ntfsprogs, then on Windows.
 
 ## 2. Features Paragon / Tuxera have that this doesn't
 
-### 2.1 Cannot read ntfs-3g Interix symlinks — open
-Stock ntfs-3g is the most deployed third-party NTFS driver; its
-symlinks (`IntxLNK` `$DATA` files) show to us as 1-cluster system
-files with binary contents. Fix: parse the IntxLNK data and resolve
-the target. Verify: create links with ntfs-3g locally (it is already
-built in `tools/.local`), read them through `ntfscli` and the fixture
-suite, round-trip through Windows.
+### 2.1 Cannot read ntfs-3g Interix symlinks — done (2026-11-25)
+
+A file with FILE_ATTR_SYSTEM set, no I30 index and an unnamed $DATA
+starting with the 8-byte `IntxLNK\x01` magic is now presented as
+S_IFLNK, with the UTF-16LE target (no NUL terminator) decoded into
+`ni->target`, so `ntfs_readlink` / `link_target` work unchanged. The
+detection mirrors ntfs-3g's own rules (`libntfs/dir.c`:
+`ntfs_dir_entry_type`, `ntfs_fuse_readlink`): magic match, size
+8 < n <= 8 + 2*PATH_MAX, SYSTEM set, no reparse point. At load time
+the $DATA size is checked in the MFT record first and resident data is
+read straight from the record; an attribute inode is created only for
+non-resident $DATA. Readdir returns DT_LNK for the same entries.
+
+Format verified against ntfsprogs-plus 1.0.0 source and against a
+gold-standard link built with real `ntfs_create_symlink` (ntfs-3g
+2026.7.7, `tools/mkfixtures/mkintx.c`): a fixture patched with
+`tools/mkfixtures/patch_interix.py` matches the gold record
+byte-for-byte (MFT 295, SI/FN 0x24, $DATA resident 20 bytes).
+
+Tests: `test_links` 624 checks, 0 failures (new `test_interix_symlinks`:
+relative / absolute / non-ASCII targets, 3000-char non-resident target,
+negative controls SYSTEM-without-magic / magic-without-SYSTEM /
+magic-only, readdir types, unlink removes only the link, ntfsck clean);
+rebuilt `ntfscli` lists the link as `l----` size 6. Full battery:
+plain ctest 15/15, UBSan ctest 15/15, `tools/run-tests.sh all` with
+NTFS_REQUIRE_FSCK=1: 265 passed, 0 failed, 0 skipped;
+`tools/pre-push.sh` green (Linux stages; Swift/app are CI-only).
+
+The work also exposed and fixed a real driver bug: an attribute inode
+kept alive past `ntfs_put_super` (it holds a reference on its base and
+is evicted only in `sb_free`) could keep a base inode that is re-dirtied
+after the unmount sync — $Volume, by clearing the dirty flag — alive
+until eviction, where writeback dereferenced the already-NULL
+`vol->mft_ino` and segfaulted (`test_crash test_data_before_metadata`).
+`__ntfs_write_inode` now returns -EIO when `vol->mft_ino` is NULL: the
+write is impossible once teardown has released $MFT, and the data is
+discarded with the volume anyway. The reparse-point read path has the
+same shape, so the guard protects it too. The Interix detector itself
+no longer creates attribute inodes for metadata files in the first
+place ($Volume's empty $DATA, $MFT, $LogFile, $UpCase are all ruled out
+by the record-level size check).
 
 ### 2.2 No ACL / security-descriptor mapping — open, by design so far
 Permissions are effectively ignored (`noowners` semantics, SIDs

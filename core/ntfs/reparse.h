@@ -14,6 +14,16 @@ extern __le16 reparse_index_name[];
 unsigned int ntfs_make_symlink(struct ntfs_inode *ni, bool dir_record);
 
 /*
+ * ntfs-3g Interix symlink (docs/GAPS.md §2.1): a plain file record with
+ * FILE_ATTR_SYSTEM, no reparse point and no I30 index, whose unnamed $DATA
+ * is the 8-byte magic "IntxLNK\1" followed by the target in UTF-16LE.
+ * Returns S_IFLNK and fills ni->target on a match, else 0. The directory
+ * listing type for the same check, for readdir entries that carry
+ * FILE_ATTR_SYSTEM but no reparse tag. */
+unsigned int ntfs_make_interix_symlink(struct ntfs_inode *ni);
+unsigned int ntfs_interix_dt_types(struct ntfs_volume *vol, unsigned long mref);
+
+/*
  * Windows symbolic link reparse data, [MS-FSCC] 2.1.2.4. Offsets are from byte
  * 0 of path_buffer, lengths are bytes and exclude any terminator, strings are
  * UTF-16LE. Both names may appear in either order in path_buffer.

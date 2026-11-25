@@ -831,6 +831,297 @@ static void test_windows_dir_links(void)
 }
 
 /*
+ * ntfs-3g Interix symlinks (docs/GAPS.md §2.1).
+ *
+ * Stock ntfs-3g -- the most deployed third-party NTFS driver -- writes its
+ * symlinks as plain files with FILE_ATTR_SYSTEM whose $DATA is the 8-byte
+ * magic "IntxLNK\1" followed by the target in UTF-16LE, no NUL terminator.
+ * Until this fix they read here as regular files with binary contents. The
+ * format was verified against ntfs-3g 2026.7.7 source (libntfs/dir.c
+ * ntfs_create_symlink, src/ntfs-3g.c ntfs_fuse_readlink) and against a link
+ * created by libntfs-3g itself (tools/mkfixtures/mkintx.c): SI/FN
+ * attributes SYSTEM ARCHIVE (0x24), $DATA "IntxLNK\1" + UTF-16LE target.
+ *
+ * No FUSE exists on this VM, so the fixture is built the way the Windows
+ * directory links are: files are created through our own driver with the
+ * right $DATA bytes, then tools/mkfixtures/patch_interix.py flips the
+ * SYSTEM bit in $STANDARD_INFORMATION, $FILE_NAME and the parent's index
+ * entry -- the three places ntfs-3g sets it.
+ *
+ * Cases: relative and absolute targets, a non-ASCII target (UTF-16
+ * conversion), a 3000-character target (forces $DATA non-resident, so the
+ * bounded read is exercised past the resident case), and three negative
+ * controls -- SYSTEM without the magic, magic without SYSTEM, and the
+ * magic alone (an empty target is not a link: ntfs-3g's readlink rejects
+ * it with -EINVAL). A link is also unlinked to show only the link goes.
+ */
+static size_t intx_ascii(const char *target, uint8_t *buf, size_t cap)
+{
+	static const uint8_t magic[8] = { 'I', 'n', 't', 'x', 'L', 'N', 'K', 1 };
+	size_t n = strlen(target), i;
+
+	if (8 + 2 * n > cap)
+		return 0;
+	memcpy(buf, magic, 8);
+	for (i = 0; i < n; i++) {
+		buf[8 + 2 * i] = (uint8_t)target[i];
+		buf[8 + 2 * i + 1] = 0;
+	}
+	return 8 + 2 * n;
+}
+
+static size_t intx_units(const uint16_t *units, size_t nunits,
+			 uint8_t *buf, size_t cap)
+{
+	static const uint8_t magic[8] = { 'I', 'n', 't', 'x', 'L', 'N', 'K', 1 };
+	size_t i;
+
+	if (8 + 2 * nunits > cap)
+		return 0;
+	memcpy(buf, magic, 8);
+	for (i = 0; i < nunits; i++) {
+		buf[8 + 2 * i] = (uint8_t)(units[i] & 0xff);
+		buf[8 + 2 * i + 1] = (uint8_t)(units[i] >> 8);
+	}
+	return 8 + 2 * nunits;
+}
+
+static int write_plain(ntfs_inode_t *dir, const char *name,
+		       const void *data, size_t len)
+{
+	ntfs_inode_t *f = NULL;
+	int rc = ntfs_create(dir, name, 0100644, &f);
+
+	if (rc)
+		return rc;
+	if (len) {
+		ssize_t w = ntfs_write(f, data, len, 0);
+
+		if (w != (ssize_t)len)
+			rc = -EIO;
+	}
+	ntfs_inode_put(f);
+	return rc;
+}
+
+struct dt_entry {
+	char name[64];
+	int type;
+};
+static struct dt_entry dt_list[32];
+static int dt_n;
+
+static int collect_type_cb(const struct ntfs_dirent *e, void *ctx)
+{
+	(void)ctx;
+	if (dt_n < 32 && e->name_len < sizeof(dt_list[0].name)) {
+		memcpy(dt_list[dt_n].name, e->name, e->name_len);
+		dt_list[dt_n].name[e->name_len] = 0;
+		dt_list[dt_n].type = e->type;
+		dt_n++;
+	}
+	return 0;
+}
+
+static int dt_type_of(const char *name)
+{
+	int i;
+
+	for (i = 0; i < dt_n; i++)
+		if (!strcmp(dt_list[i].name, name))
+			return dt_list[i].type;
+	return -1;
+}
+
+static void test_interix_symlinks(void)
+{
+	static const uint16_t uni_units[] =
+		{ 0x74, 0xe4, 0x72, 0x67, 0x65, 0x74, 0x2f, 0xfc }; /* tärget/ü */
+	static const char *patch[] =
+		{ "ilink", "ilink-abs", "ilink-uni", "ilink-long",
+		  "plain-sys", "magic-only" };
+	static struct {
+		const char *name, *expect;
+		int is_link;
+	} cases[] = {
+		{ "ilink",      "target",               1 },
+		{ "ilink-abs",  "/target",              1 },
+		{ "ilink-uni",  "t\xc3\xa4rget/\xc3\xbc", 1 },
+		{ "ilink-long", NULL,                   1 },
+		{ "plain-sys",  NULL,                   0 },
+		{ "magic-nosys", NULL,                  0 },
+		{ "magic-only", NULL,                   0 },
+	};
+	const char *py = getenv("NTFS_PATCH_INTERIX");
+	struct vol v;
+	uint8_t buf[8192];
+	char long_target[3001];
+	char cmd[PATH_MAX * 2 + 256];
+	size_t i, n;
+	int rc;
+
+	printf("test_interix_symlinks\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_interix_symlinks: NTFS_PATCH_INTERIX not set\n");
+		return;
+	}
+	if (copy_fixture("interix") != 0) {
+		fprintf(stderr, "SKIP test_interix_symlinks: no fixture\n");
+		return;
+	}
+
+	/* The long target: 2993 a's + "/target" = 3000 chars, so $DATA is
+	 * 6008 bytes and cannot stay resident in a 1024-byte record. */
+	memset(long_target, 'a', 2993);
+	memcpy(long_target + 2993, "/target", 7);
+	long_target[3000] = 0;
+	cases[3].expect = long_target;
+
+	/* Phase 1: a real target file, the links with IntxLNK $DATA, and
+	 * the three negative controls. */
+	if (vol_up(&v, 022, 022, 501, 20)) { unlink(scratch); return; }
+	CHECK(write_plain(v.root, "target", "hello\n", 6) == 0);
+	n = intx_ascii("target", buf, sizeof(buf));
+	CHECK(n > 0 && write_plain(v.root, "ilink", buf, n) == 0);
+	n = intx_ascii("/target", buf, sizeof(buf));
+	CHECK(n > 0 && write_plain(v.root, "ilink-abs", buf, n) == 0);
+	n = intx_units(uni_units, sizeof(uni_units) / sizeof(uni_units[0]),
+		       buf, sizeof(buf));
+	CHECK(n > 0 && write_plain(v.root, "ilink-uni", buf, n) == 0);
+	n = intx_ascii(long_target, buf, sizeof(buf));
+	CHECK(n > 0 && write_plain(v.root, "ilink-long", buf, n) == 0);
+	CHECK(write_plain(v.root, "plain-sys", "hello\n", 6) == 0);
+	n = intx_ascii("target", buf, sizeof(buf));
+	CHECK(n > 0 && write_plain(v.root, "magic-nosys", buf, n) == 0);
+	CHECK(write_plain(v.root, "magic-only",
+			  (const uint8_t[]){ 'I','n','t','x','L','N','K', 1 }, 8) == 0);
+	vol_down(&v);
+
+	/* Phase 2: flip SYSTEM on every case except magic-nosys. The MFT
+	 * number comes from ntfsinfo so the test does not depend on
+	 * allocation order. */
+	for (i = 0; i < sizeof(patch) / sizeof(patch[0]); i++) {
+		const char *info = getenv("NTFS_NTFSINFO");
+		char line[64];
+		FILE *p;
+		long mftno = -1;
+
+		if (!info) break;
+		snprintf(cmd, sizeof(cmd),
+			 "%s -F /%s %s 2>/dev/null | grep -m1 'Dumping Inode' | grep -oE '[0-9]+' | head -1",
+			 info, patch[i], scratch);
+		p = popen(cmd, "r");
+		if (p && fgets(line, sizeof(line), p)) mftno = strtol(line, NULL, 10);
+		if (p) pclose(p);
+		CHECK_MSG(mftno > 0, "could not find the MFT number of %s", patch[i]);
+		if (mftno <= 0) continue;
+		snprintf(cmd, sizeof(cmd), "python3 %s %s %ld >/dev/null 2>&1",
+			 py, scratch, mftno);
+		rc = system(cmd);
+		CHECK_MSG(rc == 0, "patch_interix.py failed for %s (rc %d)", patch[i], rc);
+	}
+
+	/* Phase 3: read them back. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_interix_symlinks: remount failed\n");
+		failures++; checks++; unlink(scratch); return;
+	}
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		struct ntfs_attr at;
+		char rbuf[4096];
+		ntfs_inode_t *l = NULL;
+		size_t rn = 0;
+
+		CHECK_MSG(ntfs_lookup(v.root, cases[i].name, &l) == 0,
+			  "lookup(%s)", cases[i].name);
+		if (!l) continue;
+		CHECK(ntfs_getattr(l, &at) == 0);
+		if (cases[i].is_link) {
+			CHECK_MSG((at.mode & S_IFMT) == S_IFLNK,
+				  "%s: mode %o is not S_IFLNK -- an ntfs-3g Interix "
+				  "link read as something else", cases[i].name, at.mode);
+			CHECK_MSG(ntfs_readlink(l, rbuf, sizeof(rbuf), &rn) == 0,
+				  "readlink(%s)", cases[i].name);
+			CHECK_MSG(rn == strlen(cases[i].expect) &&
+				  !memcmp(rbuf, cases[i].expect, rn),
+				  "%s: readlink '%.*s', expected '%s'", cases[i].name,
+				  (int)rn, rbuf, cases[i].expect);
+			CHECK_MSG(at.size == (int64_t)rn,
+				  "%s: size %lld != readlink length %zu",
+				  cases[i].name, (long long)at.size, rn);
+		} else {
+			CHECK_MSG((at.mode & S_IFMT) == S_IFREG,
+				  "%s: mode %o is not S_IFREG -- a negative control "
+				  "read as a link", cases[i].name, at.mode);
+		}
+		ntfs_inode_put(l); l = NULL;
+	}
+
+	/* The negative controls must still be readable as the plain files
+	 * they are: SYSTEM without the magic keeps its bytes, and the magic
+	 * without SYSTEM is inert data. */
+	{
+		ntfs_inode_t *f = NULL;
+		char rbuf[64];
+		ssize_t r;
+
+		CHECK(ntfs_lookup(v.root, "plain-sys", &f) == 0);
+		if (f) {
+			r = ntfs_read(f, rbuf, 6, 0);
+			CHECK_MSG(r == 6 && !memcmp(rbuf, "hello\n", 6),
+				  "plain-sys content changed: %zd bytes", r);
+			ntfs_inode_put(f); f = NULL;
+		}
+		CHECK(ntfs_lookup(v.root, "magic-nosys", &f) == 0);
+		if (f) {
+			r = ntfs_read(f, rbuf, 20, 0);
+			CHECK_MSG(r == 20 && !memcmp(rbuf, "IntxLNK\1", 8),
+				  "magic-nosys content changed: %zd bytes", r);
+			ntfs_inode_put(f); f = NULL;
+		}
+	}
+
+	/* readdir must agree with stat: links list as symlinks, the SYSTEM
+	 * file without the magic as a file. */
+	{
+		uint64_t cookie = 0;
+		bool eof = false;
+
+		dt_n = 0;
+		while (!eof && ntfs_readdir(v.root, &cookie, false,
+					    collect_type_cb, NULL, &eof) == 0)
+			;
+		CHECK_MSG(dt_type_of("ilink") == NTFS_ITEM_SYMLINK,
+			  "readdir: ilink type %d, not SYMLINK", dt_type_of("ilink"));
+		CHECK_MSG(dt_type_of("ilink-long") == NTFS_ITEM_SYMLINK,
+			  "readdir: ilink-long type %d, not SYMLINK", dt_type_of("ilink-long"));
+		CHECK_MSG(dt_type_of("plain-sys") == NTFS_ITEM_FILE,
+			  "readdir: plain-sys type %d, not FILE", dt_type_of("plain-sys"));
+		CHECK_MSG(dt_type_of("magic-nosys") == NTFS_ITEM_FILE,
+			  "readdir: magic-nosys type %d, not FILE", dt_type_of("magic-nosys"));
+	}
+
+	/* Phase 4: removing a link removes the link. */
+	CHECK_MSG(ntfs_unlink(v.root, "ilink") == 0, "unlink on an Interix link must remove it");
+	{
+		ntfs_inode_t *gone = NULL;
+
+		CHECK(ntfs_lookup(v.root, "ilink", &gone) == -ENOENT);
+		if (gone) ntfs_inode_put(gone);
+	}
+	{
+		ntfs_inode_t *t = NULL;
+
+		CHECK_MSG(ntfs_lookup(v.root, "target", &t) == 0,
+			  "the Interix link's TARGET must survive");
+		if (t) ntfs_inode_put(t);
+	}
+	vol_down(&v);
+	fsck_clean("ntfs-3g Interix symlinks");
+	unlink(scratch);
+}
+
+/*
  * The two on-disk copies of a symlink's $FILE_NAME must agree on the reparse
  * tag.
  *
@@ -1591,6 +1882,7 @@ int main(void)
 	test_symlink_filename_union_is_the_tag();
 	test_symlink_tag_choice();
 	test_windows_dir_links();
+	test_interix_symlinks();
 	test_symlink_to_directory_is_a_directory_record();
 	test_time_conversion();
 	test_timestamps();
