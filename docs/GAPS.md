@@ -42,13 +42,31 @@ to read a compressed cluster" at 0x30000), our `cat` the same;
 `tools/pre-push.sh` green. Still outstanding: a Windows round trip
 (`chkdsk` clean, byte-for-byte read-back) -- needs a Windows machine.
 
-### 1.2 No journal writing, only replay — open, large
+### 1.2 No journal writing, only replay — open, large, scoped (2026-11-25)
 The driver replays Windows' `$LogFile` on mount but never writes its
 own records. Metadata is write-back, flushed within 1 s and on
 sync/unmount, so a yank mid-write has no journal to recover from.
 Full `$LogFile` journaling (writing records, not just replay) is the
-item that makes yanks safe (`docs/PORTING.md` §6). Large; scope it
-before starting.
+item that makes yanks safe (`docs/PORTING.md` §6). Scoped in
+`docs/JOURNAL-DESIGN.md` (this round); no implementation yet, by
+design — the finding is that it is several months of focused work,
+comparable to the phase-4 replay work. Headlines: no writer exists
+anywhere in the ecosystem this driver is built from (vendored
+`logfile.c`, ntfs-3g, ntfs3 `fslog.c` are all replay-only or nothing;
+the ecosystem's recovery path is the dirty flag plus `chkdsk`); on a
+read-write mount the journal is retired (`mark_clean`, 2 pages) and
+every later metadata write is unjournaled; Windows is a co-reader of
+our records from the first commit (a yank leaves them in the log for
+Windows to replay), so the bar is `chkdsk` + Windows-mount
+acceptance, not self-agreement; WAL means log-at-commit-time with a
+synchronous log flush before the operation's folios are eligible for
+background writeback; write v1.1 records first (already proven
+accepted by Windows via `mark_clean`). Phased plan in the design doc:
+Phase 0 gates (§1.3 replay-atomicity proof, §1.5 real v2.0 image),
+Phase 1 LFS writer infrastructure (2–4 weeks), Phase 2 one operation
+class end-to-end (file creation, 2–3 weeks), Phase 3 class by class
+(~8 classes, 2–4 months), Phase 4 wrap/checkpoint/performance,
+Phase 5 Windows round-trip per class. Next round starts at Phase 0/1.
 
 ### 1.3 Replay atomicity unproven — open
 Nothing demonstrated a partial write during replay, nothing rules one

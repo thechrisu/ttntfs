@@ -1,0 +1,334 @@
+# `$LogFile` journal writing — design (GAPS.md §1.2)
+
+Status: **scoped, not started**. This document is the scope: what the
+writer must do, why it is the largest item in the gap list, and the
+phased plan. No code lands from this round; the next round starts at
+Phase 0/1 below.
+
+## 1. Where we are
+
+The driver replays `$LogFile` but never writes it. That is not an
+oversight in one file — there is no writer anywhere in the ecosystem
+this driver is built from:
+
+- `core/ntfs/logfile.c` (vendored Linux 7.1): no journal writing.
+  `ntfs_empty_logfile()` only wipes the log.
+- `libntfs-3g` (`tools/build/src/ntfsprogs-plus-1.0.0/libntfs/logfile.c`):
+  read-only clean check; no record writing.
+- Paragon `ntfs3` `fslog.c`: replay only — and its replay is reported
+  inoperative by the NTFSPLUS author (`docs/LOGFILE.md` §5).
+- `core/logfile/` (this repo's own replay module): reads geometry, LSNs,
+  restart pages, checkpoints, tables and all 37 redo/undo opcodes
+  (`docs/LOGFILE.md` §2.9); writes exactly two things — replayed MFT
+  records/clusters (`logfile_replay.c`) and clean restart pages
+  (`ntfs_logfile_mark_clean()`, `logfile_repair.c`). `current_lsn` is
+  read in `logfile_open.c:325` and never advanced by any writer.
+
+What happens today, step by step:
+
+1. On a read-write mount, `ntfs_glue_make_rw()` (`core/vfs/super_glue.c`)
+   **retires the journal**: `ntfs_logfile_mark_clean_device()` writes
+   two restart pages (v1.1, `VOLUME_IS_CLEAN`, log closed) — 2 writes,
+   8 KiB. Only if that fails does it fall back to
+   `ntfs_empty_logfile()`, the full-log erase. After this the log is
+   empty and clean.
+2. Every metadata write after that is unjournaled. Metadata policy
+   (`docs/PORTING.md` §6): write-back, background writer tick 200 ms
+   (`WRITER_TICK_NS`), folios dirty longer than 1000 ms
+   (`NTFS_WRITEBACK_INTERVAL_MS`) flushed, `pagecache_sync_sb` ordering
+   MFT-last; flush on sync/unmount. The first write of a session sets
+   `VOLUME_IS_DIRTY` (`core/vfs/api.c`, `file.c`, `namei.c`); a clean
+   unmount clears it (`core/ntfs/super.c`).
+3. A yank after metadata has flushed but before unmount leaves the
+   volume dirty with an **empty journal**. Windows has nothing to
+   replay. Recovery is `chkdsk`, not the journal. That is the current
+   crash story, and it is the reason this item is first in the gap list:
+   everything else in §1 is about making replay correct; this one is
+   about having anything to replay at all.
+
+What the replay work buys the writer: a complete, Windows-verified
+reader and applier for every record type the writer must emit, plus a
+`mark_clean` that writes restart pages Windows accepts byte-for-byte
+(`docs/LOGFILE.md` E1). The writer is the mirror image of that engine.
+It is also the reason the writer cannot be a small patch: the replay
+engine took a whole phase (phase 4) and is still only verified on four
+scenarios plus synthetics.
+
+## 2. What "journal writing" means
+
+Write-ahead logging (WAL), the NTFS rule: **a metadata change reaches
+the disk only after the log record describing it is durable**. In
+concrete terms, for every metadata mutation the driver must:
+
+1. Group the mutation into a **transaction** — one user-visible
+   operation (create, rename, unlink, extend, …) — with redo records
+   (what to re-apply) and undo records (what to roll back) for every
+   MFT record, index block, bitmap range and mapping-pair change it
+   makes.
+2. Append those records to `$LogFile`'s circular area, allocate LSNs,
+   maintain the restart area (current LSN, checkpoint tables), and
+   **flush the log pages to the device** before the metadata itself is
+   written.
+3. On a clean unmount, close the log exactly as `mark_clean` does now
+   (v1.1, `VOLUME_IS_CLEAN`). On a crash, the next mount — ours or
+   Windows' — replays the records and the volume comes back consistent
+   to the last committed transaction.
+
+File *data* is never journaled in NTFS, only metadata. Data writes
+stay exactly as they are. The journal covers MFT records, index
+blocks, `$Bitmap`, `$MFT` mapping pairs and attribute headers — the
+things `chkdsk` currently has to reconstruct after a yank.
+
+## 3. Why this is the biggest item
+
+### 3.1 There is no transaction model to hook into
+
+Mutations today are ad-hoc sequences spread across `attrib.c`,
+`mft.c`, `index.c`, `bitmap.c`, `lcnalloc.c`, `ea.c`, `reparse.c`,
+`namei.c` and `file.c`, each writing MFT records, index blocks and
+bitmap bits through the page cache with no grouping. Journaling needs
+every one of those paths instrumented to emit records for what it just
+changed, grouped per user-visible operation, with a commit point. That
+is a cross-cutting change to the whole write path, not a module you
+bolt on the side. The transaction boundaries have to be designed
+operation by operation: a rename is two directory updates plus a
+`$FILE_NAME` move; an extend is mapping pairs plus sizes plus bitmap;
+a create is an MFT record init plus attributes plus index entries plus
+bitmap. Nothing in the current code knows where one operation ends.
+
+### 3.2 Record emission must be byte-exact NTFS
+
+The writer must produce the same client records the replay engine
+parses (`docs/LOGFILE.md` §2.5–2.9): LFS header (LSNs, transaction
+id, record type, flags), NTFS client header (redo/undo opcodes,
+offsets, lengths, `target_attr`, `lcns_to_follow`, `record_offset`,
+`attribute_offset`, `cluster_block_offset`, `target_vcn`,
+`page_lcns[]`), and redo/undo payloads in the exact layout each
+opcode expects. Every opcode the driver can cause needs an emitter;
+every emitter needs its payload validated against the replay engine
+and against Windows. A record that is merely well-formed is not
+enough — it must describe the change the metadata actually made, or
+replay will "fix" the volume into a wrong state, which is worse than
+no journal at all.
+
+### 3.3 Windows is a co-reader from the first commit
+
+There is no safe subset in which only our replay reads our records.
+We retire the log on a clean unmount, so Windows never sees our
+records after a clean session — but a yank leaves them in the log,
+and the next Windows mount **will** replay them. So the records must
+be Windows-acceptable from day one. The acceptance bar is not "our
+replay agrees with itself" but "`chkdsk` clean and a Windows mount
+replays them to the same state". That bar can only be cleared on a
+Windows machine, per operation class (Phase 5), which is why the
+phases below keep Windows validation as a gate rather than an
+afterthought.
+
+### 3.4 LFS machinery the reader never needed
+
+The reader parses LSNs, pages, restart areas and checkpoints. The
+writer must *maintain* them: allocate LSNs from `current_lsn` with
+correct sequence numbers, lay records into pages (8-aligned, at
+`log_page_data_offset`, multi-page continuation with
+`LOG_RECORD_END` / `last_end_lsn`), write tail copies, keep the
+restart area's `current_lsn` / `last_lsn_data_length` current, emit
+checkpoint records (`NTFS_RESTART`, record type 2) carrying the four
+table dumps (open-attribute, attribute-names, dirty-page,
+transaction), and reuse the circular area when the log wraps — which
+requires checkpointing everything older than the wrap point first.
+None of that code exists; the reader's geometry and LSN math
+(`logfile_open.c`, `logfile_pages.c`) are reusable, the maintenance
+is new.
+
+### 3.5 Ordering against the page cache
+
+The background writer flushes dirty folios on its own schedule
+(200 ms tick, 1000 ms age), with no knowledge of any log. WAL needs
+log-before-metadata ordering, and the flush path must enforce it.
+The design decision (see §4) is to log at mutation time, not at
+flush time: the log write is part of the operation's commit, before
+its folios are eligible for background writeback. That keeps the
+page-cache writer untouched but puts a synchronous log flush on the
+commit path of every metadata op — one log flush per op, which is
+acceptable for metadata (already ~0.3–0.6 ms per op over FSKit) and
+is what NTFS itself does (log writes are synchronous, metadata is
+lazy). The existing `pagecache_sync_sb` MFT-last ordering is a
+precedent for ordered flushes, not a substitute for WAL: it orders
+metadata against metadata, where WAL orders log against metadata.
+
+### 3.6 The writer makes replay atomicity a gate (GAPS.md §1.3)
+
+Today replay atomicity is unproven (finding 17b: flush writes
+records one at a time, the overlay protects planning only) and replay
+stays opt-in per volume. Once we write our own records, our replay
+must apply them after a crash that may itself have interrupted a
+replay — so §1.3's fault-injection proof becomes a prerequisite,
+not a parallel item. The writer also needs a round-trip property the
+reader never had: records we write must replay through our own
+engine to exactly the state the metadata already has (idempotence
+via the per-record LSN skip the replay engine already implements).
+
+### 3.7 Torn writes and the log's own integrity
+
+A yank can tear a log page mid-write. The format already defends
+against this — every page carries update-sequence fixups and the
+tail scan (H4, `docs/LOGFILE.md` §3) refuses a tail that could only
+have been written after the page under examination — but the writer
+must use it correctly: never emit a record that straddles a page
+boundary except through the multi-page protocol, never update the
+restart area to point past a page that is not yet durable, and never
+let `current_lsn` advance past a torn page. The restart area is the
+one structure whose corruption loses the whole log, so it is updated
+last, after the record pages it describes are durable.
+
+## 4. Design
+
+### 4.1 Modules
+
+- **LFS writer** — new, in `core/logfile/` beside the reader
+  (e.g. `logfile_write.c`): append records to the circular area, LSN
+  allocation, page sequencing and fixups, tail copies, restart-area
+  maintenance, checkpoint emission, log wrap. It shares the reader's
+  geometry, LSN math and page layout; it does not know about inodes.
+  Testable offline with `ntfslog` + the replay engine as oracle, no
+  mount needed.
+- **Transaction / record emission** — new, in `core/ntfs/` where the
+  mutations live, behind a small API the mutation paths call:
+  `ntfs_journal_begin(vol, &txn)`,
+  `ntfs_journal_log_<op>(txn, …)` per operation class,
+  `ntfs_journal_commit(txn)` / `ntfs_journal_abort(txn)`. Records are
+  staged in memory per transaction and appended only at commit; abort
+  discards the staging, so a failed operation writes no log at all.
+  The emission functions live next to the code that performs each
+  operation, because only that code knows what changed.
+- **Commit / flush integration** — in the write path: commit appends
+  the transaction's records to `$LogFile`, `pwrite`s the log pages and
+  `sync`s the device, and only then marks the operation's folios
+  eligible for writeback. The background writer needs no change: it
+  only ever sees folios whose log records are already durable.
+- **Close path** — the writer's unmount close replaces/augments
+  `ntfs_logfile_mark_clean()`: same two restart pages, same v1.1
+  clean state, but written by the writer module so the restart area
+  it closes is the one the writer maintained. The existing
+  `mark_clean` stays as the path for volumes whose log we did not
+  write (retiring a Windows log on mount).
+
+### 4.2 Version: 1.1 first
+
+Write v1.1 records. The record format is version-independent; what
+differs is the restart-area layout and the tail-copy area (v1.1: 2
+tail pages; v2.0: 32). Our `mark_clean` already writes v1.1 restart
+pages and Windows accepts them byte-for-byte (`docs/LOGFILE.md` E1),
+and Windows itself downgrades to 1.1 on a clean dismount. 2.0 is what
+Windows writes while mounted, and Windows upgrades the log to 2.0 at
+mount itself — so writing 1.1 does not fight Windows, it hands it a
+log in the form Windows produces at dismount. Revisit 2.0 only if
+Windows rejects 1.1 records on replay (Phase 5 will tell us).
+
+### 4.3 Checkpoint policy
+
+Checkpoints (restart records with the four table dumps) are emitted
+periodically, not per transaction: on log wrap, when the dirty-page
+table grows past a bound, and at least every N transactions (N tuned
+by measurement; start with 128). The checkpoint is what bounds
+replay work — without it, a replay after a crash would walk the whole
+log. The open-attribute and dirty-page tables are maintained
+in-memory by the writer as transactions commit; the checkpoint
+serialises them.
+
+### 4.4 What the writer does not do
+
+- No data journaling (NTFS never journals file data).
+- No change to the dirty-flag policy: the flag is still set on first
+  write and cleared on clean unmount; the journal is an additional
+  recovery mechanism, not a replacement for the flag.
+- No `$MFTMirr` special-casing beyond what NTFS does: mirror updates
+  are MFT operations and are logged as such; the existing mirror sync
+  in `write_inode` stays.
+- No ACL mapping (§2.2) and no change to the replay opt-in policy:
+  replay of *our* records after a crash follows the same
+  per-volume-instruction rule as replay of Windows' records until
+  Phase 5 proves otherwise.
+
+## 5. Phased plan
+
+| Phase | Work | Verifies with | Estimate |
+|---|---|---|---|
+| 0 | Gates: §1.3 fault-injection proof that replay is atomic; §1.5 real v2.0 image for the writer's version handling. Both are already scoped in GAPS.md; do them first because the writer depends on them. | Fault-injection test (kill mid-replay, volume still mounts/replays cleanly); v2.0 fixture in `tools/images`. | ~1 week |
+| 1 | LFS writer infrastructure: append, LSN allocation, page sequencing + fixups, tail copies, restart-area maintenance, checkpoint emission, log wrap. No integration with mutation paths. Test tool writes synthetic transactions. | `ntfslog` + our replay engine as oracle on synthetic logs; `ntfsck` clean; writer-only unit tests in `core/logfile/tests/`. | 2–4 weeks |
+| 2 | One operation class end-to-end: file creation (`InitializeFileRecordSegment` + `CreateAttribute` + `AddIndexEntryRoot/Allocation` + `$Bitmap`). Log-at-commit + WAL ordering wired into the create path; crash tests. | Kill -9 mid-create + replay → `chkdsk` clean; fixture suite still 265/0/0; new `test_crash` cases. | 2–3 weeks |
+| 3 | Operation class by operation class: unlink, rename, mkdir, truncate/extend, setattr, xattr, symlink, EA, reparse, compressed-write. One commit per class, each with its own crash tests. | Per-class crash tests + `ntfsck`; Windows `chkdsk` per class (Phase 5). | 1–2 weeks per class, ~8 classes → 2–4 months |
+| 4 | Log wrap + checkpoint under load; performance: write amplification per op, op latency vs the no-journal baseline, log-size behaviour on small sticks (5.5 MiB log). | Benchmarks against the phase-5 bar (metadata within 2× of Apple's exFAT); long-run soak with forced wraps. | 2–3 weeks |
+| 5 | Windows round-trip per operation class: Windows mounts the volume, replays our records, `chkdsk /f` clean, byte-for-byte data check. | Physical Windows PC (the phase-4 capture setup in `docs/LOGFILE.md` §7). | Needs a Windows machine; ongoing per class |
+
+Total: **several months of focused work** — comparable to the phase-4
+replay work, which took weeks and is still only verified on four
+scenarios plus synthetics. That scale is the finding, not a failure:
+no shipping open-source NTFS writer writes `$LogFile` records
+(ntfs-3g, ntfs3 and NTFSPLUS are all replay-only or nothing; the
+ecosystem's recovery path is the dirty flag plus `chkdsk`). This
+driver would be the first. The phased plan is what makes that tractable:
+each phase lands independently verifiable value, and Phase 2 alone —
+one operation class, journaled — already changes the crash story for
+the most common metadata operation.
+
+## 6. Test plan (applies from Phase 1 on)
+
+- **Round-trip**: records written by the writer replay through our
+  own engine (`ntfslog` + `core/logfile` apply path) to exactly the
+  state the metadata already has; a second replay is a no-op (LSN
+  skip).
+- **Fault injection**: kill the process mid-commit, mid-flush and
+  mid-checkpoint; corrupt/torn log pages; the volume must still mount
+  (read-only at worst) and replay to a consistent state. This is the
+  §1.3 test, extended to writer crashes.
+- **Refusal, not corruption**: a malformed record (fuzzed payloads)
+  must make replay refuse with `needs_chkdsk`, never restructure
+  metadata. The §5.2 fuzz harness grows a writer variant.
+- **Structural**: `ntfsck` (ntfsprogs-plus) clean after every test;
+  fixture suite 265/0/0 throughout; no regression in ctest/UBSan.
+- **Windows**: per-class `chkdsk /f` + Windows-mount replay, on the
+  physical PC. Nothing in Phases 2–4 is "done" for an operation class
+  until Phase 5 has cleared it.
+
+## 7. Acceptance criteria
+
+- Yank mid-write → next mount (ours or Windows') replays to the last
+  committed transaction; `chkdsk` clean; no data loss beyond the
+  in-flight operation.
+- Clean unmount → log closed as today (v1.1, `VOLUME_IS_CLEAN`);
+  Windows mounts the volume without complaint.
+- No regression: fixture suite 265/0/0, ctest 15/15, UBSan 15/15,
+  pre-push green, on every phase commit.
+- Performance: metadata ops stay within the phase-5 bar (within 2×
+  of Apple's exFAT); log write amplification measured and recorded
+  per operation class.
+
+## 8. Open questions
+
+1. Does Windows accept 1.1 records written by a non-Windows writer
+   while the volume was mounted by us (as opposed to only at
+   dismount)? Testable only on Windows (Phase 5, file creation
+   first). If it refuses, the fallback is v2.0 record writing — same
+   record format, larger tail-copy area.
+2. Checkpoint frequency vs log size on small sticks: a 5.5 MiB log
+   with a checkpoint every 128 transactions may wrap too often under
+   sustained metadata load. Measure in Phase 4; the bound is tunable.
+3. Are `$MFTMirr` updates logged as separate records, or does NTFS
+   rely on mirror sync alone? Read the answer out of a real Windows
+   log (Phase 0 capture work) rather than guessing from fslog.c.
+4. The writer's close must replace `mark_clean` for logs we wrote,
+   not duplicate it — one close path, with `mark_clean` kept for
+   retiring Windows logs on mount. The boundary between the two needs
+   a state flag on the volume, not a heuristic.
+5. How much of the transaction-table / dirty-page-table state must
+   survive across a remount for replay of our own records to be
+   fast? The checkpoint carries it; the question is how often the
+   checkpoint must be written for replay time to stay acceptable on
+   large logs (64 MiB).
+
+## 9. Non-goals
+
+Data journaling; moving the upstream pin; changing the dirty-flag
+policy; ACL mapping (§2.2); changing the replay opt-in policy;
+anything that writes to a volume Windows has hibernated (§1.4).
