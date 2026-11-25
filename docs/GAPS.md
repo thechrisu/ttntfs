@@ -71,11 +71,21 @@ against — the logfile suite covers it only synthetically. Close it by
 capturing a real v2.0 log from a Windows machine and adding it to the
 fixtures.
 
-### 1.6 8 KB xattr not checked — open
-Xattrs round-trip as alternate data streams on Windows, but the 8 KB
-`user.big` xattr (exceeds the inline limit, takes a different storage
-path) was never checked (`docs/TODO.md`). Verify locally against
-ntfsprogs, then on Windows.
+### 1.6 8 KB xattr not checked — done (2026-11-25)
+
+`test_names.c` gained `test_xattr_big_persists`: an 8 KB `user.big`
+xattr (the phase-2 gate's F-xattr group, `tools/phase2-gate/write.py`)
+plus a small `user.comment`, set on one file, then read back
+byte-for-byte after a remount, listed, and read by `ntfscat` as an
+ordinary named `$DATA` stream — with `ntfsck -n` run while the stream
+is present, which the 300 KiB test never did (it only checked the
+volume after removing the large stream). `ntfsinfo` on a driver-written
+image confirms the named `$DATA` is non-resident (8000 bytes data,
+8192 allocated) — the different storage path the inline limit forces.
+Evidence: test_names 471 checks, 0 failures; non-vacuity
+proven by flipping one expectation (got 8000, expected 8001);
+ntfsinfo residency check above. Still open, as before: a Windows
+round trip (`dir /r`, chkdsk) needs a Windows machine.
 
 ## 2. Features Paragon / Tuxera have that this doesn't
 
@@ -204,7 +214,13 @@ source of truth. CI verifies both slices with `lipo` in `tools/ci.sh`:
 `stage_ctest` checks `build/libntfscore.a`, `stage_build_app` checks
 the app and extension binaries. `tools/check-archs.sh` (pre-push
 stage 8) pins the four-way consistency locally and is verified by
-negative test. No arch-specific code stood in the way: the only inline
+negative test. Follow-up fix the same day: the first universal CI run
+failed only on the check itself — `stage_build_app` looked for the
+extension binary under `Contents/PlugIns`, but ExtensionKit extensions
+do not live there; the build had succeeded and `lipo` had already
+verified `libntfscore.a: x86_64 arm64`. The check now locates both
+binaries with `find` across the whole app bundle. No arch-specific
+code stood in the way: the only inline
 asm in the tree is the arch-neutral `barrier()` memory clobber, and
 `tools/check-darwin.sh` already preprocesses the whole C tree for
 x86_64-apple-darwin.

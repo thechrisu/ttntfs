@@ -131,10 +131,15 @@ stage_build_app() {
 	# Universal check (GAPS.md §4.2): the app and the extension must each
 	# carry both slices, or Intel Macs get a build that cannot run. lipo
 	# is macOS-only, and this stage only runs where xcodebuild exists.
-	local app_bin="$dd/Build/Products/Debug/TT NTFS Native.app/Contents/MacOS/TT NTFS Native"
-	local ext_bin
-	ext_bin=$(find "$dd/Build/Products/Debug/TT NTFS Native.app/Contents/PlugIns" -name NTFSExtension -type f 2>/dev/null | head -1)
-	[ -n "$ext_bin" ] || { echo "extension binary not found under PlugIns"; return 1; }
+	# The extension binary is located with find, not a hardcoded
+	# PlugIns path: ExtensionKit extensions do not live under
+	# Contents/PlugIns (that assumption failed the first universal
+	# run even though the build itself succeeded).
+	local app_bin ext_bin
+	app_bin=$(find "$dd/Build/Products/Debug/TT NTFS Native.app/Contents/MacOS" -name "TT NTFS Native" -type f 2>/dev/null | head -1)
+	ext_bin=$(find "$dd/Build/Products/Debug/TT NTFS Native.app" -name NTFSExtension -type f 2>/dev/null | head -1)
+	[ -n "$app_bin" ] || { echo "app binary not found in app bundle"; return 1; }
+	[ -n "$ext_bin" ] || { echo "extension binary not found in app bundle"; return 1; }
 	check_universal "$app_bin" || return 1
 	check_universal "$ext_bin" || return 1
 	return 0

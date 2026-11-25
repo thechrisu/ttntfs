@@ -117,6 +117,14 @@ jobs:
     timeout-minutes: 45
     if: github.event_name == 'workflow_dispatch' && needs.budget-guard.outputs.allow == 'true'
     continue-on-error: true
+    # Own concurrency group, overriding the workflow-level ci-* group:
+    # a dispatch used to share the checks job's group, so dispatching
+    # while a push run was in flight cancelled that run's checks job
+    # (run 45706260240, §4.2, cancelled by dispatch 45706341293 for the
+    # previous head). A dispatch now only ever cancels an older dispatch.
+    concurrency:
+      group: ci-mount-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
       - uses: actions/checkout@v4

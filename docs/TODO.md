@@ -48,8 +48,11 @@
       them alone. Verified by test_symlink_ea_migration (fixture built with
       tools/mkfixtures/patch_ea.py, chkdsk damage with index_union.py).
 - [x] Xattrs confirmed 2026-09-17: `dir /r` shows them as ordinary alternate data
-      streams on Windows. Not separately checked: the 8 KB `user.big` xattr in
-      F-xattr, which exceeds the inline limit and takes a different storage path.
+      streams on Windows. The 8 KB `user.big` xattr (F-xattr, exceeds the inline
+      limit, non-resident stream) checked 2026-11-25: `test_xattr_big_persists`
+      in test_names.c reads it back byte-for-byte after a remount, ntfscat reads
+      it as a named $DATA stream, ntfsck clean while present, ntfsinfo confirms
+      non-resident. Windows round trip still open.
 - [x] Compressed round trip done 2026-09-18: chkdsk clean, Windows reads our
       modifications to its own compressed file byte for byte. Phase 2 closed. Found
       and fixed two volume-goes-read-only defects on the way (finding 24).

@@ -1090,6 +1090,117 @@ static void test_xattr_as_stream(void)
 	printf("test_xattr_as_stream\n");
 }
 
+/* ---- 6. the 8 KB xattr survives a remount ---------------------------- */
+/*
+ * TODO.md / GAPS.md §1.6: the phase-2 gate writes an 8 KB `user.big`
+ * xattr (tools/phase2-gate/write.py, group F-xattr) but it was never
+ * separately checked. The 300 KiB value in test_xattr_as_stream covers
+ * the write path in one mount; it never reads a large ADS back after a
+ * remount, never lets an independent reader see one, and ntfsck only
+ * runs after the large stream is removed. An 8 KB value is past what
+ * fits resident in a 1 KiB MFT record, so this is the non-resident
+ * storage path: the runlist has to parse back, ntfscat has to read it
+ * as an ordinary named $DATA stream, and ntfsck has to accept the
+ * volume while it is present.
+ */
+#define BIG8K_XATTR_SIZE 8000
+
+static void test_xattr_big_persists(void)
+{
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *ni = NULL;
+	static char big[BIG8K_XATTR_SIZE], readback[BIG8K_XATTR_SIZE];
+	char buf[4096];
+	size_t len;
+	int i, n;
+
+	if (copy_fixture("names.img", "xattrbig") != 0) {
+		fprintf(stderr, "SKIP test_xattr_big_persists: no fixture\n");
+		return;
+	}
+	if (mount_scratch(0, &vol, &root)) {
+		fprintf(stderr, "FAIL: could not mount for the big-xattr test\n");
+		failures++; checks++;
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_create(root, "tagged-0.txt", 0100644, &ni) == 0);
+	if (!ni) {
+		ntfs_inode_put(root);
+		ntfs_unmount(vol);
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_write(ni, "body 0\n", 7, 0) == 7);
+	for (i = 0; i < BIG8K_XATTR_SIZE; i++)
+		big[i] = (char)(i * 31 + 7);
+	CHECK_RC(ntfs_setxattr(ni, "user.big", big, sizeof(big), 0), 0,
+		 "set 8 KB user.big");
+	CHECK_RC(ntfs_setxattr(ni, "user.comment", "comment 0", 9, 0), 0,
+		 "set user.comment");
+	/* In-mount sanity before the remount does the real checking. */
+	CHECK_RC(ntfs_getxattr(ni, "user.big", readback, sizeof(readback), &len), 0,
+		 "read back 8 KB in the same mount");
+	CHECK(memcmp(readback, big, sizeof(big)) == 0);
+	ntfs_inode_put(ni);
+	ntfs_inode_put(root);
+	CHECK(ntfs_unmount(vol) == 0);
+
+	/* Remount: the non-resident runlist has to parse back. */
+	if (mount_scratch(0, &vol, &root)) {
+		fprintf(stderr, "FAIL: could not remount for the big-xattr test\n");
+		failures++; checks++;
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_lookup(root, "tagged-0.txt", &ni) == 0);
+	if (!ni) {
+		ntfs_inode_put(root);
+		ntfs_unmount(vol);
+		unlink(scratch);
+		return;
+	}
+	len = 0;
+	CHECK_RC(ntfs_getxattr(ni, "user.big", NULL, 0, &len), 0,
+		 "size query after remount");
+	CHECK_RC((int)len, BIG8K_XATTR_SIZE, "size query result after remount");
+	memset(readback, 0, sizeof(readback));
+	CHECK_RC(ntfs_getxattr(ni, "user.big", readback, sizeof(readback), &len), 0,
+		 "read back 8 KB after remount");
+	CHECK(memcmp(readback, big, sizeof(big)) == 0);
+	/* The small xattr on the same file survived too, and both list. */
+	CHECK_RC(ntfs_getxattr(ni, "user.comment", buf, sizeof(buf), &len), 0,
+		 "read back user.comment after remount");
+	CHECK_RC((int)len, 9, "user.comment length after remount");
+	CHECK(memcmp(buf, "comment 0", 9) == 0);
+	len = 0;
+	CHECK_RC(ntfs_listxattr(ni, NULL, 0, &len), 0, "list size query after remount");
+	CHECK_RC((int)len, (int)(strlen("user.big") + 1 + strlen("user.comment") + 1),
+		 "list size query result after remount");
+	/* The file's own data is untouched by the xattr traffic. */
+	CHECK(ntfs_read(ni, buf, 7, 0) == 7);
+	CHECK(memcmp(buf, "body 0\n", 7) == 0);
+	ntfs_inode_put(ni);
+	ntfs_inode_put(root);
+	CHECK(ntfs_unmount(vol) == 0);
+
+	/* ntfsck while the 8 KB stream is present, not after removing it. */
+	structural_check("test_xattr_big_persists");
+
+	/* The independent reader: ntfscat reads the value as an ordinary
+	 * named $DATA stream. */
+	memset(readback, 0, sizeof(readback));
+	n = ntfscat_stream("/tagged-0.txt", "user.big", readback, sizeof(readback));
+	if (n < 0) {
+		fprintf(stderr, "SKIP ntfscat big-stream check: ntfsprogs not built\n");
+	} else {
+		CHECK_RC(n, BIG8K_XATTR_SIZE, "ntfscat read the 8 KB named stream");
+		CHECK(memcmp(readback, big, sizeof(big)) == 0);
+	}
+	unlink(scratch);
+	printf("test_xattr_big_persists\n");
+}
+
 int main(void)
 {
 	test_windows_illegal_rejected();
@@ -1097,6 +1208,7 @@ int main(void)
 	test_case_insensitive_preserving();
 	test_long_and_unicode_names();
 	test_xattr_as_stream();
+	test_xattr_big_persists();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
