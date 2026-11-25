@@ -876,6 +876,16 @@ skip_attr_list_load:
 			 * decide, so clear them before setting the link type. */
 			vi->i_mode = (vi->i_mode & ~S_IFMT) | S_IFLNK;
 			vi->i_mode &= ~vol->fmask;
+			/*
+			 * PORT: migrate a pre-e6b3418 symlink off $EA
+			 * (docs/GAPS.md §2.5). Before e6b3418 every link was
+			 * created carrying $LXUID/$LXGID/$LXMOD, and chkdsk
+			 * rewrites such a link's index entry as an EA file;
+			 * the strip (and the index re-sync it triggers) is
+			 * what repairs it. Nothing is lost: mode 0777 and
+			 * mount-wide uid/gid. Read-only mounts skip it.
+			 */
+			ntfs_migrate_symlink_ea(vi);
 		} else if (dir_record) {
 			vi->i_mode |= S_IFDIR;
 			/* Apply the directory permissions mask set in the mount

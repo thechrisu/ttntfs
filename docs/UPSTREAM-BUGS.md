@@ -694,21 +694,26 @@ upstream writes them on every inode. The research had flagged the coexistence
 as outside the spec; it was set aside because Windows *follows* such links.
 It does. `chkdsk` is what objects.
 
-Fix, `e045c2e`: no `$EA` on symlinks, as Linux ntfs3 does. A symlink's mode is
+Fix, `e6b3418`: no `$EA` on symlinks, as Linux ntfs3 does. A symlink's mode is
 0777 by definition and uid/gid are mount-wide under noowners, so nothing is
 lost. Verified on Windows 10 with the exact sequence that had broken three
 previous sets -- `dir`, `chkdsk /f`, a Mac read-write session in the same
 directory, `dir` again: `<SYMLINKD>`, `<SYMLINK>`, `<SYMLINK>` all intact.
+(The docs cited this commit as `e045c2e`; no such object exists in this
+clone -- the hash was stale after a rebase. It is `e6b3418`.)
 
 This also explains the very first observation in this thread: the 500 GB
 disk's links listing as zero-byte files on 2026-09-17, after its `chkdsk /f`
 three days earlier.
 
-**Migration.** Links created by builds before `e045c2e` still carry `$EA` and
+**Migration.** Links created by builds before `e6b3418` still carry `$EA` and
 the next `chkdsk` will still rewrite their index entries. The reparse
 attribute survives, so they still work on the Mac; only Windows' listing is
-affected. A repair pass that strips `$EA` from existing symlinks would fix
-them; not written.
+affected. Fixed 2026-11-25 (docs/GAPS.md §2.5): `ntfs_migrate_symlink_ea()`
+strips `$EA` from such a link the first time it is loaded on a read-write
+mount and re-syncs its index entry to the reparse tag; read-only mounts
+leave it alone. Verified by `test_symlink_ea_migration` (fixture built with
+`tools/mkfixtures/patch_ea.py`, chkdsk damage with `index_union.py`).
 
 ## Finding 24 **FIXED**: a compressed folder took the volume read-only on first use
 

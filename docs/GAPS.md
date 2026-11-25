@@ -136,11 +136,37 @@ Deliberate: chkdsk is the tool and the project will not pretend
 otherwise. Journal recovery is the safe subset and it is done. Paragon
 ships Disk Utility verify/repair; this does not, on purpose.
 
-### 2.5 `$EA` migration for pre-e045c2e symlinks — open, low priority
-Symlinks created before commit e045c2e still carry `$EA`, and chkdsk
-still rewrites their index entries. They still work on the Mac. Fix: a
-migration pass that strips `$EA` from existing links. Verify with
-`chkdsk` before/after on a fixture carrying such a link.
+### 2.5 `$EA` migration for pre-e6b3418 symlinks — done (2026-11-25)
+Symlinks created before commit e6b3418 still carried `$EA`, and chkdsk
+still rewrote their index entries. A lazy migration now repairs them: the
+first time such a link is loaded on a read-write mount,
+`ntfs_migrate_symlink_ea()` removes `$EA` and `$EA_INFORMATION`, clears the
+HasEA flag, and re-syncs the parent index entry's union to the real reparse
+tag with `ntfs_inode_sync_filename()`, so Windows lists it as a link again
+without waiting for the next chkdsk. Read-only mounts never migrate (a
+dirty volume mounts read-only, and migration is a write). Nothing is lost:
+mode 0777, uid/gid mount-wide. On any failure the link is left as it was,
+still usable on the Mac.
+Evidence: new `test_symlink_ea_migration` in `test_links` (651 checks, 0
+failures, was 624) -- a link hand-built into the pre-e6b3418 state with
+`tools/mkfixtures/patch_ea.py` ($EA bytes verified against a regular file
+the driver created), the chkdsk damage written with
+`tools/mkfixtures/index_union.py --set-ea-form`, then one RW load: `$EA`
+gone, index union back to the tag 0xa000000c, link still resolves, ntfsck
+clean; a second link proves a read-only mount leaves `$EA` alone. Plain
+ctest 15/15, UBSan ctest 15/15, `tools/run-tests.sh all` 265 passed 0
+failed 0 skipped with `NTFS_REQUIRE_FSCK=1`, `tools/pre-push.sh` green.
+Still outstanding: a `chkdsk` round trip on Windows (the local checks are
+ntfsck + direct index-byte reads, which is what chkdsk reconciles).
+Side fixes in the same commit: the merged archive `build/libntfscore.a`
+went stale silently -- the custom merge command depended on the `ntfs`
+core/platform targets by name only, which is an ordering dependency, not
+a file dependency, so a plain build never re-merged after a core change
+(ntfscli linked the stale archive). The command now also depends on the
+two archive files via `$<TARGET_FILE:...>`; verified a plain build
+re-merges after a touch. Docs corrected too: every `e045c2e` in
+TODO.md/UPSTREAM-BUGS.md/GAPS.md was a stale hash (no such object in this
+clone) -- the fix commit is `e6b3418`.
 
 ## 3. Performance — the structural gap
 

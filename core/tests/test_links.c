@@ -1873,6 +1873,217 @@ static void test_permissions(void)
 	printf("test_permissions\n");
 }
 
+/*
+ * $EA migration for pre-e6b3418 symlinks (docs/GAPS.md §2.5).
+ *
+ * Before e6b3418 every link this driver created carried $LXUID/$LXGID/$LXMOD,
+ * and chkdsk enforces [MS-FSA]'s rule that reparse points and extended
+ * attributes are mutually exclusive by recomputing each directory index
+ * entry's duplicated $FILE_NAME from the MFT record and writing the EA form
+ * of the union (packed size 0x2d, reserved 0x0f) over the reparse tag.
+ * Windows then lists the link as a zero-byte file. New links carry no $EA;
+ * the migration strips it from an old link the first time it is loaded on a
+ * read-write mount, and re-syncs the index entry to the real tag, so the
+ * link reads as a link again without waiting for the next chkdsk.
+ *
+ * Nothing on this VM can create an old-style link -- the driver stopped
+ * writing $EA on symlinks -- so the fixture is built the way the Interix
+ * one is: a link is created through the driver, then
+ * tools/mkfixtures/patch_ea.py inserts $EA_INFORMATION + $EA with exactly
+ * the bytes ntfs_set_ea writes (verified against a regular file), and
+ * tools/mkfixtures/index_union.py --set-ea-form writes the chkdsk damage
+ * into the index entry. ntfsinfo reads the MFT copy, index_union.py reads
+ * the index copy: the two copies are checked separately because they are
+ * what chkdsk reconciles.
+ *
+ * Cases: the MFT strip ($EA_INFORMATION gone after one RW load), the index
+ * repair (union back to the tag after the same load), the link still
+ * resolving, a second link proving a read-only mount does not migrate, and
+ * ntfsck clean throughout.
+ */
+static int index_union_of(const char *tool, const char *name, unsigned long *out)
+{
+	char cmd[PATH_MAX * 2 + 256];
+	char line[256];
+	FILE *p;
+
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %s 2>/dev/null",
+		 tool, scratch, name);
+	p = popen(cmd, "r");
+	if (!p || !fgets(line, sizeof(line), p)) {
+		if (p) pclose(p);
+		return -1;
+	}
+	if (p) pclose(p);
+	return sscanf(line, "union=0x%lx", out) == 1 ? 0 : -1;
+}
+
+static int ea_info_count(const char *info, const char *name)
+{
+	char cmd[PATH_MAX * 2 + 256];
+	char line[64];
+	FILE *p;
+	int got = -1;
+
+	snprintf(cmd, sizeof(cmd), "%s -F /%s %s 2>/dev/null | grep -c 'EA_INFORMATION'",
+		 info, name, scratch);
+	p = popen(cmd, "r");
+	if (p && fgets(line, sizeof(line), p))
+		got = (int)strtol(line, NULL, 10);
+	if (p) pclose(p);
+	return got;
+}
+
+static long mft_number_of(const char *info, const char *name)
+{
+	char cmd[PATH_MAX * 2 + 256];
+	char line[64];
+	FILE *p;
+	long mftno = -1;
+
+	snprintf(cmd, sizeof(cmd),
+		 "%s -F /%s %s 2>/dev/null | grep -m1 'Dumping Inode' | grep -oE '[0-9]+' | head -1",
+		 info, name, scratch);
+	p = popen(cmd, "r");
+	if (p && fgets(line, sizeof(line), p))
+		mftno = strtol(line, NULL, 10);
+	if (p) pclose(p);
+	return mftno;
+}
+
+static void test_symlink_ea_migration(void)
+{
+	const char *info = getenv("NTFS_NTFSINFO");
+	const char *patch_ea = getenv("NTFS_PATCH_EA");
+	const char *index_union = getenv("NTFS_INDEX_UNION");
+	struct vol v;
+	ntfs_inode_t *l = NULL;
+	char cmd[PATH_MAX * 2 + 256];
+	unsigned long u = 0;
+	int rc;
+
+	printf("test_symlink_ea_migration\n");
+	if (!info || !*info || access(info, X_OK) != 0 ||
+	    !patch_ea || !*patch_ea || access(patch_ea, R_OK) != 0 ||
+	    !index_union || !*index_union || access(index_union, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_symlink_ea_migration: NTFS_NTFSINFO/NTFS_PATCH_EA/NTFS_INDEX_UNION not set\n");
+		return;
+	}
+	if (copy_fixture("eamig") != 0) {
+		fprintf(stderr, "SKIP test_symlink_ea_migration: no fixture\n");
+		return;
+	}
+
+	/* Phase 1: two links, then $EA inserted into both by hand. */
+	if (vol_up(&v, 022, 022, 501, 20)) { unlink(scratch); return; }
+	CHECK(write_plain(v.root, "target.txt", "hello\n", 6) == 0);
+	CHECK(ntfs_symlink(v.root, "old.lnk", "target.txt", &l) == 0);
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	CHECK(ntfs_symlink(v.root, "old2.lnk", "target.txt", &l) == 0);
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	vol_down(&v);
+	for (int i = 0; i < 2; i++) {
+		const char *name = i ? "old2.lnk" : "old.lnk";
+		long mftno = mft_number_of(info, name);
+		int ea_count;
+
+		CHECK_MSG(mftno > 0, "could not find the MFT number of %s", name);
+		if (mftno <= 0) continue;
+		snprintf(cmd, sizeof(cmd), "python3 %s %s %ld >/dev/null 2>&1",
+			 patch_ea, scratch, mftno);
+		rc = system(cmd);
+		CHECK_MSG(rc == 0, "patch_ea.py failed for %s (rc %d)", name, rc);
+		ea_count = ea_info_count(info, name);
+		CHECK_MSG(ea_count == 1,
+			  "%s: $EA_INFORMATION count %d, expected 1 before migration",
+			  name, ea_count);
+		CHECK_MSG(index_union_of(index_union, name, &u) == 0 && u == 0xA000000Cu,
+			  "%s: index union 0x%08lx before damage, expected the tag",
+			  name, u);
+	}
+	/* chkdsk damage on the first link only: the EA form of the union. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s old.lnk --set-ea-form >/dev/null 2>&1",
+		 index_union, scratch);
+	rc = system(cmd);
+	CHECK_MSG(rc == 0, "index_union.py --set-ea-form failed (rc %d)", rc);
+	CHECK_MSG(index_union_of(index_union, "old.lnk", &u) == 0 && u == 0x000F002Du,
+		  "old.lnk: index union 0x%08lx after damage, expected the EA form",
+		  u);
+
+	/* Phase 2: one RW load migrates the first link, MFT and index. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_symlink_ea_migration: remount failed\n");
+		failures++; checks++; unlink(scratch); return;
+	}
+	{
+		struct ntfs_attr at;
+		char rbuf[64];
+		size_t rn = 0;
+
+		CHECK_MSG(ntfs_lookup(v.root, "old.lnk", &l) == 0, "lookup(old.lnk)");
+		if (l) {
+			CHECK(ntfs_getattr(l, &at) == 0);
+			CHECK_MSG((at.mode & S_IFMT) == S_IFLNK,
+				  "old.lnk: mode %o is not S_IFLNK after migration",
+				  at.mode);
+			CHECK_MSG(ntfs_readlink(l, rbuf, sizeof(rbuf), &rn) == 0,
+				  "readlink(old.lnk)");
+			CHECK_MSG(rn == strlen("target.txt") &&
+				  !memcmp(rbuf, "target.txt", rn),
+				  "old.lnk: readlink '%.*s', expected 'target.txt'",
+				  (int)rn, rbuf);
+			ntfs_inode_put(l); l = NULL;
+		}
+	}
+	vol_down(&v);
+	CHECK_MSG(ea_info_count(info, "old.lnk") == 0,
+		  "old.lnk: $EA_INFORMATION still present after migration");
+	CHECK_MSG(index_union_of(index_union, "old.lnk", &u) == 0 && u == 0xA000000Cu,
+		  "old.lnk: index union 0x%08lx after migration, expected the tag",
+		  u);
+	fsck_clean("symlink $EA migration");
+
+	/* Phase 3: the migrated link still resolves on a fresh mount. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_symlink_ea_migration: remount failed\n");
+		failures++; checks++; unlink(scratch); return;
+	}
+	{
+		char rbuf[64];
+		size_t rn = 0;
+
+		CHECK_MSG(ntfs_lookup(v.root, "old.lnk", &l) == 0, "lookup(old.lnk)");
+		if (l) {
+			CHECK_MSG(ntfs_readlink(l, rbuf, sizeof(rbuf), &rn) == 0,
+				  "readlink(old.lnk) after migration");
+			CHECK_MSG(rn == strlen("target.txt") &&
+				  !memcmp(rbuf, "target.txt", rn),
+				  "old.lnk: readlink '%.*s' after migration",
+				  (int)rn, rbuf);
+			ntfs_inode_put(l); l = NULL;
+		}
+	}
+	vol_down(&v);
+
+	/* Phase 4: a read-only mount must not migrate the second link. */
+	if (vol_up_flags(&v, NTFS_MOUNT_RDONLY, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_symlink_ea_migration: read-only remount failed\n");
+		failures++; checks++; unlink(scratch); return;
+	}
+	CHECK_MSG(ntfs_lookup(v.root, "old2.lnk", &l) == 0, "lookup(old2.lnk)");
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	vol_down(&v);
+	{
+		int ea_count = ea_info_count(info, "old2.lnk");
+
+		CHECK_MSG(ea_count == 1,
+			  "old2.lnk: $EA_INFORMATION count %d after a read-only mount, expected 1 (unmigrated)",
+			  ea_count);
+	}
+	fsck_clean("read-only mount leaves $EA alone");
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -1883,6 +2094,7 @@ int main(void)
 	test_symlink_tag_choice();
 	test_windows_dir_links();
 	test_interix_symlinks();
+	test_symlink_ea_migration();
 	test_symlink_to_directory_is_a_directory_record();
 	test_time_conversion();
 	test_timestamps();

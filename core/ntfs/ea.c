@@ -447,6 +447,72 @@ int ntfs_ea_set_wsl_inode(struct inode *inode, dev_t rdev, __le16 *ea_size,
 	return err;
 }
 
+/*
+ * ntfs_migrate_symlink_ea - strip $EA from a pre-e6b3418 symlink
+ * @vi:		VFS inode of a symlink, just loaded
+ *
+ * [MS-FSA] states that reparse points and extended attributes are mutually
+ * exclusive. Builds before e6b3418 wrote $LXUID/$LXGID/$LXMOD on every
+ * inode, symlinks included, so every link they made carries $EA and
+ * $EA_INFORMATION. chkdsk enforces the rule by recomputing each directory
+ * index entry's duplicated $FILE_NAME from the MFT record and writing the
+ * EA form of the union -- packed size 0x2d, reserved 0x0f -- over the
+ * reparse tag; Windows then lists the link as a zero-byte file, or as a
+ * plain directory for a directory-record link (docs/UPSTREAM-BUGS.md
+ * finding 23).
+ *
+ * New links carry no $EA. This migrates an old one the first time it is
+ * loaded on a read-write mount: remove $EA and $EA_INFORMATION, clear the
+ * HasEA flag, and rewrite the parent index entry's union to the real
+ * reparse tag with ntfs_inode_sync_filename(), so Windows lists it as a
+ * link again without waiting for the next chkdsk. Nothing is lost: a
+ * symlink's mode is 0777 by definition and uid/gid are mount-wide under
+ * noowners.
+ *
+ * Best-effort: on any failure the link is left as it was -- still usable
+ * on the Mac, and the next chkdsk would still rewrite its index entry.
+ * Read-only mounts never migrate: a dirty volume mounts read-only, and
+ * migration is a write.
+ */
+void ntfs_migrate_symlink_ea(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	int err;
+
+	if (IS_RDONLY(vi))
+		return;
+	if (!NInoHasEA(ni) && !ntfs_attr_exist(ni, AT_EA, AT_UNNAMED, 0))
+		return;
+
+	/* $EA first: $EA_INFORMATION describes it. */
+	if (ntfs_attr_exist(ni, AT_EA, AT_UNNAMED, 0)) {
+		err = ntfs_attr_remove(ni, AT_EA, AT_UNNAMED, 0);
+		if (err) {
+			ntfs_error(vi->i_sb,
+				   "Failed to strip $EA from symlink 0x%llx (%d); leaving it.\n",
+				   (unsigned long long)ni->mft_no, err);
+			return;
+		}
+	}
+	if (ntfs_attr_exist(ni, AT_EA_INFORMATION, AT_UNNAMED, 0)) {
+		err = ntfs_attr_remove(ni, AT_EA_INFORMATION, AT_UNNAMED, 0);
+		if (err) {
+			ntfs_error(vi->i_sb,
+				   "Failed to strip $EA_INFORMATION from symlink 0x%llx (%d); leaving it.\n",
+				   (unsigned long long)ni->mft_no, err);
+			return;
+		}
+	}
+	NInoClearHasEA(ni);
+	/* A later writeback re-syncs the index too if the direct sync below
+	 * fails partway (e.g. the parent is gone). */
+	NInoSetFileNameDirty(ni);
+	err = ntfs_inode_sync_filename(ni);
+	if (err)
+		ntfs_debug("Symlink 0x%llx migrated off $EA; index sync deferred (%d).\n",
+			   (unsigned long long)ni->mft_no, err);
+}
+
 ssize_t ntfs_listxattr(struct dentry *dentry, char *buffer, size_t size)
 {
 	struct inode *inode = d_inode(dentry);

@@ -107,14 +107,14 @@ if(APPLE)
   add_custom_command(
     OUTPUT ${NTFS_MERGED_LIB}
     COMMAND libtool -static -o ${NTFS_MERGED_LIB} $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
-    DEPENDS ntfscore ntfsplatform
+    DEPENDS ntfscore ntfsplatform $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
     COMMENT "Merging libntfscore.a"
     VERBATIM)
 else()
   add_custom_command(
     OUTPUT ${NTFS_MERGED_LIB}
     COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/merge-static-libs.sh ${NTFS_MERGED_LIB} $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform>
-    DEPENDS ntfscore ntfsplatform ${CMAKE_CURRENT_SOURCE_DIR}/tools/merge-static-libs.sh
+    DEPENDS ntfscore ntfsplatform $<TARGET_FILE:ntfscore> $<TARGET_FILE:ntfsplatform> ${CMAKE_CURRENT_SOURCE_DIR}/tools/merge-static-libs.sh
     COMMENT "Merging libntfscore.a"
     VERBATIM)
 endif()
@@ -221,7 +221,7 @@ if(NTFS_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   add_test(NAME links COMMAND test_links)
   set_tests_properties(links PROPERTIES
-    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_NTFSINFO=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/bin/ntfsinfo;NTFS_PATCH_REPARSE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_reparse.py;NTFS_PATCH_INTERIX=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_interix.py")
+    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_NTFSINFO=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/bin/ntfsinfo;NTFS_PATCH_REPARSE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_reparse.py;NTFS_PATCH_INTERIX=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_interix.py;NTFS_PATCH_EA=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_ea.py;NTFS_INDEX_UNION=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/index_union.py")
 
   # The three name and xattr decisions in PORTING.md section 6, which were
   # recorded and then enforced by nothing: Windows-illegal names rejected,

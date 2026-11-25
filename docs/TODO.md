@@ -33,17 +33,20 @@
       EA coexistence turned out not to matter. Finding 20.
 - [x] Fixed 2026-09-17 (finding 22): a symlink to an existing directory is written
       as a directory record. Windows shows <SYMLINKD> and cd works.
-- [ ] Our driver cannot read ntfs-3g's default Interix symlinks (IntxLNK $DATA files).
-      Stock ntfs-3g is the most deployed third-party NTFS driver; its symlinks show
-      to us as 1-cluster system files with binary contents.
+- [x] Fixed 2026-11-25 (finding 23, docs/GAPS.md §2.1): our driver can read
+      ntfs-3g's default Interix symlinks (IntxLNK $DATA files, commit
+      bf3ff225).
 - [x] Fixed 2026-09-17 (finding 21): Windows directory symlinks and junctions read
       as links and resolve, deleting one leaves the target alone.
-- [x] Confirmed 2026-09-18: links from e045c2e survive chkdsk + Mac write + Windows.
+- [x] Confirmed 2026-09-18: links from e6b3418 survive chkdsk + Mac write + Windows.
       The real cause was chkdsk rewriting the index entry of any file carrying both
       $EA and a reparse point (finding 23). Symlinks no longer carry $EA.
-- [ ] Migration: symlinks from builds before e045c2e still carry $EA and chkdsk will
-      still rewrite their index entries. A pass that strips $EA from existing links
-      would repair them. Low priority -- they still work on the Mac.
+- [x] Migration done 2026-11-25 (docs/GAPS.md §2.5): symlinks from builds before
+      e6b3418 are stripped of $EA on first load on a read-write mount
+      (ntfs_migrate_symlink_ea), and their index entries are re-synced to the
+      reparse tag, so chkdsk no longer rewrites them. Read-only mounts leave
+      them alone. Verified by test_symlink_ea_migration (fixture built with
+      tools/mkfixtures/patch_ea.py, chkdsk damage with index_union.py).
 - [x] Xattrs confirmed 2026-09-17: `dir /r` shows them as ordinary alternate data
       streams on Windows. Not separately checked: the 8 KB `user.big` xattr in
       F-xattr, which exceeds the inline limit and takes a different storage path.
