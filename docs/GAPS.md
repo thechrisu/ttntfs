@@ -374,10 +374,26 @@ in `ntfs_ir_to_ib`, index root relocation), plus boot-sector
 validation (`sectors_per_cluster`, MFT LCNs — the same class the
 §5.2 fuzz fix addressed) and runlist realloc hardening.
 
-Follow-up (not done): triage those 124 commits — merge what applies
-to core/ntfs/, record what does not in this doc, then move the pin
-(refresh upstream/ per upstream/UPSTREAM.md). The pin does not move
-until the triage does.
+Follow-up — triaged 2026-11-25, see `docs/UPSTREAM-TRIAGE-7.3.md`.
+All 124 commits classified (patch read + port code checked at the
+cited lines), plus one more recovered from a merge aggregate: the
+quota removal (`cbe287fd65f1`, "remove unsupported quota handling")
+only exists in the `dbad5db3a0bb` merge diff — no individual commit
+touching `fs/ntfs/quota.c` is in the 124. Verdicts over 125 items:
+**port 61, already-covered 13, not-applicable 35, needs-work 16**.
+Headlines: the port independently implemented native Windows
+symlinks already (absolute/relative following + creation all
+already-covered — only the `native_symlink=` mount option is
+missing); `ntfs_new_attr_flags` carries five unfixed bugs in one
+function (`0ab6dc1ac460` et al — port as one commit); the worst
+single item is the index_root heap OOB write (`dc09bf79b76f`);
+compressed writes punch old clusters before the new data lands
+(`eb67671cd814`); the port's rw-remount path always fails -EROFS
+because of the dead quota marker (`cbe287fd65f1`); WOF is the
+biggest remaining feature (9 commits, no `wof.c` / codec interface /
+decompressors in the port). The pin does not move until the port
+items land — moving it now would just re-baseline the drift report
+around 61 known-missing fixes.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
