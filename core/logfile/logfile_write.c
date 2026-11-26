@@ -55,10 +55,21 @@
  *   on-disk state is still either old-page or new-copy (see above), so
  *   the next open recovers cleanly; what the failure forbids is
  *   continuing to write on a device that would not take the log.
- * - Wrap is refused with -ENOSPC until a checkpoint exists: wrapping
- *   destroys records older than the wrap point, and without a checkpoint
- *   every record is live. Checkpoint emission (a later commit in this
- *   phase) lifts that refusal.
+ * - A record is refused with -ENOSPC when it would overwrite the
+ *   oldest live page: the layout may use only the free pages, those
+ *   strictly after the cursor up to (not including) the oldest live
+ *   page. A wrap around the end of the file is allowed when it stays
+ *   inside that range — which is what a checkpoint makes possible, by
+ *   advancing the oldest live LSN past the records it covers (before
+ *   any checkpoint the oldest record sits on the first page, so no
+ *   wrap is possible). The wrap itself needs no first_lsn advance:
+ *   the pages it overwrites held only dispensable records.
+ * - Appends keep a checkpoint reserve: a record is refused with
+ *   -ENOSPC if it would leave fewer free pages than a checkpoint needs
+ *   (one page per non-empty table dump, one for the restart record,
+ *   one of margin). Without the reserve a full log could not be
+ *   checkpointed at all, and the checkpoint is what frees the log.
+ *   Checkpoint appends themselves are exempt from the reserve.
  *
  * What a crash at the worst instant leaves, per operation:
  * - mid-append, before the tail copy: old page, record absent.
@@ -93,6 +104,16 @@ struct ntfs_log_writer {
 	uint32_t tail_slot;		/* next tail-copy page vbo */
 	bool failed;
 	bool checkpointed;
+	bool in_checkpoint;		/* checkpoint appends: reserve-exempt */
+
+	/* Restart tables, maintained in memory and dumped by checkpoint().
+	 * Phase 1: only the open-attribute table is populated (by
+	 * ntfs_log_writer_open_attr()); the transaction and dirty-page
+	 * tables gain entries in Phase 2. A table with no allocated
+	 * entries is not dumped at all (the reader skips a zero length). */
+	struct lfs_table trtbl, dptbl, oatbl;
+	uint8_t *attr_names;		/* attribute-names dump blob */
+	uint32_t attr_names_len, attr_names_cap;
 };
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -253,6 +274,41 @@ int ntfs_log_writer_format(const struct ntfs_log_io *io, const struct ntfs_log_g
 
 /* ---- open -------------------------------------------------------------- */
 
+/* Copy the last checkpoint's tables into the writer, if one exists. */
+static int lw_adopt_checkpoint(ntfs_log_writer_t *w, ntfs_logfile_t *log)
+{
+	int err = lfs_load_checkpoint(log);
+
+	if (err && err != -ENOENT)
+		return err;
+	if (err)
+		return 0;
+	if (log->trtbl.buf) {
+		err = lfs_table_copy(&w->trtbl, log->trtbl.buf, log->trtbl.bytes);
+		if (err)
+			return err;
+	}
+	if (log->dptbl.buf) {
+		err = lfs_table_copy(&w->dptbl, log->dptbl.buf, log->dptbl.bytes);
+		if (err)
+			return err;
+	}
+	if (log->oatbl.buf) {
+		err = lfs_table_copy(&w->oatbl, log->oatbl.buf, log->oatbl.bytes);
+		if (err)
+			return err;
+	}
+	if (log->attr_names_len) {
+		w->attr_names = malloc(log->attr_names_len);
+		if (!w->attr_names)
+			return -ENOMEM;
+		memcpy(w->attr_names, log->attr_names, log->attr_names_len);
+		w->attr_names_len = log->attr_names_len;
+		w->attr_names_cap = log->attr_names_len;
+	}
+	return 0;
+}
+
 /* Find the NTFS client record in the restart-area client array by name. */
 static int lw_find_client(ntfs_logfile_t *log, uint16_t *idx_out)
 {
@@ -311,11 +367,21 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 	}
 	memcpy(w->ra, log->ra, w->ra_len);
 
+	/*
+	 * Adopt the last checkpoint's tables, so a checkpoint written by
+	 * this session does not drop what an earlier session registered.
+	 * No checkpoint yet is fine (-ENOENT); a corrupt one refuses the
+	 * open rather than writing on top of it.
+	 */
+	err = lw_adopt_checkpoint(w, log);
+	if (err) {
+		ntfs_log_writer_free(w);
+		return err;
+	}
+
 	err = lw_find_client(log, &w->client_idx);
 	if (err) {
-		free(w->ra);
-		free(w->page_buf);
-		free(w);
+		ntfs_log_writer_free(w);
 		return err;
 	}
 	{
@@ -347,9 +413,7 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 		lf_put16(w->ra + RA_FLAGS, lf_get16(w->ra + RA_FLAGS) & ~RESTART_VOLUME_IS_CLEAN);
 		err = ntfs_log_writer_sync(w);
 		if (err) {
-			free(w->ra);
-			free(w->page_buf);
-			free(w);
+			ntfs_log_writer_free(w);
 			return err;
 		}
 	}
@@ -384,6 +448,10 @@ void ntfs_log_writer_free(ntfs_log_writer_t *w)
 {
 	if (!w)
 		return;
+	lfs_table_free(&w->trtbl);
+	lfs_table_free(&w->dptbl);
+	lfs_table_free(&w->oatbl);
+	free(w->attr_names);
 	free(w->ra);
 	free(w->page_buf);
 	free(w);
@@ -482,22 +550,66 @@ static int lw_flush_page(ntfs_log_writer_t *w, uint32_t vbo)
 	return lw_write_page(log, vbo, w->page_buf);
 }
 
-/* Does laying out @total bytes from (page, off) cross the end of file? */
-static bool lw_would_wrap(ntfs_logfile_t *log, uint32_t page, uint32_t off, uint32_t total)
+/* Pages a @total-byte record occupies starting at offset @off. */
+static uint32_t lw_pages_for(ntfs_logfile_t *log, uint32_t off, uint32_t total)
 {
-	uint32_t left = total;
+	uint32_t cap = log->page_size - log->data_off;
+	uint32_t left = total, n = 1;
 
-	for (;;) {
-		uint32_t room = log->page_size - off;
-
-		if (left <= room)
-			return false;
-		left -= room;
-		page = lfs_next_page_off(log, page);
-		if (page == log->first_page)
-			return true;
-		off = log->data_off;
+	if (left <= log->page_size - off)
+		return 1;
+	left -= log->page_size - off;
+	while (left > cap) {
+		left -= cap;
+		n++;
 	}
+	return n + 1;
+}
+
+/* Number of record pages in the log area. */
+static uint32_t lw_page_count(ntfs_logfile_t *log)
+{
+	return (log->l_size - log->first_page) / log->page_size;
+}
+
+/* Pages strictly after @page, up to (not including) the oldest live page. */
+static uint32_t lw_pages_free(ntfs_log_writer_t *w, uint32_t page)
+{
+	ntfs_logfile_t *log = w->log;
+	uint32_t oldest, p = page, n = 0, total = lw_page_count(log);
+
+	if (!w->first_lsn)
+		return total;		/* empty log: everything is free */
+	oldest = lfs_lsn_to_vbo(log, w->first_lsn) & ~log->page_mask;
+	/* Advance before comparing: when the cursor sits on the oldest
+	 * page, every other page is free (the live records are all on
+	 * this page, ahead of the cursor). */
+	p = lfs_next_page_off(log, p);
+	while (p != oldest) {
+		n++;
+		p = lfs_next_page_off(log, p);
+		if (n > total)
+			break;		/* cannot happen */
+	}
+	return n;
+}
+
+/* Pages a checkpoint needs: one per non-empty table dump, one for the
+ * restart record, one of margin. */
+static uint32_t lw_reserve_pages(ntfs_log_writer_t *w)
+{
+	ntfs_logfile_t *log = w->log;
+	uint32_t p = 2;		/* restart record + margin */
+
+	if (w->trtbl.buf && lfs_table_total(&w->trtbl))
+		p += lw_pages_for(log, log->data_off, LR_HEADER_SIZE + NR_HEADER_SIZE + 8 + LF_ALIGN8(w->trtbl.bytes));
+	if (w->dptbl.buf && lfs_table_total(&w->dptbl))
+		p += lw_pages_for(log, log->data_off, LR_HEADER_SIZE + NR_HEADER_SIZE + 8 + LF_ALIGN8(w->dptbl.bytes));
+	if (w->attr_names_len)
+		p += lw_pages_for(log, log->data_off, LR_HEADER_SIZE + NR_HEADER_SIZE + 8 + LF_ALIGN8(w->attr_names_len));
+	if (w->oatbl.buf && lfs_table_total(&w->oatbl))
+		p += lw_pages_for(log, log->data_off, LR_HEADER_SIZE + NR_HEADER_SIZE + 8 + LF_ALIGN8(w->oatbl.bytes));
+	return p;
 }
 
 int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t transaction_id,
@@ -532,10 +644,21 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 			seq++;
 		off = log->data_off;
 	}
-	/* Pre-check the wrap with the adjusted start: a refused append
-	 * writes nothing (the layout below only runs after this passes). */
-	if (lw_would_wrap(log, page, off, total) && !w->checkpointed)
-		return -ENOSPC;
+	/* Pre-check the wrap and the checkpoint reserve with the adjusted
+	 * start: a refused append writes nothing (the layout below only
+	 * runs after this passes). The wrap is refused even with a
+	 * checkpoint until the wrap commit advances first_lsn past
+	 * overwritten pages; the reserve keeps a checkpoint emittable. */
+	{
+		uint32_t need = lw_pages_for(log, off, total);
+		uint32_t free_after = lw_pages_free(w, page);
+
+		if (need - 1 > free_after)
+			return -ENOSPC;
+		if (!w->in_checkpoint &&
+		    free_after - (need - 1) < lw_reserve_pages(w))
+			return -ENOSPC;
+	}
 	multi = off + total > log->page_size;
 
 	stage = malloc(total);
@@ -620,4 +743,218 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 	if (lsn_out)
 		*lsn_out = lsn;
 	return 0;
+}
+
+/* ---- open-attribute registration --------------------------------------- */
+
+/*
+ * Register an open attribute in the writer's in-memory table. Phase 2
+ * calls this when a transaction opens an attribute; the checkpoint
+ * dumps the table, so the attribute survives a crash and a reopen.
+ * The name, if any, is appended to the attribute-names blob with the
+ * entry's table offset, which is how the reader pairs names to
+ * entries. Returns the entry's table offset in *attr_id_out.
+ */
+int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
+			      uint64_t mft_no, uint16_t mft_seq,
+			      const uint16_t *name, uint16_t name_len,
+			      uint32_t *attr_id_out)
+{
+	uint8_t *e;
+	uint32_t off;
+	int err;
+
+	if (w->failed)
+		return -EIO;
+	if (!w->oatbl.buf) {
+		err = lfs_table_init(&w->oatbl, OA1_SIZE, 16);
+		if (err)
+			return err;
+	}
+	e = lfs_table_alloc(&w->oatbl);
+	if (!e)
+		return -ENOMEM;
+	off = lfs_table_off(&w->oatbl, e);
+	lf_put32(e + OA1_TYPE, type);
+	lf_put64(e + OA1_FILE_REF,
+		 (mft_no & 0xffffffffffffull) | ((uint64_t)mft_seq << 48));
+	lf_put64(e + OA1_OPEN_RECORD_LSN, w->last_lsn);
+	if (name_len) {
+		uint32_t need = w->attr_names_len + 4 + (uint32_t)name_len * 2;
+		uint8_t *nb = w->attr_names;
+
+		if (need > w->attr_names_cap) {
+			uint32_t cap = w->attr_names_cap ? w->attr_names_cap : 64;
+
+			while (cap < need)
+				cap *= 2;
+			nb = realloc(w->attr_names, cap);
+			if (!nb)
+				return -ENOMEM;
+			w->attr_names = nb;
+			w->attr_names_cap = cap;
+		}
+		lf_put16(w->attr_names + w->attr_names_len, (uint16_t)off);
+		lf_put16(w->attr_names + w->attr_names_len + 2, (uint16_t)(name_len * 2));
+		memcpy(w->attr_names + w->attr_names_len + 4, name, (size_t)name_len * 2);
+		w->attr_names_len = need;
+	}
+	if (attr_id_out)
+		*attr_id_out = off;
+	return 0;
+}
+
+/* ---- checkpoint emission ----------------------------------------------- */
+
+/*
+ * Append one restart table as a client record with a dump opcode.
+ * The redo payload is the table bytes; there is no undo. The record
+ * uses transaction id 0x18 (the first transaction-table entry): the
+ * replay analysis pass allocates an entry for every client record's
+ * tid, and tid 0 is rejected, so a dump must not use it.
+ */
+static int lw_dump_table(ntfs_log_writer_t *w, uint16_t op,
+			 const uint8_t *data, uint32_t len, uint64_t *lsn_out)
+{
+	uint32_t hdr = NR_HEADER_SIZE + 8;	/* lcns = 0 */
+	uint32_t total = hdr + LF_ALIGN8(len);
+	uint8_t *cdata;
+	int err;
+
+	if (len > 0xffff)
+		return -E2BIG;
+	cdata = malloc(total);
+	if (!cdata)
+		return -ENOMEM;
+	memset(cdata, 0, total);
+	lf_put16(cdata + NR_REDO_OP, op);
+	lf_put16(cdata + NR_UNDO_OP, LOP_Noop);
+	lf_put16(cdata + NR_REDO_OFFSET, (uint16_t)hdr);
+	lf_put16(cdata + NR_REDO_LENGTH, (uint16_t)len);
+	lf_put16(cdata + NR_UNDO_OFFSET, (uint16_t)total);
+	lf_put16(cdata + NR_UNDO_LENGTH, 0);
+	memcpy(cdata + hdr, data, len);
+	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0,
+				     cdata, total, lsn_out);
+	free(cdata);
+	return err;
+}
+
+/*
+ * Emit a checkpoint: dump each non-empty restart table, then an
+ * NTFS_RESTART record naming them, then sync the restart area so the
+ * new checkpoint is referenced before any later wrap can destroy the
+ * checkpoint it supersedes.
+ *
+ * The checkpoint's start_of_checkpoint is the first dump's LSN (or 0,
+ * which the reader takes as the restart record's own LSN, when every
+ * table is empty). Records before it become dispensable: the tables
+ * carry the state, and the oldest live LSN advances to it — which is
+ * what makes wraps possible: append() may use only the free pages,
+ * and before any checkpoint the oldest record sits on the first page,
+ * so no wrap fits. An active transaction's first record is never
+ * passed over (Phase 2 populates the transaction table; none exist
+ * yet).
+ *
+ * Crash contract: every dump and the restart record are appended
+ * synchronously, and the final sync is part of the call, so a crash
+ * at any instant leaves either the old checkpoint (restart area
+ * still points at it, its pages intact) or the new one (restart area
+ * updated, dumps durable). A crash mid-checkpoint leaves a partial
+ * checkpoint that is never referenced — the reader loads the old one.
+ */
+static int lw_checkpoint_inner(ntfs_log_writer_t *w, uint64_t *lsn_out)
+{
+	uint64_t oa_lsn = 0, an_lsn = 0, dp_lsn = 0, tr_lsn = 0;
+	uint32_t oa_len = 0, an_len = 0, dp_len = 0, tr_len = 0;
+	uint64_t first_dump = 0, rlsn;
+	uint8_t crst[CRST_SIZE];
+	uint8_t *e;
+	int err;
+	if (w->trtbl.buf && lfs_table_total(&w->trtbl)) {
+		err = lw_dump_table(w, LOP_TransactionTableDump,
+				    w->trtbl.buf, w->trtbl.bytes, &tr_lsn);
+		if (err)
+			return err;
+		tr_len = w->trtbl.bytes;
+		if (!first_dump)
+			first_dump = tr_lsn;
+	}
+	if (w->dptbl.buf && lfs_table_total(&w->dptbl)) {
+		err = lw_dump_table(w, LOP_DirtyPageTableDump,
+				    w->dptbl.buf, w->dptbl.bytes, &dp_lsn);
+		if (err)
+			return err;
+		dp_len = w->dptbl.bytes;
+		if (!first_dump)
+			first_dump = dp_lsn;
+	}
+	if (w->attr_names_len) {
+		err = lw_dump_table(w, LOP_AttributeNamesDump,
+				    w->attr_names, w->attr_names_len, &an_lsn);
+		if (err)
+			return err;
+		an_len = w->attr_names_len;
+		if (!first_dump)
+			first_dump = an_lsn;
+	}
+	if (w->oatbl.buf && lfs_table_total(&w->oatbl)) {
+		err = lw_dump_table(w, LOP_OpenAttributeTableDump,
+				    w->oatbl.buf, w->oatbl.bytes, &oa_lsn);
+		if (err)
+			return err;
+		oa_len = w->oatbl.bytes;
+		if (!first_dump)
+			first_dump = oa_lsn;
+	}
+
+	memset(crst, 0, sizeof(crst));
+	lf_put32(crst + CRST_MAJOR_VER, 1);
+	lf_put32(crst + CRST_MINOR_VER, 1);
+	lf_put64(crst + CRST_START_OF_CHECKPOINT, first_dump);
+	lf_put64(crst + CRST_OPEN_ATTR_TABLE_LSN, oa_lsn);
+	lf_put32(crst + CRST_OPEN_ATTR_TABLE_LEN, oa_len);
+	lf_put64(crst + CRST_ATTR_NAMES_LSN, an_lsn);
+	lf_put32(crst + CRST_ATTR_NAMES_LEN, an_len);
+	lf_put64(crst + CRST_DIRTY_PAGE_TABLE_LSN, dp_lsn);
+	lf_put32(crst + CRST_DIRTY_PAGE_TABLE_LEN, dp_len);
+	lf_put64(crst + CRST_TRANSACTION_TABLE_LSN, tr_lsn);
+	lf_put32(crst + CRST_TRANSACTION_TABLE_LEN, tr_len);
+	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT_RESTART, 0, 0,
+				     crst, sizeof(crst), &rlsn);
+	if (err)
+		return err;
+
+	w->checkpoint_lsn = rlsn;
+	w->checkpointed = true;
+	w->first_lsn = first_dump ? first_dump : rlsn;
+	e = NULL;
+	while ((e = lfs_table_next(&w->trtbl, e))) {
+		uint8_t st = e[TR_STATE];
+
+		if (st == TRANSACTION_ACTIVE || st == TRANSACTION_PREPARED) {
+			uint64_t fl = lf_get64(e + TR_FIRST_LSN);
+
+			if (fl && fl < w->first_lsn)
+				w->first_lsn = fl;
+		}
+	}
+	err = ntfs_log_writer_sync(w);
+	if (err)
+		return err;
+	if (lsn_out)
+		*lsn_out = rlsn;
+	return 0;
+}
+
+int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out)
+{
+	int err;
+
+	if (w->failed)
+		return -EIO;
+	w->in_checkpoint = true;
+	err = lw_checkpoint_inner(w, lsn_out);
+	w->in_checkpoint = false;
+	return err;
 }

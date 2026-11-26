@@ -298,6 +298,11 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out);
 int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type,
 			   uint32_t transaction_id, uint64_t undo_next_lsn,
 			   const void *data, uint32_t data_len, uint64_t *lsn_out);
+int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
+			      uint64_t mft_no, uint16_t mft_seq,
+			      const uint16_t *name, uint16_t name_len,
+			      uint32_t *attr_id_out);
+int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out);
 int ntfs_log_writer_sync(ntfs_log_writer_t *w);
 void ntfs_log_writer_free(ntfs_log_writer_t *w);
 

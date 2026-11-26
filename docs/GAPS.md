@@ -146,12 +146,48 @@ byte-exact read-back through the reader), `test_writer_reopen_append`
 only the earlier record), `test_writer_torn_tail` (torn last page →
 log ends at the previous record). Negative controls: no tail copy →
 crash test fails 4 checks; no first-record flush → walk fails
-`-EINVAL`. Still to do in Phase 1: checkpoint emission (NTFS_RESTART
-+ four table dumps, round-tripped through `load_checkpoint`), log
-wrap with checkpoint-first, and the writer-owned clean close.
-No integration with the mutation paths yet — the driver still
-retires the journal on mount and writes metadata unjournaled, so
-the crash story is unchanged until Phase 2.
+`-EINVAL`.
+
+Phase 1, step 2 landed 2026-11-26 (commit, this round): checkpoint
+emission — `ntfs_log_writer_checkpoint()` dumps each non-empty
+restart table as a client record (dump opcodes 0x1d–0x20, tid 0x18:
+the replay analysis allocates an entry for every client record's
+tid and rejects tid 0), then an NTFS_RESTART record naming them,
+then syncs the restart area so the new checkpoint is referenced
+before any later wrap can destroy the one it supersedes. Oldest
+live LSN advances to the checkpoint's start (first dump's LSN, or
+the restart record's own LSN when every table is empty); an active
+transaction's first record is never passed over. Also:
+`ntfs_log_writer_open_attr()` registers an open attribute (+ name
+in the attribute-names blob, keyed by table offset); `writer_open()`
+adopts the last checkpoint's tables so a second session's checkpoint
+does not drop them; appends keep a checkpoint reserve (one page per
+non-empty dump, one for the restart record, one of margin) so a full
+log can still be checkpointed — checkpoint appends are exempt. A
+record is refused when it would overwrite the oldest live page; a
+wrap around the end of the file is allowed when it stays inside the
+free pages, which a checkpoint makes possible by freeing the early
+ones. The wrap itself needs no `first_lsn` advance — the pages it
+overwrites held only dispensable records. Crash contract: a crash
+at any instant leaves the old checkpoint or the new one; a crash
+mid-checkpoint leaves a partial checkpoint that is never referenced.
+Tests: `test_writer_checkpoint_basic` (1 attr + name, dumps and
+restart record walked from the checkpoint, pre-checkpoint records
+now outside `[oldest, last]`), `test_writer_checkpoint_reopen`
+(second session keeps the attribute), `test_writer_checkpoint_reserve`
+(fill to `-ENOSPC`, checkpoint, fill again, checkpoint again).
+Negative controls: stubbing `checkpoint()` fails all three tests;
+dropping the table adoption fails the reopen test (attribute lost).
+Bug fixed en route: `lw_pages_free()` returned 0 when the cursor
+sat on the oldest page — every other page is free then, and the old
+code refused the next append on a nearly empty log.
+Still to do in Phase 1: verify a wrapped log reads back (the free-
+range check already permits wraps after a checkpoint; the second
+fill in `test_writer_checkpoint_reserve` wraps, but nothing walks
+the wrapped log yet), and the writer-owned clean close. No
+integration with the mutation paths yet — the driver still retires
+the journal on mount and writes metadata unjournaled, so the crash
+story is unchanged until Phase 2.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

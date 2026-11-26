@@ -2209,6 +2209,246 @@ static void test_writer_tail_copy_crash(void)
  * from the last synced record and truncates — the walk must return the
  * earlier records, never garbage.
  */
+
+/* Checkpoint: one open attribute with a name, dumped and reloaded. */
+struct ckpt_oa {
+	uint32_t id, type;
+	uint64_t mft_no, open_record_lsn;
+	uint16_t mft_seq, name_len;
+	uint16_t name[16];
+	int n;
+};
+
+static int ckpt_oa_cb(const struct ntfs_log_open_attr *a, void *ctx)
+{
+	struct ckpt_oa *o = ctx;
+
+	o->n++;
+	if (o->n == 1) {
+		o->id = a->id;
+		o->type = a->type;
+		o->mft_no = a->mft_no;
+		o->mft_seq = a->mft_seq;
+		o->open_record_lsn = a->open_record_lsn;
+		o->name_len = a->name_len;
+		if (a->name && a->name_len <= 16)
+			memcpy(o->name, a->name, (size_t)a->name_len * 2);
+	}
+	return 0;
+}
+
+static void test_writer_checkpoint_basic(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], p2[40], c1[512], c2[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct wseen s;
+	struct ckpt_oa oa;
+	struct ntfs_log_table_cbs cbs;
+	static const uint16_t nm[] = { 'D', 'A', 'T', 'A' };
+	uint32_t n1, n2, attr_id = 0;
+	uint64_t lsn1, lsn2, rlsn, first_dump;
+	int i;
+
+	printf("test_writer_checkpoint_basic\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 40; i++)
+		p2[i] = (uint8_t)(0x5A + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), 0);
+	CHECK_EQ(ntfs_log_writer_open_attr(w, ATTR_TYPE_DATA, 6, 1, nm, 4, &attr_id), 0);
+	CHECK_EQ(attr_id, 0x18);	/* first open-attribute entry */
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn), 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Reopen: the checkpoint is referenced and its tables load. */
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.client_restart_lsn, rlsn);
+	CHECK_EQ(ntfs_logfile_load_checkpoint(log), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.table_open_attrs, 1);
+	memset(&oa, 0, sizeof(oa));
+	memset(&cbs, 0, sizeof(cbs));
+	cbs.open_attr = ckpt_oa_cb;
+	CHECK_EQ(ntfs_logfile_tables(log, &cbs, &oa), 0);
+	CHECK_EQ(oa.n, 1);
+	if (oa.n == 1) {
+		CHECK_EQ(oa.id, 0x18);
+		CHECK_EQ(oa.type, ATTR_TYPE_DATA);
+		CHECK_EQ(oa.mft_no, 6);
+		CHECK_EQ(oa.mft_seq, 1);
+		CHECK_EQ(oa.open_record_lsn, lsn2);
+		CHECK_EQ(oa.name_len, 4);
+		CHECK(memcmp(oa.name, nm, sizeof(nm)) == 0);
+	}
+	/* The walk starts at the checkpoint: names dump, open-attr dump,
+	 * restart record. Records before the checkpoint are gone from
+	 * the walk's range. */
+	first_dump = info.checkpoint_lsn;
+	CHECK(first_dump != 0 && first_dump != rlsn);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, 0, wcollect, &s), 0);
+	CHECK_EQ(s.n, 3);
+	if (s.n == 3) {
+		CHECK_EQ(s.lsn[0], first_dump);
+		CHECK_EQ(s.type[0], LFS_RECORD_TYPE_CLIENT);
+		CHECK_EQ(s.tid[0], 0x18);
+		CHECK_EQ(s.type[1], LFS_RECORD_TYPE_CLIENT);
+		CHECK_EQ(s.tid[1], 0x18);
+		CHECK_EQ(s.lsn[2], rlsn);
+		CHECK_EQ(s.type[2], LFS_RECORD_TYPE_CLIENT_RESTART);
+		CHECK_EQ(lf_get32(s.data[2]), 1);	/* restart major ver */
+	}
+	wseen_free(&s);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsn1, wcollect, &s), -EINVAL);
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
+/* A second session's checkpoint must keep the first session's attribute. */
+static void test_writer_checkpoint_reopen(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], c1[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct ckpt_oa oa;
+	struct ntfs_log_table_cbs cbs;
+	static const uint16_t nm[] = { 'D', 'A', 'T', 'A' };
+	uint32_t n1, attr_id = 0;
+	uint64_t lsn1, rlsn1, rlsn2;
+	int i;
+
+	printf("test_writer_checkpoint_reopen\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_open_attr(w, ATTR_TYPE_DATA, 6, 1, nm, 4, &attr_id), 0);
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn1), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Second session: no new attributes, just another record and a
+	 * checkpoint. Without adopting the old checkpoint's tables the
+	 * attribute would be dropped here. */
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn2), 0);
+	CHECK(rlsn2 > rlsn1);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.client_restart_lsn, rlsn2);
+	CHECK_EQ(ntfs_logfile_load_checkpoint(log), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.table_open_attrs, 1);
+	memset(&oa, 0, sizeof(oa));
+	memset(&cbs, 0, sizeof(cbs));
+	cbs.open_attr = ckpt_oa_cb;
+	CHECK_EQ(ntfs_logfile_tables(log, &cbs, &oa), 0);
+	CHECK_EQ(oa.n, 1);
+	if (oa.n == 1) {
+		CHECK_EQ(oa.mft_no, 6);
+		CHECK_EQ(oa.name_len, 4);
+		CHECK(memcmp(oa.name, nm, sizeof(nm)) == 0);
+	}
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
+/*
+ * Fill the log until appends refuse, checkpoint (which must still fit
+ * in the reserve), fill again, checkpoint again. The second checkpoint
+ * is the referenced one after reopen.
+ */
+static void test_writer_checkpoint_reserve(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p[4000], c[4200];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	uint32_t n;
+	uint64_t lsn, rlsn1, rlsn2;
+	int i, filled1 = 0, filled2 = 0;
+
+	printf("test_writer_checkpoint_reserve\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 4000; i++)
+		p[i] = (uint8_t)(0xA5 ^ (i & 0xff));
+	n = build_noop(c, p, sizeof(p));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	while (ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn) == 0)
+		filled1++;
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn), -ENOSPC);
+	CHECK(filled1 > 10);	/* most of the 64-page log filled */
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn1), 0);
+	while (ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn) == 0)
+		filled2++;
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn), -ENOSPC);
+	CHECK(filled2 > 10);	/* the checkpoint freed the log again */
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn2), 0);
+	CHECK(rlsn2 > rlsn1);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.client_restart_lsn, rlsn2);
+	CHECK_EQ(ntfs_logfile_load_checkpoint(log), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.checkpoint_lsn, rlsn2);	/* no dumps: start is the restart record */
+	CHECK_EQ(info.table_open_attrs, 0);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
 static void test_writer_torn_tail(void)
 {
 	uint8_t *buf = malloc(LSIZE);
@@ -2290,6 +2530,9 @@ int main(void)
 	test_writer_reopen_append();
 	test_writer_tail_copy_crash();
 	test_writer_torn_tail();
+	test_writer_checkpoint_basic();
+	test_writer_checkpoint_reopen();
+	test_writer_checkpoint_reserve();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
