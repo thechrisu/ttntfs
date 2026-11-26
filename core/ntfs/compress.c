@@ -1354,27 +1354,30 @@ static void ntfs_compress_workspace_free(struct ntfs_compress_workspace *ws)
 }
 
 static void ntfs_copy_cb(struct page **pages, int pages_per_cb,
+			 unsigned int page_offset,
 			 struct ntfs_compress_workspace *ws, unsigned int bytes)
 {
 	unsigned int copied = 0, i;
 
 	for (i = 0; i < pages_per_cb && copied < bytes; i++) {
-		unsigned int len = min_t(unsigned int, bytes - copied, PAGE_SIZE);
+		unsigned int offset = i ? 0 : page_offset;
+		unsigned int len = min_t(unsigned int, bytes - copied, PAGE_SIZE - offset);
 		void *addr = kmap_local_page(pages[i]);
 
-		memcpy(ws->outbuf + copied, addr, len);
+		memcpy(ws->outbuf + copied, addr + offset, len);
 		kunmap_local(addr);
 		copied += len;
 	}
 }
 
 static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
-		int pages_per_cb, struct compress_context *ctx,
+		int pages_per_cb, unsigned int page_offset,
+		struct compress_context *ctx,
 		struct ntfs_compress_workspace *ws)
 {
 	struct ntfs_volume *vol = ni->vol;
 	char *outbuf = ws->outbuf, *pbuf;
-	u32 compsz, p, insz = pages_per_cb << PAGE_SHIFT;
+	u32 compsz, p, insz = ni->itype.compressed.block_size;
 	s32 rounded, bio_size;
 	int sz;
 	unsigned int bsz;
@@ -1395,11 +1398,10 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 	compsz = 0;
 	allzeroes = true;
 	for (p = 0; (p < insz) && !fail; p += NTFS_SB_SIZE) {
-		/* PORT: upstream adds page_offset here for large pages;
-		 * this port has no page_offset — units start at a page
-		 * boundary — so the input offset is just p. Each
-		 * sub-block is one page (NTFS_SB_SIZE == PAGE_SIZE). */
-		unsigned int input_offset = p;
+		/* Each sub-block is one page (NTFS_SB_SIZE == PAGE_SIZE);
+		 * on a large-page system the unit may start mid-page, so
+		 * the offset is carried in page_offset. */
+		unsigned int input_offset = page_offset + p;
 		unsigned int page_idx = input_offset >> PAGE_SHIFT;
 		const char *input;
 		void *addr;
@@ -1473,7 +1475,7 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 			err = 0;
 		goto out;
 	} else {
-		ntfs_copy_cb(pages, pages_per_cb, ws, insz);
+		ntfs_copy_cb(pages, pages_per_cb, page_offset, ws, insz);
 		bio_size = insz;
 	}
 
@@ -1549,12 +1551,21 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 	struct compress_context *ctx;
 	struct folio *folio;
 	struct page **pages = NULL, *page;
-	int pages_per_cb = ni->itype.compressed.block_size >> PAGE_SHIFT;
+	int pages_per_cb;
 	int cb_size = ni->itype.compressed.block_size, cb_off, err = 0;
 	int i, ip;
 	size_t written = 0;
 	loff_t end = pos + count;
 	struct address_space *mapping = VFS_I(ni)->i_mapping;
+
+	/* PORT: at PAGE_SIZE 4096 this is cb_size >> PAGE_SHIFT, the old
+	 * value. It is computed, not shifted, so a unit starting mid-page
+	 * on a large-page system maps every page it covers instead of
+	 * yielding a zero page count for a small block. The per-unit
+	 * recompute below yields the same count at 4K, so the array
+	 * sized here always fits. */
+	pages_per_cb = DIV_ROUND_UP(offset_in_page(pos & ~(cb_size - 1)) +
+			cb_size, PAGE_SIZE);
 
 	/*
 	 * PORT: upstream expands only when the write passes allocated_size.
@@ -1599,6 +1610,7 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 	while (count) {
 		pgoff_t index;
 		size_t copied, bytes;
+		unsigned int page_offset;
 		bool full_cb;
 		int off;
 
@@ -1608,14 +1620,11 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 			bytes = count;
 
 		cb_off = pos & ~(cb_size - 1);
+		page_offset = offset_in_page(cb_off);
+		pages_per_cb = DIV_ROUND_UP(page_offset + cb_size, PAGE_SIZE);
 		index = cb_off >> PAGE_SHIFT;
-		/* PORT: upstream also requires !page_offset (the unit starts
-		 * at a page boundary) and !(cb_size & (PAGE_SIZE - 1)) (the
-		 * unit is a whole number of pages). This port hard-codes 4K
-		 * pages and cb_size is always a multiple of 4 KiB, so both
-		 * hold unconditionally; only the two terms that can vary are
-		 * tested. */
-		full_cb = !off && bytes == cb_size;
+		full_cb = !off && bytes == cb_size && !page_offset &&
+				!(cb_size & (PAGE_SIZE - 1));
 
 		if (unlikely(fault_in_iov_iter_readable(from, bytes))) {
 			err = -EFAULT;
@@ -1673,7 +1682,8 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 			goto release_pages;
 		}
 
-		err = ntfs_write_cb(ni, pos, pages, pages_per_cb, ctx, &ws);
+		err = ntfs_write_cb(ni, pos, pages, pages_per_cb, page_offset,
+				ctx, &ws);
 
 release_pages:
 		for (i = 0; i < pages_per_cb; i++) {

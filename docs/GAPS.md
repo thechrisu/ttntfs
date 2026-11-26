@@ -1829,6 +1829,43 @@ Porting progress (one commit per item, in the order above):
   (196 s).
   1 port item remains.
 
+- 2026-11-26: `f2b2aeeaadce` (support large pages in compressed
+  writes) — ported. `ntfs_compress_write()` derived its page
+  count by shifting the compression block size and assumed every
+  block begins at a page boundary — a zero page count for small
+  blocks on large-page systems, and an ignored in-page offset.
+  Now every page covering the block is mapped (pages_per_cb via
+  DIV_ROUND_UP(offset_in_page + cb_size, PAGE_SIZE), once from
+  pos and recomputed per unit), the in-page offset is passed to
+  `ntfs_write_cb()` and `ntfs_copy_cb()`, insz is the block size
+  rather than pages_per_cb << PAGE_SHIFT, and the full_cb
+  condition is upstream-verbatim (including !page_offset and
+  !(cb_size & (PAGE_SIZE - 1))). The upstream else-branch
+  memcpy/pages assignment and the bio sector math are already
+  covered in better form by the item-12 port (ntfs_copy_cb +
+  workspace; the port has no bio). Behaviour-neutral at PAGE_SIZE
+  4096 — every new computation reduces to the old value — so no
+  new test can discriminate it here; the value is structural: the
+  4K assumption is gone from the compressed-write path, so a
+  future move to host page sizes (macOS arm64 is 16K) cannot
+  silently yield pages_per_cb = 0.
+  Measured, honestly: same scratch benchmark (256 MiB image, 16
+  MiB writes, 5 reps each) — compressible median 69 ms (69.1 /
+  84.6 / 69.4 / 65.2 / 65.1) vs 73 ms before, random median
+  341 ms (325.5 / 341.1 / 331.3 / 356.3 / 341.6) vs 358 ms
+  before — both inside this box's ±15% load swing, i.e. no
+  measurable change, which is the correct result for this port.
+  No perf gain is claimed.
+  Crash/disconnect at the worst instant: the write order, flush
+  points, and on-disk layout are unchanged — this commit only
+  changes how the in-memory page count and offsets are computed,
+  so the crash story is unchanged.
+  Evidence (this commit): plain ctest 15/15 (60 s), UBSan ctest
+  15/15 (59 s), ASan ctest 15/15 (74 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (201 s).
+  0 port items remain — the port queue is done.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
