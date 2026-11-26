@@ -38,6 +38,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
@@ -2757,6 +2758,116 @@ static void test_ea_final_size_validated(void)
 	unlink(scratch);
 }
 
+/*
+ * Upstream 5b6eedd7cc29: ntfs_icx_ib_sync_write() called
+ * post_write_mst_fixup() when ntfs_ib_write() returned an error,
+ * intending to restore the buffer after a failed write. But
+ * ntfs_ib_write() also returns an error when pre_write_mst_fixup()
+ * validation fails on an invalid index_block, and post_write assumes
+ * the block is valid and does no boundary checks. With usa_count = 0
+ * the count underflows to 0xffff and post_write walks ~33 MB past the
+ * 4 KiB buffer (KASAN slab-out-of-bounds in the upstream report). The
+ * fix moves the post_write call into ntfs_ib_write(), after the
+ * pwrite, so it only runs when pre_write succeeded.
+ *
+ * The crafted block still reads fine: post_read_mst_fixup() treats an
+ * invalid USA as "not protected" and returns 0, so the directory loads
+ * and a setattr + fsync on an existing root directory reaches the sync
+ * write (fsync -> __ntfs_write_inode -> ntfs_inode_sync_filename ->
+ * ntfs_icx_ib_sync_write). The trigger must use an EXISTING entry:
+ * creating a file first does not work -- the create's own index write
+ * fails at pre_write and is swallowed, so the entry never lands on
+ * disk and the fsync-time index lookup returns -ENOENT before any
+ * sync write. Setting the directory's crtime (to its current value)
+ * sets FileNameDirty, which is what makes __ntfs_write_inode call
+ * sync_filename at all; the entry is on disk, so the lookup finds it
+ * and the sync write runs on the crafted block. The trigger runs in a
+ * forked child: without the fix the child dies with SIGSEGV in
+ * post_write; with the fix it exits cleanly. __ntfs_write_inode()
+ * ignores sync_filename's return, so fsync reports 0 either way --
+ * survival, not the return value, is the assertion. The parent CHECKs
+ * the wait status, so the suite survives the negative control.
+ * Fixture patcher tools/mkfixtures/patch_ib_usa.py sets usa_count = 0
+ * on the root's single INDX block. No fsck_clean: the image is
+ * deliberately corrupt.
+ */
+static void test_ib_sync_write_no_post_fixup(void)
+{
+	const char *py = getenv("NTFS_PATCH_IB_USA");
+	char cmd[PATH_MAX * 2 + 256];
+	pid_t pid;
+	int rc, st;
+
+	printf("test_ib_sync_write_no_post_fixup\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_ib_sync_write_no_post_fixup: NTFS_PATCH_IB_USA not set\n");
+		return;
+	}
+	if (copy_fixture("ibus") != 0) {
+		fprintf(stderr, "SKIP test_ib_sync_write_no_post_fixup: no fixture\n");
+		return;
+	}
+	snprintf(cmd, sizeof(cmd), "python3 %s %s >/dev/null 2>&1", py, scratch);
+	rc = system(cmd);
+	if (rc != 0) {
+		fprintf(stderr, "SKIP test_ib_sync_write_no_post_fixup: patcher failed (rc %d)\n", rc);
+		unlink(scratch);
+		return;
+	}
+	pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "SKIP test_ib_sync_write_no_post_fixup: fork failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (pid == 0) {
+		/* Child: mount, look up the existing "ads" directory, set
+		 * its crtime to its current value (sets FileNameDirty with
+		 * no on-disk change), fsync it. With the fix the sync write
+		 * fails cleanly with -EIO inside and the child exits;
+		 * without it post_write_mst_fixup() runs on the invalid
+		 * block and the child segfaults. "ads" is used (not
+		 * "links"): the crafted block's sector ends are never
+		 * restored on read, so an entry whose mref spans a sector
+		 * end ("links" at 1528, sequence bytes at 1534-1535) reads
+		 * back the USN 0xa instead of its true sequence 1 and the
+		 * lookup fails with stale-reference -EIO; "ads" (entry at
+		 * 1240) does not span one. */
+		struct vol v;
+		ntfs_inode_t *d = NULL;
+		struct ntfs_attr at;
+
+		if (vol_up(&v, 022, 022, 501, 20))
+			_exit(2);
+		if (ntfs_lookup(v.root, "ads", &d) != 0 || !d)
+			_exit(3);
+		if (ntfs_getattr(d, &at) != 0)
+			_exit(4);
+		if (ntfs_setattr(d, &at, NTFS_SETATTR_CRTIME) != 0)
+			_exit(5);
+		/* __ntfs_write_inode() calls ntfs_inode_sync_filename()
+		 * but ignores its return, so fsync reports 0 even when
+		 * the index sync write fails: survival is the assertion
+		 * here, not the return value. */
+		(void)ntfs_fsync(d, false);
+		ntfs_inode_put(d);
+		vol_down(&v);
+		_exit(0);
+	}
+	if (waitpid(pid, &st, 0) < 0) {
+		fprintf(stderr, "FAIL ib sync write: waitpid failed\n");
+		CHECK(0);
+		unlink(scratch);
+		return;
+	}
+	CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+	if (WIFSIGNALED(st))
+		fprintf(stderr, "FAIL ib sync write: child killed by signal %d (expected clean exit)\n", WTERMSIG(st));
+	else if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		fprintf(stderr, "FAIL ib sync write: child exit status %d (expected 0)\n", WEXITSTATUS(st));
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -2777,6 +2888,7 @@ int main(void)
 	test_lookup_err_mref_normalized();
 	test_nonres_attr_validation();
 	test_ea_final_size_validated();
+	test_ib_sync_write_no_post_fixup();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

@@ -722,6 +722,34 @@ Porting progress (one commit per item, in the order above):
   in the new one. Plain ctest 15/15, UBSan ctest 15/15,
   `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
   41 port items remain.
+- 2026-11-26: `5b6eedd7cc29` (avoid calling post_write_mst_fixup() for
+  invalid index_block) — ported: `ntfs_icx_ib_sync_write()` called
+  `post_write_mst_fixup()` whenever `ntfs_ib_write()` returned an
+  error, but `ntfs_ib_write()` also errors when `pre_write_mst_fixup()`
+  validation fails on an invalid block, and `post_write` assumes the
+  block is valid and does no boundary checks (with usa_count = 0 the
+  count underflows to 0xffff and it walks ~33 MB past the 4 KiB
+  buffer). The fix moves the `post_write` call into `ntfs_ib_write()`,
+  after the pwrite, so it only runs when `pre_write` succeeded. New
+  test `test_ib_sync_write_no_post_fixup` in `core/tests/test_links.c`
+  plus fixture patcher `tools/mkfixtures/patch_ib_usa.py` (sets
+  usa_count = 0 on the root's single INDX block). The trigger runs in
+  a forked child (setattr the existing "ads" directory's crtime to
+  its current value to set FileNameDirty, then fsync it, reaching
+  `ntfs_inode_sync_filename` -> `ntfs_icx_ib_sync_write`); the parent
+  CHECKs the wait status so the suite survives the negative control.
+  Two dead ends are recorded in the test comment: creating a file
+  first does not work (the create's own index write fails at pre_write
+  and is swallowed, so the entry never lands on disk and the
+  fsync-time lookup returns -ENOENT), and "links" cannot be the target
+  (its mref spans sector end 1534, so the unrestored USN 0xa reads back
+  instead of its true sequence 1 and the lookup fails stale-reference
+  -EIO; "ads" at 1240 does not span one). Evidence: test_links 487
+  checks 0 failures with the fix; without it exactly 1 failure, the
+  child killed by signal 11 (SIGSEGV). Plain ctest 15/15, UBSan ctest
+  15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1.
+  40 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

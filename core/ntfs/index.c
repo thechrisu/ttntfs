@@ -141,6 +141,15 @@ static int ntfs_ib_write(struct ntfs_index_context *icx, struct index_block *ib)
 	ret = ntfs_inode_attr_pwrite(VFS_I(icx->ia_ni),
 			ntfs_ib_vcn_to_pos(icx, vcn), icx->block_size,
 			(u8 *)ib, icx->sync_write);
+
+	/* PORT: upstream 5b6eedd7cc29: perform data restoration before
+	 * returning, so a failed pre_write_mst_fixup() (invalid
+	 * index_block) never reaches post_write_mst_fixup() in the
+	 * caller -- post_write assumes the block is valid and does no
+	 * boundary checks, so it would read/write out of bounds on a
+	 * crafted usa_ofs/usa_count. */
+	post_write_mst_fixup((struct ntfs_record *)ib);
+
 	if (ret != icx->block_size) {
 		ntfs_debug("Failed to write index block %lld, inode %llu",
 				vcn, (unsigned long long)icx->idx_ni->mft_no);
@@ -178,7 +187,10 @@ int ntfs_icx_ib_sync_write(struct ntfs_index_context *icx)
 		icx->ib = NULL;
 		icx->ib_dirty = false;
 	} else {
-		post_write_mst_fixup((struct ntfs_record *)icx->ib);
+		/* PORT: upstream 5b6eedd7cc29: post_write_mst_fixup()
+		 * moved into ntfs_ib_write() (see above); calling it here
+		 * on a block whose pre_write validation failed would run
+		 * it on an invalid index_block. */
 		icx->sync_write = false;
 	}
 
