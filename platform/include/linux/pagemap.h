@@ -145,6 +145,7 @@ void truncate_inode_pages_range(struct address_space *mapping, loff_t lstart, lo
 void truncate_inode_pages_final(struct address_space *mapping);
 void truncate_pagecache(struct inode *inode, loff_t newsize);
 void truncate_setsize(struct inode *inode, loff_t newsize);
+void pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to);
 unsigned long invalidate_mapping_pages(struct address_space *mapping, pgoff_t start, pgoff_t end);
 int invalidate_inode_pages2_range(struct address_space *mapping, pgoff_t start, pgoff_t end);
 static inline void filemap_invalidate_lock(struct address_space *m) { down_write(&m->invalidate_lock); }

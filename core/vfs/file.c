@@ -241,20 +241,41 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	/* PORT: flush cached edge pages before the size changes under them. */
 	if (attr->ia_size < old_size)
 		filemap_write_and_wait(vi->i_mapping);
-	truncate_setsize(vi, attr->ia_size);
-	err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
-	if (err) {
-		i_size_write(vi, old_size);
-		return err;
+
+	/*
+	 * Upstream 9cc5761b8f28: take invalidate_lock exclusively around the
+	 * whole resize, after the DIO wait (the port has no DIO), so a page
+	 * fault cannot resolve a VCN against the transient runlist state
+	 * of ntfs_non_resident_attr_expand() and fail with a spurious
+	 * SIGBUS. PORT: the port has no mmap fault path and no shared taker
+	 * of invalidate_lock anywhere (see the not-applicable row for
+	 * 0fecc393f206 in docs/UPSTREAM-TRIAGE-7.3.md), so the lock is
+	 * unobservable here; take it anyway for upstream fidelity, so the
+	 * resize is atomic against any future fault path. Lock order is
+	 * i_rwsem -> invalidate_lock, matching ntfs_vfs_fallocate().
+	 */
+	filemap_invalidate_lock(vi->i_mapping);
+	if (attr->ia_size > old_size) {
+		/*
+		 * Upstream 5c32f0b8d791: truncate_pagecache() first, then
+		 * update i_size, and pagecache_isize_extended() instead of
+		 * the manual zero_range() epilogue below. The straddling
+		 * folio is zeroed in the cache and marked dirty (see
+		 * pagecache_isize_extended()); the read path zeroes past
+		 * initialized_size on fill, so an uncached folio needs
+		 * nothing.
+		 */
+		truncate_pagecache(vi, old_size);
+		i_size_write(vi, attr->ia_size);
+		pagecache_isize_extended(vi, old_size, attr->ia_size);
+	} else {
+		truncate_setsize(vi, attr->ia_size);
 	}
 
-	if (NInoNonResident(ni) && attr->ia_size > old_size &&
-	    old_size % PAGE_SIZE != 0) {
-		loff_t len = min_t(loff_t,
-				round_up(old_size, PAGE_SIZE) - old_size,
-				attr->ia_size - old_size);
-		err = ntfs_vfs_zero_range(vi, old_size, len);
-	}
+	err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
+	if (err)
+		i_size_write(vi, old_size);
+	filemap_invalidate_unlock(vi->i_mapping);
 
 	return err;
 }
@@ -469,7 +490,6 @@ int ntfs_vfs_fallocate(struct inode *vi, int mode, loff_t offset, loff_t len)
 	struct ntfs_volume *vol = ni->vol;
 	int err = 0;
 	loff_t old_size;
-	bool map_locked = false;
 
 	if (mode & ~(NTFS_FALLOC_FL_SUPPORTED))
 		return -EOPNOTSUPP;
@@ -502,14 +522,21 @@ int ntfs_vfs_fallocate(struct inode *vi, int mode, loff_t offset, loff_t len)
 
 	old_size = i_size_read(vi);
 
-	if (NInoCompressed(ni) || NInoEncrypted(ni)) {
-		err = -EOPNOTSUPP;
-		goto out;
-	}
+	if (NInoCompressed(ni) || NInoEncrypted(ni))
+		return -EOPNOTSUPP;
+
+	/*
+	 * Upstream 67aded1da114: take invalidate_lock for all fallocate
+	 * operations, not just punch hole. During ntfs_attr_fallocate()
+	 * new clusters are mapped to the runlist before being zeroed by
+	 * ntfs_dio_zero_range(), so a concurrent mmap page fault could
+	 * read uninitialized disk data. PORT: same unobservable note as
+	 * ntfs_setattr_size() above -- no mmap fault path, no shared
+	 * taker of invalidate_lock; taken for upstream fidelity.
+	 */
+	filemap_invalidate_lock(vi->i_mapping);
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
-		filemap_invalidate_lock(vi->i_mapping);
-		map_locked = true;
 		if (!(mode & FALLOC_FL_KEEP_SIZE)) {
 			err = -EOPNOTSUPP;
 			goto out;
@@ -523,15 +550,19 @@ int ntfs_vfs_fallocate(struct inode *vi, int mode, loff_t offset, loff_t len)
 		goto out;
 
 out:
-	if (map_locked)
-		filemap_invalidate_unlock(vi->i_mapping);
+	filemap_invalidate_unlock(vi->i_mapping);
 	if (!err) {
 		if (mode == 0 && NInoNonResident(ni) &&
-		    offset > old_size && old_size % PAGE_SIZE != 0) {
-			loff_t zlen = min_t(loff_t,
-					    round_up(old_size, PAGE_SIZE) - old_size,
-					    offset - old_size);
-			err = ntfs_vfs_zero_range(vi, old_size, zlen);
+		    offset > old_size) {
+			/*
+			 * Upstream 5c32f0b8d791: same truncate_pagecache()
+			 * + pagecache_isize_extended() as the setattr
+			 * extension path; the old_size % PAGE_SIZE
+			 * condition goes away (both helpers are no-ops
+			 * when nothing straddles the old EOF).
+			 */
+			truncate_pagecache(vi, old_size);
+			pagecache_isize_extended(vi, old_size, offset);
 		}
 		NInoSetFileNameDirty(ni);
 		inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));

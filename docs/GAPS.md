@@ -1134,6 +1134,46 @@ Porting progress (one commit per item, in the order above):
   18.1.3 via apt, darwin stage green again.)
   24 port items remain.
 
+- 2026-11-26: `9cc5761b8f28` + `67aded1da114` + `5c32f0b8d791`
+  (invalidate_lock / size extension) — ported as one commit (same
+  two functions): `ntfs_setattr_size()` now takes
+  filemap_invalidate_lock around the whole resize (unlocked on
+  error too, restoring i_size first), and `ntfs_vfs_fallocate()`
+  takes it unconditionally before the punch/allocate switch (the
+  compressed/encrypted check returns -EOPNOTSUPP before the lock;
+  the old map_locked flag is gone); lock order i_rwsem ->
+  invalidate_lock. New `pagecache_isize_extended()` in
+  platform/pagecache/pagecache.c (zeroes [from, to) in the folio
+  straddling the old EOF and marks it dirty; no-op when from >= to
+  or the folio is not cached), and both extension branches now call
+  truncate_pagecache(old_size) + pagecache_isize_extended(old, new)
+  instead of the old ntfs_vfs_zero_range() epilogue (which only ran
+  when old_size % PAGE_SIZE != 0). NOTE: the lock half is
+  unobservable in this port — no mmap fault path, no shared taker
+  of invalidate_lock anywhere, no inode_dio_wait — so no
+  discriminating test is possible for it (same precedent as
+  4dc8f4ee2d46 / 8c5dc7587fdd / 88496c4ac5a6 / 81fe702ff176);
+  applied for upstream fidelity. The zeroing half is
+  behavior-preserving here (the old zero_range also dirtied the
+  folio; the read path zeroes past initialized_size on fill;
+  ntfs_truncate_vfs never raises initialized_size on extension),
+  and it is pinned by the discriminating unit test
+  `test_isize_extended()` in
+  platform/pagecache/tests/test_pagecache.c — negative controls:
+  stripping the zero fails it at the zeroed-bytes assertion,
+  stripping the dirty mark fails it at the dirty assertion
+  (the folio starts clean with stale bytes planted by memset, so
+  the setup cannot mask either). `test_size_extension_zeroes()` in
+  core/tests/test_links.c pins the end-to-end behaviour (setattr
+  extension and the fallocate gap, in memory and after a remount)
+  as a characterization test: it passes with the old code too,
+  verified empirically by stripping the new extension branch to a
+  bare i_size_write. Evidence: plain ctest 15/15, UBSan ctest
+  15/15, ASan ctest PASS, `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 (202s).
+  19 port items remain (triage-table count; the running GAPS
+  count had drifted from the table by two rows).
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

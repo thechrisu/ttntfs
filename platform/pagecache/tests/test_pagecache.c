@@ -210,6 +210,43 @@ static void test_fgp_flags(struct inode *in)
 	folio_put(f);
 }
 
+/*
+ * pagecache_isize_extended() (upstream 5c32f0b8d791): extending i_size
+ * must zero [from, to) in the folio straddling the old EOF and leave
+ * it dirty, so the zeroed tail reaches the disk at writeback. A folio
+ * that is not cached needs nothing (read_mapping_folio zeroes past
+ * initialized_size on fill), and from >= to is a no-op.
+ */
+static void test_isize_extended(struct inode *in)
+{
+	struct address_space *m = in->i_mapping;
+	struct folio *f = read_mapping_folio(m, 500, NULL);
+	CHECK(!IS_ERR(f));
+	/*
+	 * Stale bytes past the old EOF in a folio that is NOT dirty (the
+	 * state after a sync): a plain memset plants them without
+	 * changing the dirty state, so the dirty assertion below really
+	 * tests pagecache_isize_extended() and not the setup.
+	 */
+	folio_lock(f);
+	memset((char *)f->data + 100, 0xAB, PAGE_SIZE - 100);
+	folio_unlock(f);
+	CHECK(!folio_test_dirty(f));
+	pagecache_isize_extended(in, 500 * PAGE_SIZE + 100, 500 * PAGE_SIZE + 5000);
+	/* Bytes before the old EOF untouched, the exposed range zeroed. */
+	for (size_t i = 0; i < 100; i++)
+		CHECK(((unsigned char *)f->data)[i] == fake_addr(m, 500)[i]);
+	for (size_t i = 100; i < PAGE_SIZE; i++)
+		CHECK(((unsigned char *)f->data)[i] == 0);
+	CHECK(folio_test_dirty(f));
+	folio_put(f);
+	/* No-op cases: from >= to, and no cached folio. */
+	pagecache_isize_extended(in, 100, 100);
+	CHECK(PTR_ERR(filemap_get_folio(m, 501)) == -ENOENT);
+	pagecache_isize_extended(in, 501 * PAGE_SIZE, 502 * PAGE_SIZE);
+	CHECK(PTR_ERR(filemap_get_folio(m, 501)) == -ENOENT);
+}
+
 /* Standalone pages (alloc_page, as compress.c uses) must not disturb the
  * cache's folio accounting: every alloc/free cycle used to leave the global
  * counter one lower, which eventually disabled reclaim for good. */
@@ -400,6 +437,7 @@ int main(void)
 	test_fgp_flags(&in);
 	test_sync_visibility(&in);
 	test_sync_retries_redirty(&in);
+	test_isize_extended(&in);
 	/* sync_sb flushes this inode's dirty folios through its sb. */
 	{
 		struct folio *f = read_mapping_folio(in.i_mapping, 400, NULL);

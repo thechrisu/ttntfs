@@ -3212,6 +3212,107 @@ static void test_folio_fullpage_write(void)
 }
 
 /*
+ * Upstream 9cc5761b8f28 + 67aded1da114 + 5c32f0b8d791 (invalidate_lock /
+ * size extension): extending a file must expose zeroes in the region
+ * past the old EOF, in memory and after a remount, and fallocate()
+ * past the old EOF must do the same for the gap. The stale bytes are
+ * planted the honest way: a full page of 0xAB is written and synced,
+ * so the on-disk cluster holds 0xAB past offset 100, and the file is
+ * then shrunk to 100 (which clamps initialized_size to 100).
+ *
+ * Honest note on what this test can and cannot prove in this port:
+ * the old code passed it too -- it zeroed the straddle through
+ * ntfs_vfs_zero_range(), which marks the folio dirty. What changed
+ * is the mechanism: truncate_pagecache() + pagecache_isize_extended()
+ * (zero + dirty in the cache, no device round trip) instead of the
+ * zero_range epilogue, plus invalidate_lock around both resizes.
+ * The invalidate_lock half has no discriminating test here: the port
+ * has no mmap fault path and no shared taker of invalidate_lock, so
+ * the lock is unobservable (same situation as the 4dc8f4ee2d46 /
+ * 8c5dc7587fdd ports). The zeroing half is pinned where it can be
+ * told apart -- the pagecache unit test test_isize_extended() fails
+ * if the zero or the dirty mark is dropped -- and this test pins the
+ * end-to-end behaviour of the new path, in memory and after a
+ * remount. No fsck_clean on the fallocate file: it is only read back.
+ */
+static void test_size_extension_zeroes(void)
+{
+	static unsigned char page[4096];
+	static unsigned char back[13096];
+	struct vol v;
+	ntfs_inode_t *f = NULL, *g = NULL;
+	size_t i;
+	int bad;
+
+	printf("test_size_extension_zeroes\n");
+	memset(page, 0xAB, sizeof(page));
+	if (copy_fixture("size-extend") != 0) {
+		fprintf(stderr, "SKIP test_size_extension_zeroes: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_size_extension_zeroes: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+
+	/* --- setattr extension -------------------------------------- */
+	CHECK(ntfs_create(v.root, "ext.bin", 0100644, &f) == 0);
+	if (!f) goto out;
+	CHECK(ntfs_write(f, page, sizeof(page), 0) == (ssize_t)sizeof(page));
+	CHECK(ntfs_fsync(f, false) == 0);
+	CHECK(ntfs_truncate(f, 100) == 0);
+	CHECK(ntfs_truncate(f, 5000) == 0);
+	CHECK(ntfs_read(f, back, 5000, 0) == 5000);
+	bad = 0;
+	for (i = 0; i < 100; i++)
+		if (back[i] != 0xAB) bad++;
+	for (i = 100; i < 5000; i++)
+		if (back[i] != 0) bad++;
+	CHECK_MSG(!bad, "setattr extension: %d bytes wrong in [0,5000)", bad);
+	CHECK(ntfs_fsync(f, false) == 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	vol_down(&v);
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_size_extension_zeroes: remount failed\n");
+		failures++;
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_lookup(v.root, "ext.bin", &f) == 0);
+	if (!f) goto out;
+	CHECK(ntfs_read(f, back, 5000, 0) == 5000);
+	bad = 0;
+	for (i = 0; i < 100; i++)
+		if (back[i] != 0xAB) bad++;
+	for (i = 100; i < 5000; i++)
+		if (back[i] != 0) bad++;
+	CHECK_MSG(!bad, "setattr extension after remount: %d bytes wrong in [0,5000)", bad);
+
+	/* --- fallocate gap ------------------------------------------ */
+	CHECK(ntfs_create(v.root, "fal.bin", 0100644, &g) == 0);
+	if (!g) goto out;
+	CHECK(ntfs_write(g, page, sizeof(page), 0) == (ssize_t)sizeof(page));
+	CHECK(ntfs_fsync(g, false) == 0);
+	CHECK(ntfs_truncate(g, 100) == 0);
+	CHECK(ntfs_fallocate(g, 9000, 4096, false) == 0);
+	CHECK(ntfs_read(g, back, 13096, 0) == 13096);
+	bad = 0;
+	for (i = 0; i < 100; i++)
+		if (back[i] != 0xAB) bad++;
+	for (i = 100; i < 13096; i++)
+		if (back[i] != 0) bad++;
+	CHECK_MSG(!bad, "fallocate gap: %d bytes wrong in [0,13096)", bad);
+
+out:
+	if (g) ntfs_inode_put(g);
+	if (f) ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 56cc42a7b387 ("ntfs: return errors from ntfs_attr_readall"):
  * ntfs_attr_readall() returned NULL on every failure -- attribute
  * lookup, allocation and read -- so every caller lost the errno and
@@ -4275,6 +4376,7 @@ int main(void)
 	test_ea_first_set_same_mount_get();
 	test_getxattr_erange();
 	test_folio_fullpage_write();
+	test_size_extension_zeroes();
 	test_readall_error_propagates();
 	test_hasea_untouched_on_set_failure();
 	test_ctime_untouched_on_setxattr_failure();

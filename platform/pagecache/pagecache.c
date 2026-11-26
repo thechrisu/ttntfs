@@ -946,6 +946,51 @@ void truncate_pagecache(struct inode *inode, loff_t newsize)
 	truncate_inode_pages(inode->i_mapping, newsize);
 }
 
+/*
+ * pagecache_isize_extended - update the page cache after i_size extension
+ * @inode:	inode whose size was extended from @from to @to
+ * @from:	old size
+ * @to:		new size
+ *
+ * PORT of the kernel's pagecache_isize_extended() (upstream 5c32f0b8d791
+ * switches ntfs_setattr_size() and ntfs_fallocate() to it). The kernel
+ * version marks the folio straddling @from read-only so page_mkwrite()
+ * fires on the first mmap write after the size change. The port has no
+ * page_mkwrite handler and no mmap fault path at all (see the
+ * not-applicable row for 0fecc393f206 in docs/UPSTREAM-TRIAGE-7.3.md),
+ * so that half is a no-op here. The half that matters is the post-EOF
+ * zeroing added by 52aecaee1c26 ("mm: zero range of eof folio exposed
+ * by inode size extension"): a folio straddling the old EOF must have
+ * [@from, @to) zeroed before the new i_size becomes visible, or a
+ * reader sees stale disk bytes and writeback persists them.
+ * truncate_pagecache() already zeroed the cached tail, but it does not
+ * mark the folio dirty, so the zeroed tail would never reach the disk;
+ * do the zero + dirty here. If the folio is not cached there is nothing
+ * to do: read_mapping_folio zeroes past initialized_size on fill.
+ */
+void pagecache_isize_extended(struct inode *inode, loff_t from, loff_t to)
+{
+	struct address_space *mapping = inode->i_mapping;
+	struct folio *folio;
+	loff_t pos;
+	size_t start, end;
+
+	if (from >= to)
+		return;
+	if (!idx_of(mapping))
+		return;
+	folio = __filemap_get_folio(mapping, byte_to_index(from), FGP_LOCK, 0);
+	if (IS_ERR(folio))
+		return;
+	pos = folio_pos(folio);
+	start = (size_t)(from - pos);
+	end = (size_t)min_t(loff_t, to - pos, (loff_t)PAGE_SIZE);
+	folio_zero_segment(folio, start, end);
+	folio_mark_dirty(folio);
+	folio_unlock(folio);
+	folio_put(folio);
+}
+
 void truncate_setsize(struct inode *inode, loff_t newsize)
 {
 	i_size_write(inode, newsize);
