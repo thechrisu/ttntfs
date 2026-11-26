@@ -445,6 +445,52 @@ static void test_boot_sector_spc_refused_early(void)
 	unlink(scratch);
 }
 
+/*
+ * Upstream c8504fc1245f: $AttrDef must hold at least one attr_def
+ * entry (160 bytes). The old mount check only required the size to
+ * be > 0, so a 120-byte table mounted, and creating a file then read
+ * ad->type (offset 128 in the entry) past the kvzalloc'd buffer in
+ * ntfs_attr_find_in_attrdef() (KASAN slab-out-of-bounds). The mount
+ * must refuse such a volume. The patcher shrinks record 4's $DATA to
+ * 120 bytes; the control (unpatched) mounts fine. No fsck_clean: the
+ * image is deliberately corrupt.
+ */
+static void test_attrdef_too_small_refused(void)
+{
+	const char *py = getenv("NTFS_PATCH_ATTRDEF_SIZE");
+	char cmd[2048];
+	int err;
+
+	printf("test_attrdef_too_small_refused\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_attrdef_too_small_refused: NTFS_PATCH_ATTRDEF_SIZE not set\n");
+		return;
+	}
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_attrdef_too_small_refused: no fixture\n");
+		return;
+	}
+	/* Control: the clean fixture mounts. */
+	err = mount_ro(scratch);
+	CHECK(err == 0);
+	if (err) {
+		fprintf(stderr, "FAIL attrdef control: clean fixture refused (%d)\n", err);
+		unlink(scratch);
+		return;
+	}
+	snprintf(cmd, sizeof(cmd), "python3 %s %s 120 >/dev/null 2>&1", py, scratch);
+	if (system(cmd) != 0) {
+		fprintf(stderr, "SKIP test_attrdef_too_small_refused: patcher failed\n");
+		unlink(scratch);
+		return;
+	}
+	err = mount_ro(scratch);
+	CHECK(err != 0);
+	if (!err)
+		fprintf(stderr, "FAIL attrdef 120 bytes: undersized $AttrDef mounted\n");
+	unlink(scratch);
+}
+
 /* ---- 1. the clean rule, and the two implementations agreeing ---------- */
 
 /*
@@ -865,6 +911,7 @@ int main(void)
 	test_one_flush_per_sync();
 	test_boot_sector_geometry_refusals();
 	test_boot_sector_spc_refused_early();
+	test_attrdef_too_small_refused();
 	test_quota_removal_remount_rw();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

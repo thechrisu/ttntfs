@@ -154,7 +154,7 @@ if(NTFS_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   add_test(NAME mount COMMAND test_mount)
   set_tests_properties(mount PROPERTIES
-    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images")
+    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_PATCH_ATTRDEF_SIZE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_attrdef_size.py")
 
   # Volume geometry: 4Kn sectors, cluster sizes on either side of the sector
   # size, and a 16 TiB sparse volume whose metadata sits past the 32-bit byte

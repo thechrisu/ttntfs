@@ -1265,9 +1265,13 @@ static bool load_and_init_attrdef(struct ntfs_volume *vol)
 		goto failed;
 	}
 	NInoSetSparseDisabled(NTFS_I(ino));
-	/* The size of FILE_AttrDef must be above 0 and fit inside 31 bits. */
+	/* PORT: upstream c8504fc1245f: FILE_AttrDef must hold at least
+	 * one entry and fit inside 31 bits. The old check (size > 0)
+	 * let a table smaller than one attr_def (160 bytes) through,
+	 * and ntfs_attr_find_in_attrdef() then read ad->type past the
+	 * kvzalloc'd buffer when a file was created. */
 	i_size = i_size_read(ino);
-	if (i_size <= 0 || i_size > 0x7fffffff)
+	if (i_size < (s64)sizeof(struct attr_def) || i_size > 0x7fffffff)
 		goto iput_failed;
 	vol->attrdef = kvzalloc(i_size, GFP_NOFS);
 	if (!vol->attrdef)

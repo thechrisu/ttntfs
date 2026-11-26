@@ -1627,8 +1627,13 @@ static struct attr_def *ntfs_attr_find_in_attrdef(const struct ntfs_volume *vol,
 	struct attr_def *ad;
 
 	WARN_ON(!type);
-	for (ad = vol->attrdef; (u8 *)ad - (u8 *)vol->attrdef <
-			vol->attrdef_size && ad->type; ++ad) {
+	/* PORT: upstream c8504fc1245f: the old guard bounded only the
+	 * start of each entry, so a table whose size is not a multiple
+	 * of sizeof(*ad) let the loop read ad->type (offset 128) and
+	 * the body fields of a trailing partial entry past the
+	 * allocation. Require the whole entry to lie within the table. */
+	for (ad = vol->attrdef; (u8 *)ad - (u8 *)vol->attrdef <=
+			vol->attrdef_size - (s32)sizeof(*ad) && ad->type; ++ad) {
 		/* We have not found it yet, carry on searching. */
 		if (likely(le32_to_cpu(ad->type) < le32_to_cpu(type)))
 			continue;

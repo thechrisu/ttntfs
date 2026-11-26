@@ -654,6 +654,25 @@ Porting progress (one commit per item, in the order above):
   Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
   0 failed with NTFS_REQUIRE_FSCK=1.
   43 port items remain.
+- 2026-11-26: `c8504fc1245f` (bound $AttrDef table walk to the loaded
+  table size) — ported: `ntfs_attr_find_in_attrdef()` in
+  `core/ntfs/attrib.c` bounded only the start of each 160-byte entry,
+  so a table whose size is not a multiple of 160 let the loop read
+  ad->type (offset 128) and the body fields of a trailing partial
+  entry past the kvzalloc'd buffer; the loop guard now requires the
+  whole entry to lie within attrdef_size (<= attrdef_size -
+  sizeof(*ad)). `load_and_init_attrdef()` in `core/ntfs/super.c` also
+  accepted any i_size > 0; it now rejects i_size < sizeof(struct
+  attr_def) at mount. New test `test_attrdef_too_small_refused` in
+  `core/tests/test_mount.c` plus fixture patcher
+  `tools/mkfixtures/patch_attrdef_size.py` (shrinks record 4's $DATA
+  data_size/initialized_size to 120 bytes; control mounts fine).
+  Evidence: test_mount 143 checks 0 failures with the fix; without
+  it exactly 1 failure, the 120-byte $AttrDef mounts. No fsck_clean
+  for this test: the image is deliberately corrupt. Plain ctest 15/15,
+  UBSan ctest 15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1.
+  42 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
