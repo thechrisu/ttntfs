@@ -2759,6 +2759,140 @@ static void test_ea_final_size_validated(void)
 }
 
 /*
+ * Upstream 56cc42a7b387 ("ntfs: return errors from ntfs_attr_readall"):
+ * ntfs_attr_readall() returned NULL on every failure -- attribute
+ * lookup, allocation and read -- so every caller lost the errno and
+ * substituted its own: ntfs_get_ea() reported -ENODATA for a failed
+ * $EA read, ntfs_listxattr() reported an empty list, and the reparse
+ * parser treated an allocation/I/O error as "no reparse data". The
+ * fix returns ERR_PTR() with the original error, and every caller
+ * propagates it (ntfs_get_ea / ntfs_set_ea / ntfs_listxattr in ea.c,
+ * ntfs_ibm_get_free in index.c, the two reparse.c sites; the
+ * port-only readlink fallback in core/vfs/api.c normalises the
+ * ERR_PTR to NULL because its out: path kvfrees the pointer).
+ *
+ * The failure is produced by hand, the way a crafted image would:
+ * a file with one 8 KiB EA has a non-resident $EA stream (an 8.2 KiB
+ * stream cannot fit in the MFT record), and
+ * tools/mkfixtures/patch_oob_ea.py rewrites its first run to start
+ * past the end of the volume, so the pread inside readall fails
+ * with -EIO (the runlist decoder refuses the out-of-volume LCN).
+ * Without the fix the get returns -ENODATA; with it, -EIO. The set
+ * path propagates too: replacing the EA must fail with the read
+ * error instead of silently dropping the stream. No fsck_clean:
+ * the image is deliberately corrupt by design.
+ */
+static void test_readall_error_propagates(void)
+{
+	static char val8k[8192];
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	uint64_t mft_no;
+	char cmd[2048], out[256];
+	const char *py = getenv("NTFS_PATCH_OOB_EA");
+	char buf[8192];
+	int err;
+	FILE *p;
+	int rc;
+
+	printf("test_readall_error_propagates\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: NTFS_PATCH_OOB_EA not set\n");
+		return;
+	}
+	memset(val8k, 'A', sizeof(val8k));
+	if (copy_fixture("readall-ea") != 0) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "ea3.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	mft_no = ntfs_inode_number(f);
+	if (ea_set(f, "user.big", val8k, sizeof(val8k)) != 0) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: setup set failed\n");
+		ntfs_inode_put(f);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* The EA reads back before patching, so a failure after the
+	 * patch is the patch's doing, not the setup's. */
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	if (err != 8192) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: setup get returned %d\n", err);
+		ntfs_inode_put(f);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_volume_sync(v.vol) == 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	vol_down(&v);
+
+	/* Rewrite the $EA run out of the volume, on disk. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu",
+		 py, scratch, (unsigned long long)mft_no);
+	p = popen(cmd, "r");
+	if (!p || !fgets(out, sizeof(out), p)) {
+		fprintf(stderr, "FAIL patch_oob_ea.py produced no output\n");
+		failures++; checks++;
+		if (p) pclose(p);
+		unlink(scratch);
+		return;
+	}
+	rc = pclose(p);
+	CHECK(rc == 0);
+	{
+		long nr_clusters, cs, old_lcn, old_len, new_lcn, new_len;
+		CHECK(sscanf(out, "%ld %ld %ld %ld %ld %ld", &nr_clusters, &cs,
+			     &old_lcn, &old_len, &new_lcn, &new_len) == 6);
+		CHECK(new_lcn >= nr_clusters);
+		CHECK(new_len == old_len);
+	}
+
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "ea3.bin", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_readall_error_propagates: lookup failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* New: the $EA read fails with -EIO and the real error reaches
+	 * the caller. Old: readall returned NULL and the get reported
+	 * -ENODATA, as if the EA did not exist -- the get is the
+	 * discriminator. The set assertion guards the new behaviour
+	 * (it returns -EIO in the old build too, via the create path
+	 * failing, so it does not discriminate on its own). */
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	CHECK(err == -EIO);
+	if (err != -EIO)
+		fprintf(stderr, "FAIL ea get on corrupt $EA: returned %d, expected -EIO (-5)\n", err);
+	/* The set path propagates too: replacing the EA must fail with
+	 * the read error instead of silently dropping the stream. */
+	err = ea_set(f, "user.big", val8k, sizeof(val8k));
+	CHECK(err == -EIO);
+	if (err != -EIO)
+		fprintf(stderr, "FAIL ea set on corrupt $EA: returned %d, expected -EIO (-5)\n", err);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 5b6eedd7cc29: ntfs_icx_ib_sync_write() called
  * post_write_mst_fixup() when ntfs_ib_write() returned an error,
  * intending to restore the buffer after a failed write. But
@@ -2888,6 +3022,7 @@ int main(void)
 	test_lookup_err_mref_normalized();
 	test_nonres_attr_validation();
 	test_ea_final_size_validated();
+	test_readall_error_propagates();
 	test_ib_sync_write_no_post_fixup();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

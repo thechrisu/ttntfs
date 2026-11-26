@@ -751,6 +751,27 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1.
   40 port items remain.
 
+- 2026-11-26: `56cc42a7b387` (return errors from ntfs_attr_readall) —
+  ported: readall returned NULL on every failure, so callers lost
+  the errno — ntfs_get_ea() reported -ENODATA for a failed $EA read,
+  ntfs_listxattr() an empty list, and the reparse parser treated an
+  allocation/I/O error as "no reparse data". All four failure paths
+  now return ERR_PTR() (iget, invalid size, kvmalloc, pread) and all
+  callers propagate: ntfs_get_ea / ntfs_set_ea / ntfs_listxattr in
+  ea.c, ntfs_ibm_get_free in index.c (its -1 becomes the real errno;
+  both callers already test < 0), the two reparse.c sites (IS_ERR
+  normalised to NULL before the kvfree), plus the port-only readlink
+  fallback in core/vfs/api.c (same normalisation, required because
+  its out: path kvfrees the pointer). New test
+  `test_readall_error_propagates` in `core/tests/test_links.c` plus
+  fixture patcher `tools/mkfixtures/patch_oob_ea.py` (rewrites a
+  non-resident $EA run out of the volume). Evidence: test_links 697
+  checks 0 failures with the fix; without it exactly 1 failure, the
+  get returning -ENODATA (-61) instead of -EIO. Plain ctest 15/15,
+  UBSan ctest 15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1.
+  39 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

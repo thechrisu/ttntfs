@@ -481,6 +481,8 @@ int ntfs_readlink(ntfs_inode_t *h, char *buf, size_t bufsize, size_t *len_out)
 
 	mutex_lock(&ni->mrec_lock);
 	rp = ntfs_attr_readall(ni, AT_REPARSE_POINT, NULL, 0, &rp_size);
+	if (IS_ERR(rp))
+		rp = NULL;
 	mutex_unlock(&ni->mrec_lock);
 	if (rp && rp_size >= (s64)sizeof(*rp) &&
 	    rp->reparse_tag == IO_REPARSE_TAG_SYMLINK) {
