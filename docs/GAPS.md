@@ -25,6 +25,27 @@ and in-app fsck for any FSKit path) as active work after the port
 queue. §4.1 and §5.1 stay blocked on Apple/signing; the paid signing
 route was declined and is not re-proposed.
 
+North star, set 2026-11-26 by the owner: data safety is the
+overriding first priority, above speed and above everything else —
+the worst possible outcome is the driver wiping, corrupting or
+breaking user data. The target is a bulletproof, state-of-the-art
+driver, best in class for correctness, aiming to be better than any
+filesystem driver of any filesystem out there. In short: **a fast
+driver that can lose data is a failure; a correct driver that is
+slightly slower is not.** What that changes: §1.2 journal writing
+moves to the top of the post-port-queue work, ahead of features and
+performance; §1.3 gates §1.2 Phase 0 and any later performance work
+that touches the write path; crash-consistency is a standing bar,
+not a one-off test (power-loss / torn-write simulation on every
+write-path change, fault injection at every flush point, and a torn
+volume must always be detected, never silently papered over — the
+4188d3b1 lesson); fuzzing (§5.2) gets more coverage, not less; every
+write-path change is verified against Windows chkdsk where a round
+trip is possible and by ntfsck + remount read-back locally where it
+is not; and no performance optimisation may trade away a safety
+margin — a perf change touching the write path needs the same
+crash-consistency evidence as a correctness fix.
+
 ## 1. Data safety — fix first, these can eat data
 
 ### 1.1 Compressed-file creation corrupts files — done (2026-11-25)
@@ -77,9 +98,14 @@ Phase 0 gates (§1.3 replay-atomicity proof, §1.5 real v2.0 image),
 Phase 1 LFS writer infrastructure (2–4 weeks), Phase 2 one operation
 class end-to-end (file creation, 2–3 weeks), Phase 3 class by class
 (~8 classes, 2–4 months), Phase 4 wrap/checkpoint/performance,
-Phase 5 Windows round-trip per class. Next round starts at Phase 0/1.
+Phase 5 Windows round-trip per class. Top of the post-port-queue
+work since 2026-11-26 (owner's data-safety-first direction): the
+port queue finishes first, then §1.2 starts at Phase 0/1, ahead of
+§2.2/§4.4 and ahead of all performance work.
 
 ### 1.3 Replay atomicity unproven — open
+Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
+gate for any later performance work that touches the write path.
 Nothing demonstrated a partial write during replay, nothing rules one
 out (`docs/UPSTREAM-BUGS.md` finding 17b). Flush writes records one at
 a time; the overlay protects planning only. This is why replay stays
@@ -224,7 +250,10 @@ measure every metadata op against Apple's exFAT and Paragon's
 published figures where reachable, then squeeze what FSKit allows
 (warm inode cache, batching, fewer round trips per op) and record
 the measured numbers per release. Every perf claim needs measured
-numbers in the commit message, not assertions.
+numbers in the commit message, not assertions. Safety constraint
+(2026-11-26): no performance optimisation may trade away a safety
+margin — a perf change touching the write path needs the same
+crash-consistency evidence as a correctness fix (§1.3 gates it).
 
 ### 3.2 Random 4 KiB writes miss the bar — open, to the physical limit
 Phase 5 bar is "within 2× of Apple's exFAT"; random 4 KiB writes still
@@ -232,7 +261,10 @@ miss it. Attributed to the macOS buffer cache rather than the driver —
 prove that attribution with a benchmark before changing code, then
 close the gap as far as the hardware allows (write coalescing,
 alignment, fewer syncs per write). Same rule as §3.1: measured
-numbers in the commit message, not assertions.
+numbers in the commit message, not assertions — and the same safety
+constraint: random-write work touches the write path, so §1.3 gates
+it and every change needs torn-write / power-loss evidence, not
+just a faster number.
 
 ## 4. macOS integration
 
@@ -327,6 +359,12 @@ ubuntu-latest, own concurrency group `fuzz-${{ github.ref }}` so it can
 never cancel a push run, gated on the same 20% budget guard as CI).
 `tools/pre-push.sh` runs `tools/fuzz.sh check` (seeds mount, regression
 images fail cleanly); the ASan+LSan leak regression is CI's job.
+
+Expanded coverage since 2026-11-26 (owner's data-safety-first
+direction): dirty-$LogFile seeds, a read-only-mount fuzz variant,
+longer runs, and any new write path gets a fuzz target before it
+lands. Fuzzing is a standing bar alongside crash-consistency, not
+a one-off harness.
 
 First findings, all fixed in the same commit with deterministic
 regression images (`tools/fuzz/mkregression.py`, generated, never
@@ -1457,6 +1495,28 @@ Porting progress (one commit per item, in the order above):
   passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
   (430 s).
   10 port items remain.
+
+- 2026-11-26: `cf06dcd57284` (fix kmap_local leak in
+  write_mft_record_nolock() error paths) — ported. Upstream's two
+  changes verbatim in `write_mft_record_nolock()`
+  (core/ntfs/mft.c): the `pre_write_mst_fixup` failure now goes to
+  the new `unmap_err_out` label instead of `err_out`, and
+  `unmap_err_out` runs `kunmap_local(kaddr)` before `err_out`,
+  covering both that path and the `put_bio_out` path
+  (`bio_add_folio` failure). No new test, honestly: in this port
+  `kunmap_local` is a no-op shim
+  (platform/include/linux/highmem.h:14) and `kmap_local_folio`
+  just returns a pointer into folio data, so the leak has no
+  observable effect here; the fix is upstream fidelity in case
+  the shim ever becomes real. Same "no new test, port note
+  explains why" precedent as 71feaa7686fb.
+  Evidence (this commit): plain ctest 15/15 (114 s), UBSan ctest
+  15/15 (113 s), ASan ctest 15/15 (151 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (403 s; first pre-push run failed stage 5 transiently under load
+  — an isolated `ci.sh --quick` re-run passed all three Linux
+  stages, and the full re-run went 9/9).
+  9 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
