@@ -1068,6 +1068,27 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   27 port items remain.
 
+- 2026-11-26: `607a9478833d` (treat any nonzero dio zero-range
+  return as an error) — ported: the check in
+  ntfs_attr_fallocate() (core/ntfs/attrib.c) is now `if (err)`
+  instead of `if (err > 0)`. New test
+  test_fallocate_zero_failure (core/tests/test_faults.c): seed a
+  1MB file, punch a cluster-aligned hole in the middle, arm a
+  write fault on the whole device, fallocate over the hole -- the
+  only device write during the call is the zeroing write, so it
+  fails with -EIO. Evidence: faults suite 150 checks, 0
+  failures with the fix (fallocate returns -EIO, 1 write
+  refused); without it exactly 1 failure (fallocate returns 0,
+  the failed zero silently ignored) -- negative control
+  reverted the check by exact string. Also in this commit: the
+  faults harness used `dd bs=1m`, which GNU dd rejects, so the
+  whole faults suite was skipping here (0 checks); `bs=1M`
+  works on GNU and BSD dd and the suite now runs for real
+  locally. Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  26 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

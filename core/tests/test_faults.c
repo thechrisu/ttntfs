@@ -53,6 +53,16 @@
 
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
+#include <linux/types.h>
+#include <linux/fs.h>
+#include <linux/falloc.h>
+
+/* ntfs_vfs_fallocate() for the dio zero-range test: the public
+ * ntfs_fallocate() has no mode argument, so the punch-hole step
+ * needs the VFS entry point directly. The handle IS the VFS
+ * inode, as in test_links.c. */
+struct inode;
+int ntfs_vfs_fallocate(struct inode *vi, int mode, loff_t offset, loff_t len);
 
 /* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
  * some machines and the 16 TiB geometry image needs ~600 MiB while
@@ -100,8 +110,11 @@ static int make_image(const char *tag, unsigned mb)
 	char cmd[2048];
 
 	snprintf(img, sizeof(img), "%s/ttntfs-faults-%d-%s.img", scratch_dir(), (int)getpid(), tag);
+	/* PORT: bs=1M, not 1m: GNU dd (this VM, coreutils 9.4)
+	 * rejects the lowercase suffix, so every fault test was
+	 * skipping here (0 checks); BSD dd accepts both. */
 	snprintf(cmd, sizeof(cmd),
-		 "dd if=/dev/zero of='%s' bs=1m count=%u >/dev/null 2>&1 && "
+		 "dd if=/dev/zero of='%s' bs=1M count=%u >/dev/null 2>&1 && "
 		 "'%s' -Q -F -L FAULT '%s' >/dev/null 2>&1",
 		 img, mb, tool("NTFS_MKNTFS", "tools/.local/sbin/mkntfs"), img);
 	if (system(cmd) != 0) {
@@ -1000,6 +1013,85 @@ out:
 }
 
 /*
+ * Upstream 607a9478833d: ntfs_dio_zero_range() returns 0 or a
+ * negative errno, never a positive value, so the "err > 0" check
+ * in ntfs_attr_fallocate() never fired and a failed zero was
+ * silently ignored -- the allocation kept going and could
+ * succeed leaving stale on-disk data in the new clusters.
+ *
+ * Seed a 1MB file, punch a cluster-aligned hole in the middle
+ * (initialized_size stays 1MB, so the hole is inside it), arm a
+ * write fault on the whole device, and fallocate over the hole.
+ * The only device write during that call is the zeroing write
+ * (allocation and mapping-pairs updates are in-memory until
+ * sync), so it fails with -EIO. Old: fallocate returns 0. New:
+ * -EIO.
+ */
+static void test_fallocate_zero_failure(void)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *f;
+	char rbuf[4096];
+	ssize_t rn;
+	int err;
+
+	if (make_image("diozero", 32) != 0)
+		return;
+	if (seed_file("dio.bin", 1 << 20, 0xA5, NULL, 0) != 0) {
+		fprintf(stderr, "SKIP test_fallocate_zero_failure: seed failed\n");
+		drop_image();
+		return;
+	}
+	fault_clear();
+	err = mount_rw(&dev, &vol);
+	CHECK(err == 0);
+	if (err) { drop_image(); return; }
+	CHECK(ntfs_volume_root(vol, &root) == 0);
+	err = ntfs_lookup(root, "dio.bin", &f);
+	CHECK(err == 0);
+	if (err) goto out;
+
+	/* Punch a cluster-aligned hole in the middle. The punch
+	 * itself runs with the fault disarmed. */
+	err = ntfs_vfs_fallocate((struct inode *)f,
+				 FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+				 256 << 10, 256 << 10);
+	CHECK(err == 0);
+	if (err) goto out_file;
+	/* Sanity: the hole reads back zeros before the fault. */
+	rn = ntfs_read(f, rbuf, sizeof(rbuf), 256 << 10);
+	CHECK(rn == (ssize_t)sizeof(rbuf));
+	if (rn == (ssize_t)sizeof(rbuf)) {
+		int i, nonzero = 0;
+		for (i = 0; i < (int)sizeof(rbuf); i++)
+			nonzero |= rbuf[i];
+		CHECK(nonzero == 0);
+	}
+
+	/* Refuse every device write, then allocate over the hole. */
+	fi.mode = FAULT_WRITE;		/* the whole device, every write */
+	err = ntfs_fallocate(f, 256 << 10, 256 << 10, true);
+	CHECK_MSG(fi.fired > 0, "no write reached the device at all, case is vacuous");
+	printf("  fallocate_zero_failure: ntfs_fallocate -> %d (%d device writes refused)\n",
+	       err, fi.fired);
+	CHECK_MSG(err == -EIO,
+		  "fallocate over a hole returned %d with every zeroing write refused, expected -EIO (-5): the failed zero was silently ignored",
+		  err);
+
+out_file:
+	ntfs_inode_put(f);
+out:
+	ntfs_inode_put(root);
+	fault_clear();		/* let the unmount land, so ntfsck judges the fault, not the teardown */
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	check_image("fallocate_zero_failure");
+	drop_image();
+	printf("test_fallocate_zero_failure\n");
+}
+
+/*
  * The same fault aimed at metadata writeback rather than file data: create
  * several directory entries, then fail every device write and sync. If
  * ntfs_volume_sync() returns 0 here, an unmount reports success while the MFT
@@ -1282,6 +1374,7 @@ int main(void)
 	test_read_fail_midtransfer();
 	test_transient_read();
 	test_write_fail_data();
+	test_fallocate_zero_failure();
 	test_write_fail_sync();
 	test_write_fail_midtransfer();
 	test_flush_fail();
