@@ -703,8 +703,14 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 			w->off = end > log->page_size ? log->page_size : end;
 			break;
 		}
-		/* The record continues: this page is full, no record ends here. */
-		lf_put32(w->page_buf + PG_FLAGS, 0);
+		/* The record continues: this page is full, so the next record
+		 * starts on the following page — but an earlier record may
+		 * already have ended on this page, and its end marker must
+		 * survive: the reader checks PG_FLAGS/LAST_END_LSN when it
+		 * finishes reading that (multi-page) record. Only clear the
+		 * flag when no record has ended here yet. */
+		if (!(lf_get32(w->page_buf + PG_FLAGS) & LFS_PAGE_LOG_RECORD_END))
+			lf_put32(w->page_buf + PG_FLAGS, 0);
 		lf_put16(w->page_buf + PG_NEXT_RECORD_OFFSET, (uint16_t)log->page_size);
 		err = lw_flush_page(w, page);
 		if (err)

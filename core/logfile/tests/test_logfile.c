@@ -2449,6 +2449,134 @@ static void test_writer_checkpoint_reserve(void)
 	free(buf);
 }
 
+
+/* wseen holds 16 records; the wrap walk yields ~57, so it needs its own. */
+struct wseen64 {
+	uint64_t lsn[64];
+	uint32_t type[64];
+	uint8_t *data[64];
+	uint32_t len[64];
+	int n;
+};
+
+static int wcollect64(const struct ntfs_log_record *r, void *ctx)
+{
+	struct wseen64 *s = ctx;
+
+	if (s->n < 64) {
+		int i = s->n;
+
+		s->lsn[i] = r->lsn;
+		s->type[i] = r->record_type;
+		s->len[i] = r->data_len;
+		s->data[i] = malloc(r->data_len ? r->data_len : 1);
+		if (s->data[i] && r->data_len)
+			memcpy(s->data[i], r->raw, r->data_len);
+	}
+	s->n++;
+	return 0;
+}
+
+static void wseen64_free(struct wseen64 *s)
+{
+	int i;
+
+	for (i = 0; i < s->n && i < 64; i++)
+		free(s->data[i]);
+}
+
+/*
+ * Wrap read-back: fill, checkpoint, then fill again so the appends
+ * wrap around the end of the file onto the first pages. After reopen
+ * the walk from the checkpoint must yield the restart record and
+ * every fill record in order, byte-exact — including the ones that
+ * wrapped (their LSNs sit on lower pages than the checkpoint's).
+ * The pre-checkpoint records are outside [oldest, last].
+ */
+static void test_writer_wrap_readback(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p[4000], c[4200];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct wseen64 s;
+	uint32_t n;
+	uint64_t lsn, rlsn, fill_lsn[64], first_lsn = 0;
+	int i, filled1 = 0, filled2 = 0, wrapped = 0;
+	uint32_t rlsn_vbo;
+
+	printf("test_writer_wrap_readback\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 4000; i++)
+		p[i] = (uint8_t)(0xA5 ^ (i & 0xff));
+	n = build_noop(c, p, sizeof(p));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	/* Fill to the reserve, so the checkpoint lands near the end. */
+	while (ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn) == 0) {
+		if (!first_lsn)
+			first_lsn = lsn;
+		filled1++;
+	}
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn), -ENOSPC);
+	CHECK(filled1 > 10);
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn), 0);
+	/* Fill again: the early pages are free now, so these appends
+	 * wrap around the end of the file onto the first pages. */
+	while (ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn) == 0) {
+		if (filled2 < 64)
+			fill_lsn[filled2] = lsn;
+		filled2++;
+	}
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, &lsn), -ENOSPC);
+	CHECK(filled2 > 10);
+	/* At least one second-fill record wrapped: its page sits below
+	 * the checkpoint's page, which forward-only appends cannot reach. */
+	rlsn_vbo = (uint32_t)((rlsn & 0xffffu) << 3);
+	for (i = 0; i < filled2 && i < 64; i++) {
+		uint32_t vbo = (uint32_t)((fill_lsn[i] & 0xffffu) << 3);
+
+		if (vbo < rlsn_vbo)
+			wrapped++;
+	}
+	CHECK(wrapped > 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.client_restart_lsn, rlsn);
+	CHECK_EQ(info.current_lsn, fill_lsn[filled2 - 1]);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, 0, wcollect64, &s), 0);
+	CHECK_EQ(s.n, 1 + filled2);
+	if (s.n == 1 + filled2) {
+		CHECK_EQ(s.lsn[0], rlsn);
+		CHECK_EQ(s.type[0], LFS_RECORD_TYPE_CLIENT_RESTART);
+		for (i = 0; i < filled2; i++) {
+			CHECK_EQ(s.lsn[1 + i], fill_lsn[i]);
+			CHECK_EQ(s.type[1 + i], LFS_RECORD_TYPE_CLIENT);
+			CHECK(memcmp(s.data[1 + i], c, n) == 0);
+		}
+	}
+	wseen64_free(&s);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, wcollect64, &s), -EINVAL);
+	wseen64_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
 static void test_writer_torn_tail(void)
 {
 	uint8_t *buf = malloc(LSIZE);
@@ -2533,6 +2661,7 @@ int main(void)
 	test_writer_checkpoint_basic();
 	test_writer_checkpoint_reopen();
 	test_writer_checkpoint_reserve();
+	test_writer_wrap_readback();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

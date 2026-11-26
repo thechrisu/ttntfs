@@ -181,13 +181,32 @@ dropping the table adoption fails the reopen test (attribute lost).
 Bug fixed en route: `lw_pages_free()` returned 0 when the cursor
 sat on the oldest page — every other page is free then, and the old
 code refused the next append on a nearly empty log.
-Still to do in Phase 1: verify a wrapped log reads back (the free-
-range check already permits wraps after a checkpoint; the second
-fill in `test_writer_checkpoint_reserve` wraps, but nothing walks
-the wrapped log yet), and the writer-owned clean close. No
-integration with the mutation paths yet — the driver still retires
-the journal on mount and writes metadata unjournaled, so the crash
-story is unchanged until Phase 2.
+Phase 1, step 3 landed 2026-11-26 (commit, this round): wrap
+read-back — `test_writer_wrap_readback` fills the log, checkpoints
+near the end, fills again so the appends wrap onto the first pages
+(sequence 2), reopens, and walks from the checkpoint: the restart
+record and all 56 second-fill records come back in order,
+byte-exact, and a walk from a pre-checkpoint LSN fails `-EINVAL`.
+Bug found by this test, fixed here: the append layout loop's
+"record continues" branch unconditionally cleared `PG_FLAGS` when
+a record spilled to the next page, destroying the end marker of
+an earlier record that ended on the same page — the reader checks
+`PG_FLAGS`/`LAST_END_LSN` when it finishes a multi-page record,
+so that record became unreadable. The branch now preserves the
+END flag when a record has already ended on the page. The
+roundtrip test never caught it: the only record ending on a page
+shared with a continuing record there was single-page, and
+single-page reads never consult the flag. Crash contract for a
+wrap: only dispensable records are overwritten, and the
+tail-copy-before-rewrite protocol still applies, so a crash
+mid-wrap leaves the old page or its tail copy; a stale tail copy
+cannot supersede the new page (older sequence, earlier end LSN).
+Negative control: reverting the `PG_FLAGS` fix fails the new test
+(walk `-EINVAL`, 1 record instead of 57). Still to do in Phase 1:
+the writer-owned clean close. No integration with the mutation
+paths yet — the driver still retires the journal on mount and
+writes metadata unjournaled, so the crash story is unchanged
+until Phase 2.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
