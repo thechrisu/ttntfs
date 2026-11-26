@@ -533,6 +533,33 @@ Porting progress (one commit per item, in the order above):
   converts the attribute to resident rather than leaving an empty
   non-resident array).
   49 port items remain.
+- 2026-11-26: `323751a604e7` + `cc9d09fef784` (boot-sector validation)
+  — ported as one commit: `323751a604e7` replaces the old
+  sectors_per_cluster range test in `is_boot_sector_ntfs()` with
+  upstream's `is_power_of_2` check (`core/ntfs/super.c`, no new
+  include needed — visible via ntfs.h -> kernel.h -> log2.h);
+  `cc9d09fef784` decodes the MFT/MFTMirr LCNs into `u64 ll` instead
+  of `s64 ll` in `parse_ntfs_boot_sector()`, so a high-bit LCN no
+  longer wraps negative past the bounds check (`%lli` -> `%llu`).
+  Tests in `core/tests/test_mount.c`: two new cases in
+  `test_boot_sector_geometry_refusals` (mft_lcn / mftmirr_lcn top
+  byte 0x80 — both mount without the fix, refused with it, verified
+  with ntfscli first) and a new counting-bdev test
+  `test_boot_sector_spc_refused_early` (spc=3 and spc=5 refused
+  with zero reads past sector 0; a plain refusal test is vacuous
+  here because both sides fail the mount with -EINVAL — without
+  the fix the mount reads $MFT record 0 at offset 2048 first).
+  Evidence: test_mount 141 checks 0 failures with the fix,
+  4 failures without it (2 LCN cases mount, 2 spc cases read past
+  sector 0: past0=1 maxoff=2048); plain ctest 15/15, UBSan ctest
+  15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1. Note: `git checkout -- <file>` must never be
+  used in this repo — HEAD on disk is stale upstream f61228f, so a
+  checkout restores the upstream file (quota.h include, unbuildable)
+  and destroys the port; the negative control was done by direct
+  edit instead, and the file was verified byte-identical to its
+  pre-control state afterwards.
+  47 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

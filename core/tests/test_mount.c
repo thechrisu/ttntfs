@@ -274,6 +274,18 @@ static void test_boot_sector_geometry_refusals(void)
 		{ 0x40, 0xC8, "clusters_per_mft_record -56", true },
 		{ 0x44, 0xC8, "clusters_per_index_record -56", true },
 		{ 0x0d, 0x00, "sectors_per_cluster 0", true },
+		/* Upstream cc9d09fef784: the boot sector stores the MFT and
+		 * MFTMirr locations as unsigned 64-bit LCNs, but the driver
+		 * decoded them into a signed s64, so a high-bit LCN wrapped
+		 * negative and passed the bounds check. Setting the top byte
+		 * (0x37 for $MFT at 0x30, 0x3f for $MFTMirr at 0x38) keeps
+		 * the real LCN in the low bytes and sets the high bit: without
+		 * the fix both images still mount (the u64 shift in
+		 * NTFS_CLU_TO_B wraps the high bit away and the $MFT read
+		 * lands on the real location); with it, the parse refuses
+		 * them. Verified with ntfscli before the test was written. */
+		{ 0x37, 0x80, "mft_lcn high bit set", true },
+		{ 0x3f, 0x80, "mftmirr_lcn high bit set", true },
 	};
 
 	printf("test_boot_sector_geometry_refusals\n");
@@ -301,6 +313,136 @@ static void test_boot_sector_geometry_refusals(void)
 		}
 		unlink(scratch);
 	}
+}
+
+/* ---- 2. spc refusal happens in the boot-sector check, not later ------ */
+
+/*
+ * Upstream 323751a604e7: sectors_per_cluster must be a power of two (and
+ * < 0xf4). The old range test let spc=3 and spc=5 through, and the parse
+ * then derived a 512-byte cluster size via ffs() and read $MFT record 0
+ * from byte 2048 -- a plain mount-refusal test cannot tell the fix from
+ * the no-fix behaviour, because both refuse the mount (with different
+ * reasons, both surfacing as -EINVAL). So count device reads: with the
+ * fix the mount performs only the boot-sector pread at offset 0 before
+ * failing in is_boot_sector_ntfs; without it there is a direct
+ * ntfs_bdev_read of $MFT record 0 at offset 2048 (core/vfs/inode.c
+ * ntfs_read_inode_mount, direct bdev read, not page cache).
+ *
+ * The control (unpatched fixture) proves the counter sees real reads:
+ * a clean read-only mount reads $MFT and friends well past sector 0.
+ * Precedent for wrapping bdev ops: test_faults.c fault_open().
+ */
+
+static const struct ntfs_bdev_ops *spc_real_ops;
+static struct ntfs_bdev_ops spc_ops;
+static uint64_t spc_past_sector0;
+static uint64_t spc_max_offset;
+
+static ssize_t spc_pread(struct ntfs_bdev *dev, void *buf, size_t count, u64 offset)
+{
+	if (offset >= 512) {
+		spc_past_sector0++;
+		if (offset > spc_max_offset)
+			spc_max_offset = offset;
+	}
+	return spc_real_ops->pread(dev, buf, count, offset);
+}
+
+static ssize_t spc_pwrite(struct ntfs_bdev *dev, const void *buf, size_t count, u64 offset)
+{
+	return spc_real_ops->pwrite(dev, buf, count, offset);
+}
+
+static int spc_flush(struct ntfs_bdev *dev)
+{
+	return spc_real_ops->flush(dev);
+}
+
+static int spc_discard(struct ntfs_bdev *dev, u64 offset, u64 length)
+{
+	return spc_real_ops->discard(dev, offset, length);
+}
+
+static void spc_close(struct ntfs_bdev *dev)
+{
+	spc_real_ops->close(dev);
+}
+
+/* Mount read-only with the counting wrapper in place. Returns the mount
+ * error (0 on success) and reports, via the out parameters, how many
+ * preads happened past sector 0 and the highest offset read. */
+static int mount_ro_counted(const char *path, uint64_t *past0, uint64_t *maxoff)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+	struct ntfs_volume *vol = NULL;
+	struct ntfs_mount_options opts;
+	int err;
+
+	if (!dev)
+		return -ENODEV;
+	spc_real_ops = dev->ops;
+	spc_ops = *spc_real_ops;
+	spc_ops.pread = spc_pread;
+	spc_ops.pwrite = spc_pwrite;
+	spc_ops.flush = spc_flush;
+	spc_ops.discard = spc_real_ops->discard ? spc_discard : NULL;
+	spc_ops.close = spc_close;
+	dev->ops = &spc_ops;
+	spc_past_sector0 = 0;
+	spc_max_offset = 0;
+
+	memset(&opts, 0, sizeof(opts));
+	opts.flags = NTFS_MOUNT_RDONLY;
+	err = ntfs_mount(dev, &opts, &vol);
+	if (!err)
+		ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	*past0 = spc_past_sector0;
+	*maxoff = spc_max_offset;
+	return err;
+}
+
+static void test_boot_sector_spc_refused_early(void)
+{
+	static const struct {
+		uint8_t value;
+		const char *what;
+	} cases[] = {
+		{ 0x03, "sectors_per_cluster 3" },
+		{ 0x05, "sectors_per_cluster 5" },
+	};
+	uint64_t past0, maxoff;
+	int err;
+	size_t i;
+
+	printf("test_boot_sector_spc_refused_early\n");
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_boot_sector_spc_refused_early: no fixture\n");
+		return;
+	}
+	/* Control first: a clean mount must read past sector 0, or the
+	 * counter proves nothing. */
+	err = mount_ro_counted(scratch, &past0, &maxoff);
+	CHECK(err == 0);
+	CHECK(past0 > 0);
+	if (err || !past0)
+		fprintf(stderr, "FAIL spc control: clean mount err=%d past0=%llu\n",
+			err, (unsigned long long)past0);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (patch_byte(scratch, 0x0d, cases[i].value) != 0) {
+			fprintf(stderr, "SKIP %s: cannot patch fixture\n", cases[i].what);
+			continue;
+		}
+		err = mount_ro_counted(scratch, &past0, &maxoff);
+		CHECK(err != 0);
+		CHECK(past0 == 0);
+		if (!err || past0)
+			fprintf(stderr, "FAIL %s: err=%d past0=%llu maxoff=%llu\n",
+				cases[i].what, err, (unsigned long long)past0,
+				(unsigned long long)maxoff);
+	}
+	unlink(scratch);
 }
 
 /* ---- 1. the clean rule, and the two implementations agreeing ---------- */
@@ -722,6 +864,7 @@ int main(void)
 	test_probe_light_matches();
 	test_one_flush_per_sync();
 	test_boot_sector_geometry_refusals();
+	test_boot_sector_spc_refused_early();
 	test_quota_removal_remount_rw();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
