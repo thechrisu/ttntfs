@@ -3556,6 +3556,102 @@ static void test_reparse_dt_unknown_on_lookup_failure(void)
 	unlink(scratch);
 }
 
+/* ---- 19. Reserved $LX* xattrs rejected (upstream ea6a67ef6445) --- */
+
+/*
+ * Upstream ea6a67ef6445: setxattr of the reserved $LXUID, $LXGID,
+ * $LXMOD and $LXDEV names is rejected from userspace unless the
+ * caller has CAP_SYS_ADMIN -- otherwise anyone could forge the WSL
+ * uid/gid/mode/device metadata the driver trusts on read. The port
+ * has no credential plumbing (see ntfs_caller_is_privileged() in
+ * core/ntfs/ea.c), so every handler caller is unprivileged and all
+ * four names are rejected with -EPERM. Internal WSL creation
+ * bypasses the handler (ntfs_ea_set_wsl_inode() calls ntfs_set_ea()
+ * directly), so it is unaffected.
+ */
+static void test_reserved_lxattr_rejected(void)
+{
+	static const char *reserved[] = { "$LXUID", "$LXGID", "$LXMOD", "$LXDEV" };
+	static char val[4] = { 1, 0, 0, 0 };
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	char buf[16], orig[4][4];
+	int err, i;
+
+	printf("test_reserved_lxattr_rejected\n");
+	if (copy_fixture("lxreject") != 0) {
+		fprintf(stderr, "SKIP test_reserved_lxattr_rejected: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_reserved_lxattr_rejected: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "lx.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_reserved_lxattr_rejected: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	for (i = 0; i < 4; i++) {
+		/*
+		 * Creation already wrote $LXUID/$LXGID/$LXMOD (the
+		 * driver persists uid/gid/mode in them via
+		 * ntfs_ea_set_wsl_inode(); $LXDEV only exists on
+		 * device files). A rejected set must leave the stored
+		 * value untouched, so record it first and compare
+		 * after.
+		 */
+		err = ea_get(f, reserved[i], buf, sizeof(buf));
+		if (!strcmp(reserved[i], "$LXDEV")) {
+			CHECK(err == -ENODATA);
+			if (err != -ENODATA)
+				fprintf(stderr, "FAIL lx-reject: pre-set get %s returned %d, expected -ENODATA (-61)\n",
+					reserved[i], err);
+		} else {
+			CHECK(err == 4);
+			if (err != 4) {
+				fprintf(stderr, "FAIL lx-reject: pre-set get %s returned %d, expected 4\n",
+					reserved[i], err);
+				continue;
+			}
+			memcpy(orig[i], buf, sizeof(orig[i]));
+		}
+		err = ea_set(f, reserved[i], val, sizeof(val));
+		CHECK(err == -EPERM);
+		if (err != -EPERM)
+			fprintf(stderr, "FAIL lx-reject: set %s returned %d, expected -EPERM (-1)\n",
+				reserved[i], err);
+		err = ea_get(f, reserved[i], buf, sizeof(buf));
+		if (!strcmp(reserved[i], "$LXDEV")) {
+			CHECK(err == -ENODATA);
+			if (err != -ENODATA)
+				fprintf(stderr, "FAIL lx-reject: post-set get %s returned %d, expected -ENODATA (-61)\n",
+					reserved[i], err);
+		} else {
+			CHECK(err == 4);
+			if (err == 4)
+				CHECK(memcmp(buf, orig[i], sizeof(orig[i])) == 0);
+			if (err != 4 || memcmp(buf, orig[i], sizeof(orig[i])) != 0)
+				fprintf(stderr, "FAIL lx-reject: %s changed after rejected set\n",
+					reserved[i]);
+		}
+	}
+	/* A non-reserved name still goes through. */
+	err = ea_set(f, "user.test", val, sizeof(val));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL lx-reject: set user.test returned %d, expected 0\n", err);
+	err = ea_get(f, "user.test", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val));
+	if (err == (int)sizeof(val))
+		CHECK(memcmp(buf, val, sizeof(val)) == 0);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -3583,6 +3679,7 @@ int main(void)
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
 	test_reparse_dt_unknown_on_lookup_failure();
+	test_reserved_lxattr_rejected();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

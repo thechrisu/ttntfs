@@ -907,6 +907,26 @@ Porting progress (one commit per item, in the order above):
   passed 0 failed with NTFS_REQUIRE_FSCK=1.
   34 port items remain.
 
+- 2026-11-26: `ea6a67ef6445` (reject unprivileged writes to reserved
+  $LX* xattrs) — ported: `ntfs_setxattr()` now rejects the reserved
+  $LXUID/$LXGID/$LXMOD/$LXDEV names with -EPERM (helper
+  `ntfs_is_reserved_lxattr()`, verbatim upstream, core/ntfs/ea.c).
+  The port has no credential plumbing in the VFS layer, so the
+  privilege predicate (`ntfs_caller_is_privileged()`) returns
+  false: every handler caller is unprivileged. Internal WSL
+  creation bypasses the handler (`ntfs_ea_set_wsl_inode()` calls
+  `ntfs_set_ea()` directly), so it is unaffected -- creation
+  still writes $LXUID/$LXGID/$LXMOD on every new file, which the
+  test accounts for: it records the stored values first and
+  asserts a rejected set leaves them unchanged ($LXDEV has none
+  on a regular file and stays absent). New test
+  `test_reserved_lxattr_rejected` in `core/tests/test_links.c`:
+  522 checks, 0 failures with the fix; without it 8 failures
+  (the forged sets succeed and the values change). Plain ctest
+  15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed 0
+  failed with NTFS_REQUIRE_FSCK=1.
+  33 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

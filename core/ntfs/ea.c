@@ -916,6 +916,27 @@ err_out:
 	return err;
 }
 
+static bool ntfs_is_reserved_lxattr(const char *name)
+{
+	return !strcmp(name, "$LXUID") || !strcmp(name, "$LXGID") ||
+	       !strcmp(name, "$LXMOD") || !strcmp(name, "$LXDEV");
+}
+
+/*
+ * PORT: upstream ea6a67ef6445 gates reserved $LX* writes on
+ * capable(CAP_SYS_ADMIN). The port has no credential plumbing in
+ * the VFS layer -- the FSKit extension runs as the mounting user
+ * and operations carry no capability -- so every caller through
+ * this handler is unprivileged. Internal WSL creation bypasses
+ * this handler (ntfs_ea_set_wsl_inode() calls ntfs_set_ea()
+ * directly), so rejecting here breaks nothing the driver does
+ * itself.
+ */
+static bool ntfs_caller_is_privileged(void)
+{
+	return false;
+}
+
 static int ntfs_setxattr(const struct xattr_handler *handler,
 		struct mnt_idmap *idmap, struct dentry *unused,
 		struct inode *inode, const char *name, const void *value,
@@ -927,6 +948,9 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
+
+	if (ntfs_is_reserved_lxattr(name) && !ntfs_caller_is_privileged())
+		return -EPERM;
 
 	if (!strcmp(name, SYSTEM_DOS_ATTRIB)) {
 		if (sizeof(u8) != size) {
