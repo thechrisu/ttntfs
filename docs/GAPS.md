@@ -818,6 +818,19 @@ Porting progress (one commit per item, in the order above):
   the flag update with `if (!err)` on failure paths; it does not fix
   this create-path staleness.
 
+- 2026-11-26: `ada728801999` (-ERANGE for undersized xattr buffer)
+  — ported: `ntfs_getxattr()` returned -ENODATA when the value buffer
+  for system.dos_attrib / system.ntfs_attrib[_be] was smaller than
+  the attribute value, telling userspace the attribute does not
+  exist; the xattr API expects -ERANGE (and `ntfs_get_ea()` already
+  returned -ERANGE for regular EAs). Two lines, verbatim upstream.
+  New test `test_getxattr_erange` in `core/tests/test_links.c`,
+  driven through the VFS xattr handler: 495 checks, 0 failures with
+  the fix; 3 failures without it (all three undersized-buffer gets
+  returning -ENODATA). Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  36 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

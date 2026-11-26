@@ -2901,6 +2901,77 @@ static void test_ea_first_set_same_mount_get(void)
 }
 
 /*
+ * Upstream ada728801999 ("ntfs: return -ERANGE for undersized xattr
+ * buffer"): when the value buffer passed to getxattr(2) for
+ * system.dos_attrib, system.ntfs_attrib or system.ntfs_attrib_be is
+ * smaller than the attribute value, ntfs_getxattr() returned
+ * -ENODATA, which tells userspace the attribute does not exist. The
+ * xattr API expects -ERANGE in this case, and ntfs_get_ea() in the
+ * same file already returns -ERANGE for regular EAs. Two-line fix
+ * in ntfs_getxattr(), ported verbatim. Driven through the VFS xattr
+ * handler (ea_get); the size query (NULL buffer) still returns the
+ * value size, and a sufficient buffer still returns the value.
+ */
+static void test_getxattr_erange(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	char buf[4];
+	int err;
+
+	printf("test_getxattr_erange\n");
+	if (copy_fixture("erange") != 0) {
+		fprintf(stderr, "SKIP test_getxattr_erange: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_getxattr_erange: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "erange.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_getxattr_erange: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* system.dos_attrib is 1 byte: a 0-byte buffer is too small. */
+	err = ea_get(f, "system.dos_attrib", buf, 0);
+	CHECK(err == -ERANGE);
+	if (err != -ERANGE)
+		fprintf(stderr, "FAIL erange: dos_attrib 0-byte get returned %d, expected -ERANGE (-34)\n", err);
+	/* Size query still works, and a 1-byte buffer returns the value. */
+	err = ea_get(f, "system.dos_attrib", NULL, 0);
+	CHECK(err == 1);
+	if (err != 1)
+		fprintf(stderr, "FAIL erange: dos_attrib size query returned %d, expected 1\n", err);
+	err = ea_get(f, "system.dos_attrib", buf, sizeof(buf));
+	CHECK(err == 1);
+	if (err != 1)
+		fprintf(stderr, "FAIL erange: dos_attrib full get returned %d, expected 1\n", err);
+	/* system.ntfs_attrib[_be] are 4 bytes: a 2-byte buffer is too small. */
+	err = ea_get(f, "system.ntfs_attrib", buf, 2);
+	CHECK(err == -ERANGE);
+	if (err != -ERANGE)
+		fprintf(stderr, "FAIL erange: ntfs_attrib 2-byte get returned %d, expected -ERANGE (-34)\n", err);
+	err = ea_get(f, "system.ntfs_attrib_be", buf, 2);
+	CHECK(err == -ERANGE);
+	if (err != -ERANGE)
+		fprintf(stderr, "FAIL erange: ntfs_attrib_be 2-byte get returned %d, expected -ERANGE (-34)\n", err);
+	err = ea_get(f, "system.ntfs_attrib", NULL, 0);
+	CHECK(err == 4);
+	if (err != 4)
+		fprintf(stderr, "FAIL erange: ntfs_attrib size query returned %d, expected 4\n", err);
+	err = ea_get(f, "system.ntfs_attrib", buf, sizeof(buf));
+	CHECK(err == 4);
+	if (err != 4)
+		fprintf(stderr, "FAIL erange: ntfs_attrib full get returned %d, expected 4\n", err);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 56cc42a7b387 ("ntfs: return errors from ntfs_attr_readall"):
  * ntfs_attr_readall() returned NULL on every failure -- attribute
  * lookup, allocation and read -- so every caller lost the errno and
@@ -3292,6 +3363,7 @@ int main(void)
 	test_nonres_attr_validation();
 	test_ea_final_size_validated();
 	test_ea_first_set_same_mount_get();
+	test_getxattr_erange();
 	test_readall_error_propagates();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
