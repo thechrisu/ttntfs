@@ -1746,6 +1746,123 @@ out:
 	unlink(scratch);
 }
 
+/* ---- 14. mapping-pairs bounds: runs past the volume end ------------ */
+
+/*
+ * Upstream 19cac7902a8a + fea9e4488f38, ported as one commit: the
+ * mapping-pairs decoder never checked a run against the volume size, so a
+ * run starting at or beyond nr_clusters, or one whose LCN + length runs
+ * past nr_clusters, decoded fine and the read went to whatever lay at
+ * that offset on the device. 19cac7902a8a also clamps the free-cluster
+ * bitmap scan in ntfs_cluster_alloc() to the same bound; that hunk has no
+ * reliable userspace-observable test -- the overrun reads the heap
+ * lcn_empty_bits_per_page array and is silent without ASan -- so it is
+ * carried verbatim and proven by the byte-identical diff, per the
+ * round-8 precedent for the ntfs_new_attr_flags leak.
+ *
+ * A driver-created volume can never reach this state (the allocator only
+ * hands out in-volume clusters), so the run is rewritten by hand:
+ * tools/mkfixtures/patch_oob_run.py rebuilds the file's first $DATA run
+ * with a 3-byte length/offset and appends 0x42 marker bytes past the end
+ * of the volume, so a read that escapes returns known bytes instead of
+ * EOF. Two modes, both on a scratch empty.img (8191 clusters @ 4K):
+ *   start:   run starts at nr_clusters + 10, length 1 -- the decoder
+ *            must refuse it outright.
+ *   run-end: run starts at nr_clusters - 5, length 10, so it runs 5
+ *            clusters past the end -- a valid starting LCN is not
+ *            enough, the run length comes from disk too.
+ * Without the fix the reads succeed and return the marker bytes
+ * (verified by hand with ntfscli before this test was written: 'B's for
+ * start, zeroes then 'B's for run-end); with the fix both read back -EIO
+ * (the decoder's -ENXIO is mapped to -EIO by ntfs_vfs_lcn_error).
+ * No fsck() call here: the image is deliberately corrupt by design, and
+ * ntfsck would flag the out-of-volume run.
+ */
+static void test_mapping_pairs_bounds(void)
+{
+	static const struct { const char *mode, *name; size_t clusters; } cases[] = {
+		{ "start",   "oob-start.bin",  1 },
+		{ "run-end", "oob-runend.bin", 10 },
+	};
+	const char *py = getenv("NTFS_PATCH_OOB_RUN");
+	size_t i;
+
+	printf("test_mapping_pairs_bounds\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_mapping_pairs_bounds: NTFS_PATCH_OOB_RUN not set\n");
+		return;
+	}
+	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		static unsigned char buf[40960];
+		char cmd[2048], out[256];
+		ntfs_inode_t *root = NULL, *f = NULL;
+		struct ntfs_attr a;
+		uint64_t mft_no;
+		long nr_clusters, cs, old_lcn, old_len, new_lcn, new_len;
+		FILE *p;
+		int rc;
+
+		if (copy_fixture("empty.img") != 0) {
+			fprintf(stderr, "SKIP test_mapping_pairs_bounds: no fixture\n");
+			return;
+		}
+		if (mount_scratch()) { failures++; checks++; unlink(scratch); continue; }
+		CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+		CHECK_EQ(ntfs_create(root, cases[i].name, 0100644, &f), 0, "create");
+		if (!f) { ntfs_inode_put(root); umount_scratch(); unlink(scratch); continue; }
+		mft_no = ntfs_inode_number(f);
+		memset(buf, 'A', cases[i].clusters * 4096);
+		CHECK_EQ(ntfs_write(f, buf, cases[i].clusters * 4096, 0),
+			 (ssize_t)(cases[i].clusters * 4096), "seed write");
+		CHECK_EQ(ntfs_volume_sync(g_vol), 0, "volume sync");
+		ntfs_inode_put(f);
+		ntfs_inode_put(root);
+		umount_scratch();
+
+		/* Rewrite the first run out of the volume, on disk. */
+		snprintf(cmd, sizeof(cmd), "python3 %s %s %llu %s",
+			 py, scratch, (unsigned long long)mft_no, cases[i].mode);
+		p = popen(cmd, "r");
+		if (!p || !fgets(out, sizeof(out), p)) {
+			fprintf(stderr, "FAIL patch_oob_run.py produced no output (%s)\n", cases[i].mode);
+			failures++; checks++;
+			if (p) pclose(p);
+			unlink(scratch);
+			continue;
+		}
+		rc = pclose(p);
+		CHECK_EQ(rc, 0, "patch_oob_run.py exit status");
+		CHECK(sscanf(out, "%ld %ld %ld %ld %ld %ld", &nr_clusters, &cs,
+			     &old_lcn, &old_len, &new_lcn, &new_len) == 6);
+		/* Pin the geometry the modes assume, so a fixture whose
+		 * size changed fails here instead of testing nothing. */
+		CHECK_EQ(nr_clusters, 8191, "empty.img clusters");
+		CHECK_EQ(cs, 4096, "empty.img cluster size");
+		if (!strcmp(cases[i].mode, "start")) {
+			CHECK_EQ(new_lcn, nr_clusters + 10, "start run LCN");
+			CHECK_EQ(new_len, old_len, "start run length unchanged");
+		} else {
+			CHECK_EQ(new_lcn, nr_clusters - 5, "run-end run LCN");
+			CHECK(new_lcn + new_len > nr_clusters);
+		}
+
+		CHECK_EQ(mount_scratch(), 0, "remount");
+		CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+		CHECK_EQ(ntfs_lookup(root, cases[i].name, &f), 0, "lookup");
+		if (f) {
+			CHECK(ntfs_getattr(f, &a) == 0);
+			/* Metadata still readable: only the data is refused. */
+			CHECK_EQ(a.size, (int64_t)(cases[i].clusters * 4096), "size after patch");
+			CHECK_EQ(ntfs_read(f, buf, cases[i].clusters * 4096, 0),
+				 -EIO, "read of out-of-volume run refused");
+			ntfs_inode_put(f);
+		}
+		ntfs_inode_put(root);
+		umount_scratch();
+		unlink(scratch);
+	}
+}
+
 int main(void)
 {
 	static const struct { void (*fn)(void); const char *name; } groups[] = {
@@ -1763,6 +1880,7 @@ int main(void)
 		{ test_attr_flags,		 "attr_flags" },
 		{ test_compressed_block_survives_failed_rewrite,
 					 "failed_rewrite" },
+		{ test_mapping_pairs_bounds,	 "mapping_pairs_bounds" },
 	};
 
 	/* Per-group counts, so a group that silently stopped checking anything

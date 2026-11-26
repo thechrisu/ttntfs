@@ -489,7 +489,31 @@ Porting progress (one commit per item, in the order above):
   `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1;
   ntfscli cross-check (rebuilt tree): rw mount, file created, reads
   back.
-  52 port items remain.
+- 2026-11-26: `19cac7902a8a` + `fea9e4488f38` (mapping-pairs bounds)
+  — ported together: `ntfs_cluster_alloc()` in `core/ntfs/lcnalloc.c`
+  now clamps the $Bitmap scan to `min(i_size, (nr_clusters + 7) >> 3)`,
+  and `ntfs_mapping_pairs_decompress()` in `core/ntfs/runlist.c`
+  refuses a run whose starting LCN is at or beyond `nr_clusters`, and
+  (with `check_add_overflow`) one whose LCN + length runs past
+  `nr_clusters`. Both hunks verbatim from upstream. New fixture
+  patcher `tools/mkfixtures/patch_oob_run.py` rewrites a file's first
+  $DATA run out of the volume (3-byte length/offset fields) and
+  appends 0x42 marker bytes past the volume end, so an escaping read
+  returns known bytes instead of EOF. Regression test
+  `test_mapping_pairs_bounds` in `core/tests/test_compress.c` (start
+  mode: LCN nr_clusters+10, len 1; run-end mode: LCN nr_clusters-5,
+  len 10) on a scratch `empty.img` (8191 clusters @ 4K). Evidence:
+  test_compress 502 checks 0 failures with the fix, 2 failures
+  without it (the two reads return the marker bytes instead of -EIO;
+  verified independently with ntfscli before the test was written);
+  plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1; ntfscli cross-check
+  (rebuilt tree): both OOB reads fail EIO, clean-image read still
+  works. The lcnalloc clamp hunk has no userspace-observable test
+  (the overrun reads the heap `lcn_empty_bits_per_page` array,
+  silent without ASan) and is carried verbatim, proven by the
+  byte-identical diff.
+  50 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

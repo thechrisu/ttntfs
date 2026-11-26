@@ -228,7 +228,7 @@ if(NTFS_BUILD_TESTS)
   add_test(NAME compress COMMAND test_compress)
   set_tests_properties(compress PROPERTIES
     TIMEOUT 600
-    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck")
+    ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_PATCH_OOB_RUN=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_oob_run.py")
 
   # Hard links, symlinks, timestamps and permissions: all four shipped with no
   # test. Every mutating case ends in `ntfsck -n`, because a wrong link count or
