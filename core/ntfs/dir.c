@@ -23,6 +23,18 @@
 __le16 I30[5] = { cpu_to_le16('$'), cpu_to_le16('I'),
 		cpu_to_le16('3'),	cpu_to_le16('0'), 0 };
 
+/* PORT: upstream d97a36bae86a. Directory index entries carry on-disk MFT
+ * references, so a crafted image can set the MREF error bit while leaving
+ * the low bits arbitrary; callers decode lookup failures with MREF_ERR()
+ * and would consume a bogus pseudo-errno. Normalize every error-marked
+ * reference to ERR_MREF(-EIO) at the source. */
+static inline u64 ntfs_check_mref(u64 mref)
+{
+	if (IS_ERR_MREF(mref))
+		return ERR_MREF(-EIO);
+	return mref;
+}
+
 /*
  * ntfs_lookup_inode_by_name - find an inode in a directory given its name
  * @dir_ni:	ntfs inode of the directory in which to search for the name
@@ -182,7 +194,7 @@ found_it:
 			mref = le64_to_cpu(ie->data.dir.indexed_file);
 			ntfs_attr_put_search_ctx(ctx);
 			unmap_mft_record(dir_ni);
-			return mref;
+			return ntfs_check_mref(mref);
 		}
 		/*
 		 * For a case insensitive mount, we also perform a case
@@ -280,7 +292,7 @@ found_it:
 		if (name) {
 			ntfs_attr_put_search_ctx(ctx);
 			unmap_mft_record(dir_ni);
-			return name->mref;
+			return ntfs_check_mref(name->mref);
 		}
 		ntfs_debug("Entry not found.");
 		err = -ENOENT;
@@ -456,7 +468,7 @@ found_it2:
 			mref = le64_to_cpu(ie->data.dir.indexed_file);
 			kfree(kaddr);
 			iput(ia_vi);
-			return mref;
+			return ntfs_check_mref(mref);
 		}
 		/*
 		 * For a case insensitive mount, we also perform a case
@@ -579,7 +591,7 @@ found_it2:
 	if (name) {
 		kfree(kaddr);
 		iput(ia_vi);
-		return name->mref;
+		return ntfs_check_mref(name->mref);
 	}
 	ntfs_debug("Entry not found.");
 	err = -ENOENT;

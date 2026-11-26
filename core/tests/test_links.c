@@ -2355,6 +2355,78 @@ static void test_mft_alloc_usa_ofs_validated(void)
 	unlink(scratch);
 }
 
+/* ---- 16. Error-marked MFT references are normalized (upstream d97a36bae86a) --- */
+
+/*
+ * ntfs_lookup_inode_by_name() returns MFT references read from directory
+ * index entries on disk. A crafted image can set the MREF error bit while
+ * leaving the low bits arbitrary; callers decode lookup failures with
+ * MREF_ERR() and would consume a bogus pseudo-errno. The fix normalizes
+ * every error-marked reference to ERR_MREF(-EIO) at the source, in all
+ * four lookup return paths.
+ *
+ * The patcher sets the $I30 entry for victim.txt to error-bit | 0x42.
+ * With the fix ntfs_lookup() returns -EIO; without it MREF_ERR() is 66,
+ * a positive "error" IS_ERR() does not recognise, so ntfs_lookup reports
+ * success (err 0) with a garbage inode pointer. The test checks err and
+ * that no handle came back, and never touches the handle: on the no-fix
+ * path it is bogus. No fsck_clean here -- the image is deliberately
+ * corrupt, and ntfsck would flag the index entry disagreeing with the
+ * file's own $FILE_NAME.
+ */
+static void test_lookup_err_mref_normalized(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	const char *py = getenv("NTFS_PATCH_ERR_MREF");
+	char cmd[PATH_MAX * 2 + 256];
+	int rc, err;
+
+	printf("test_lookup_err_mref_normalized\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_lookup_err_mref_normalized: NTFS_PATCH_ERR_MREF not set\n");
+		return;
+	}
+	if (copy_fixture("errmref") != 0) {
+		fprintf(stderr, "SKIP test_lookup_err_mref_normalized: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_lookup_err_mref_normalized: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_create(v.root, "victim.txt", 0100644, &f) == 0);
+	if (f) {
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	vol_down(&v);
+
+	snprintf(cmd, sizeof(cmd), "python3 %s %s victim.txt 0x42 >/dev/null 2>&1",
+		 py, scratch);
+	rc = system(cmd);
+	CHECK_MSG(rc == 0, "patch_err_mref.py failed (rc %d)", rc);
+	if (rc != 0) {
+		unlink(scratch);
+		return;
+	}
+
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_lookup_err_mref_normalized: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	err = ntfs_lookup(v.root, "victim.txt", &f);
+	CHECK(err == -EIO);
+	CHECK(f == NULL);
+	if (err != -EIO)
+		fprintf(stderr, "FAIL err-mref lookup: ntfs_lookup returned %d, expected -EIO (-5)\n", err);
+	/* Never ntfs_inode_put(f): on the no-fix path it is a bogus handle. */
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -2372,6 +2444,7 @@ int main(void)
 	test_timestamps();
 	test_permissions();
 	test_mft_alloc_usa_ofs_validated();
+	test_lookup_err_mref_normalized();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

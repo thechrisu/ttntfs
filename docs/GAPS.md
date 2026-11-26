@@ -580,6 +580,24 @@ Porting progress (one commit per item, in the order above):
   page-aligned. Plain ctest 15/15, UBSan ctest 15/15,
   `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
   46 port items remain.
+- 2026-11-26: `d97a36bae86a` (sanitize MFT references from
+  ntfs_lookup_inode_by_name) — ported: static inline
+  `ntfs_check_mref()` added after I30 (`core/ntfs/dir.c`) and all four
+  lookup return paths wrapped, so an error-marked on-disk reference
+  normalizes to ERR_MREF(-EIO) instead of reaching callers, which
+  decode failures with MREF_ERR(). New test
+  `test_lookup_err_mref_normalized` in `core/tests/test_links.c` plus
+  fixture patcher `tools/mkfixtures/patch_err_mref.py`: the $I30 entry
+  for victim.txt is set to error-bit | 0x42. The fixture's root index
+  is large, so the entry lives in an $INDEX_ALLOCATION INDX block,
+  not the $INDEX_ROOT -- the patcher searches the root first, then
+  every allocation block. Evidence: test_links 475 checks 0 failures
+  with the fix; without it exactly 2 failures, ntfs_lookup returns 0
+  with a bogus handle (MREF_ERR 66, which IS_ERR() misses). No
+  fsck_clean for this test: the image is deliberately corrupt.
+  Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
+  0 failed with NTFS_REQUIRE_FSCK=1.
+  45 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
