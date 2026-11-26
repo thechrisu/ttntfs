@@ -3624,7 +3624,27 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 
 	index = pos >> PAGE_SHIFT;
 	while (count) {
-		if (count == PAGE_SIZE) {
+		bool full_page;
+		/*
+		 * FORK-FOUND (no upstream fix in the v7.1->v7.3 drift):
+		 * the FGP_CREAT full-page path is only valid when the
+		 * write covers a whole folio, i.e. count == PAGE_SIZE
+		 * AND pos is page-aligned. Upstream tested only count,
+		 * so a page-sized write at an unaligned offset (the EA
+		 * append path: ntfs_write_ea() passes ea_off = stream
+		 * size, essentially never page-aligned) wrote the data
+		 * at folio offset 0 -- 20 bytes early for a pos of
+		 * 8212 -- and the entry tail past the folio end was
+		 * never written, corrupting the $EA stream (same-mount
+		 * get returned -ENODATA). With an unaligned pos the
+		 * write must go through read_mapping_folio, which
+		 * brings in the existing page so bytes outside the
+		 * write range are preserved; the loop then continues
+		 * into the next folio, where pos is aligned again.
+		 */
+		full_page = (count == PAGE_SIZE) &&
+			    ((pos & (PAGE_SIZE - 1)) == 0);
+		if (full_page) {
 			folio = __filemap_get_folio(vi->i_mapping, index,
 					FGP_CREAT | FGP_LOCK,
 					mapping_gfp_mask(mapping));
@@ -3648,7 +3668,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 			folio_lock(folio);
 		}
 
-		if (count == PAGE_SIZE) {
+		if (full_page) {
 			offset = 0;
 			attr_len = count;
 		} else {

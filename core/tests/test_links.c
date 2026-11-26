@@ -2989,23 +2989,22 @@ static void test_getxattr_erange(void)
  * sits in: a full-page (count == PAGE_SIZE) write to a non-resident
  * attribute takes the FGP_CREAT branch. It drives that branch
  * through the EA append path -- a first EA with an 8192-byte
- * record makes the $EA non-resident (see
+ * value makes the $EA non-resident (see
  * test_attr_add_enospc_fallback), and the second
  * EA is sized so its record is exactly one page
  * (new_ea_size = ALIGN(9 + name_len + val_size, 4) = PAGE_SIZE
  * for name "user.pg" and val_size PAGE_SIZE - 16) -- and asserts
  * the data lands byte-for-byte, same-mount and after remount.
  *
- * NOTE: the first EA's value is 8175 bytes (8192-byte record) so
- * the append lands at a page-aligned offset. The pwrite assumes
- * count == PAGE_SIZE implies a page-aligned pos and writes at
- * folio offset 0 unconditionally; a page-sized write at an
- * unaligned offset (e.g. first EA 8192 bytes -> stream 8212,
- * append at pos 8212) lands 20 bytes early and the entry tail is
- * never written, so the same-mount get returns -ENODATA. That is
- * a separate fork-found bug (present in upstream v7.1 through
- * v7.3, no fix in the drift) and is fixed in the follow-up commit,
- * which changes this test's first EA back to 8192 bytes.
+ * FORK-FOUND (fixed in this commit, no upstream fix in the
+ * v7.1->v7.3 drift): the first EA's record is 8212 bytes, so the
+ * append lands at pos 8212, unaligned. The pwrite used to assume
+ * count == PAGE_SIZE implies a page-aligned pos and wrote at
+ * folio offset 0 unconditionally, so the data landed 20 bytes
+ * early and the entry tail was never written -- the same-mount
+ * get returned -ENODATA and the stream was corrupt. The fix only
+ * takes the FGP_CREAT full-page path when the write covers a
+ * whole folio (count == PAGE_SIZE and pos page-aligned).
  */
 static void test_folio_fullpage_write(void)
 {
@@ -3039,10 +3038,11 @@ static void test_folio_fullpage_write(void)
 		unlink(scratch);
 		return;
 	}
-	/* First EA (8175-byte value -> 8192-byte record) makes the $EA
-	 * non-resident with a page-aligned stream, so the second
-	 * EA's append lands at a page-aligned offset. */
-	err = ea_set(f, "user.big", val8k, 8175);
+	/* First EA (8 KiB) makes the $EA non-resident. Its record is
+	 * 8212 bytes, so the second EA's append lands at pos 8212 --
+	 * deliberately NOT page-aligned: see the FORK-FOUND note in
+	 * the test header. */
+	err = ea_set(f, "user.big", val8k, sizeof(val8k));
 	CHECK(err == 0);
 	if (err != 0) {
 		fprintf(stderr, "SKIP test_folio_fullpage_write: setup set failed (%d)\n", err);

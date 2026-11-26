@@ -871,10 +871,17 @@ Porting progress (one commit per item, in the order above):
   makes it pass. Upstream v7.3 `fs/ntfs/ea.c` calls
   `ntfs_inode_attr_pwrite` identically, so upstream has the bug too.
   Other callers are safe (index/attrib/attrlist/reparse all write
-  at pos 0 or with count 1). **Fix next**: only take the FGP_CREAT
-  full-page path when the write covers a whole folio (count ==
-  PAGE_SIZE and pos page-aligned); otherwise read the folio from
-  disk first so bytes outside the write range are preserved.
+  at pos 0 or with count 1). **Fixed 2026-11-26**: the FGP_CREAT
+  full-page path is only taken when the write covers a whole folio
+  (count == PAGE_SIZE and pos page-aligned); otherwise the write
+  goes through `read_mapping_folio`, which brings in the existing
+  page so bytes outside the write range are preserved, and the loop
+  continues into the next folio where pos is aligned again
+  (core/vfs/inode.c, `full_page` guard on both the folio-get and
+  the offset computation). The same test now uses the unaligned
+  case (first EA 8192 bytes): 501 checks, 0 failures with the fix;
+  2 failures without it (same-mount and remount gets -ENODATA,
+  stripped by line number and verified by diff).
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
