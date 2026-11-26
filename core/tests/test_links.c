@@ -2759,6 +2759,148 @@ static void test_ea_final_size_validated(void)
 }
 
 /*
+ * Fork-found bug (no upstream fix in the v7.1 -> v7.3 drift):
+ * ntfs_set_ea() clears the HasEA flag when creating the first $EA
+ * on a file that has none. The local ea_info_qsize is never updated
+ * on the create path (only p_ea_info->ea_query_length is), so the
+ * out: label sees 0 and calls NInoClearHasEA even though the $EA
+ * was just created; ntfs_get_ea() then returns -ENODATA on the same
+ * mount until remount (the inode reload sets HasEA from the on-disk
+ * $EA). The fix is one line in core/ntfs/ea.c: keep the local
+ * ea_info_qsize in sync with the $EA_INFORMATION just written.
+ *
+ * The file must come from the fixture, not ntfs_create():
+ * driver-created files already carry the three hidden WSL EAs, so
+ * their $EA exists and the set goes through ntfs_write_ea()
+ * instead of the create path. /files/sz/0 in basic-4k.img was
+ * created by mkfixtures/libntfs-3g and has no $EA (the pre-set get
+ * returns -ENODATA).
+ *
+ * Placement matters, and this test guards it: the increment must
+ * sit AFTER the $EA write, because the append branch writes the
+ * new entry at offset ea_info_qsize. Incrementing earlier lands
+ * the entry one entry too far and leaves a gap the lookup never
+ * crosses -- the second (add-path) get below fails -ENODATA with
+ * the stream one entry longer than $EA_INFORMATION claims.
+ *
+ * Note: on a set that fails after the query_length update the flag
+ * can now be set while the stream was not written; that is the
+ * failure-path hole upstream ac727d86fb84 closes (leave HasEA
+ * untouched on setxattr failure), still in the port queue.
+ */
+static void test_ea_first_set_same_mount_get(void)
+{
+	static char val[64];
+	struct vol v;
+	ntfs_inode_t *files = NULL, *sz = NULL, *f = NULL;
+	char buf[64];
+	int err;
+
+	printf("test_ea_first_set_same_mount_get\n");
+	memset(val, 'C', sizeof(val));
+	if (copy_fixture("hasea") != 0) {
+		fprintf(stderr, "SKIP test_ea_first_set_same_mount_get: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_first_set_same_mount_get: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_first_set_same_mount_get: lookup failed\n");
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* Sanity: the fixture file has no $EA yet. */
+	err = ea_get(f, "user.first", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	if (err != -ENODATA) {
+		fprintf(stderr, "SKIP test_ea_first_set_same_mount_get: fixture file already has an EA (get=%d)\n", err);
+		ntfs_inode_put(f);
+		ntfs_inode_put(sz);
+		ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* First $EA on a file with none: takes the create_ea_info path. */
+	err = ea_set(f, "user.first", val, sizeof(val));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL hasea: set returned %d, expected 0\n", err);
+	/* Same mount, no remount: the discriminator. Without the fix
+	 * this returns -ENODATA (-61) because HasEA was cleared. */
+	err = ea_get(f, "user.first", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val));
+	if (err != (int)sizeof(val))
+		fprintf(stderr, "FAIL hasea: same-mount get returned %d, expected %d\n",
+			err, (int)sizeof(val));
+	if (err == (int)sizeof(val)) {
+		CHECK(memcmp(buf, val, sizeof(val)) == 0);
+		if (memcmp(buf, val, sizeof(val)) != 0)
+			fprintf(stderr, "FAIL hasea: same-mount get value mismatch\n");
+	}
+	/* A second EA on the same file takes the add path; the write
+	 * offset there is ea_info_qsize, so this also guards the fix
+	 * placement (see the comment above). */
+	err = ea_set(f, "user.second", val, sizeof(val));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL hasea: second set returned %d, expected 0\n", err);
+	err = ea_get(f, "user.second", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val));
+	if (err != (int)sizeof(val))
+		fprintf(stderr, "FAIL hasea: second get returned %d, expected %d\n",
+			err, (int)sizeof(val));
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	f = sz = files = NULL;
+	vol_down(&v);
+
+	/* Remount: both EAs have to parse back from disk. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_first_set_same_mount_get: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "FAIL test_ea_first_set_same_mount_get: lookup after remount failed\n");
+		failures++; checks++;
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.first", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val));
+	if (err != (int)sizeof(val))
+		fprintf(stderr, "FAIL hasea: remount get (first) returned %d, expected %d\n",
+			err, (int)sizeof(val));
+	err = ea_get(f, "user.second", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val));
+	if (err != (int)sizeof(val))
+		fprintf(stderr, "FAIL hasea: remount get (second) returned %d, expected %d\n",
+			err, (int)sizeof(val));
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 56cc42a7b387 ("ntfs: return errors from ntfs_attr_readall"):
  * ntfs_attr_readall() returned NULL on every failure -- attribute
  * lookup, allocation and read -- so every caller lost the errno and
@@ -2973,13 +3115,15 @@ static void test_attr_add_enospc_fallback(void)
 	CHECK(err == 0);
 	if (err != 0)
 		fprintf(stderr, "FAIL ea set with 8 KiB value: returned %d, expected 0\n", err);
-	/* No same-mount get here: it is broken by a separate bug
-	 * (ntfs_set_ea() clears HasEA when creating the first $EA --
-	 * the local ea_info_qsize is never updated on the create path,
-	 * so the out: label clears the flag even though the $EA was
-	 * just created; the get then returns -ENODATA until remount).
-	 * Recorded in GAPS.md §5.3 as a porting-found item; the
-	 * remount read-back below is the assertion that matters. */
+	/* Same-mount get: this was broken by the HasEA bug (see
+	 * test_ea_first_set_same_mount_get) and is fixed with it --
+	 * the 8 KiB $EA is non-resident, so this also covers the
+	 * non-resident same-mount path. */
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val8k));
+	if (err != (int)sizeof(val8k))
+		fprintf(stderr, "FAIL ea same-mount get with 8 KiB value: returned %d, expected %d\n",
+			err, (int)sizeof(val8k));
 	ntfs_inode_put(f);
 	ntfs_inode_put(sz);
 	ntfs_inode_put(files);
@@ -3147,6 +3291,7 @@ int main(void)
 	test_lookup_err_mref_normalized();
 	test_nonres_attr_validation();
 	test_ea_final_size_validated();
+	test_ea_first_set_same_mount_get();
 	test_readall_error_propagates();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();

@@ -369,6 +369,21 @@ alloc_new_ea:
 			goto out;
 	}
 
+	/* Keep the local size in sync with the $EA_INFORMATION just
+	 * written: on the create path ea_info_qsize is 0 (there was no
+	 * $EA), so without this the out: label below sees 0 and clears
+	 * the HasEA flag even though the $EA was just created, and a
+	 * same-mount getxattr returns -ENODATA until remount. Fork-found
+	 * bug, no upstream fix in the v7.1 -> v7.3 drift. This must sit
+	 * AFTER the $EA write above: the append branch writes the new
+	 * entry at offset ea_info_qsize, so incrementing earlier would
+	 * land the entry one entry too far and leave a gap the lookup
+	 * never crosses. Note: on a set that fails after this point the
+	 * flag can now be set while the stream was not written; upstream
+	 * ac727d86fb84 (still in the port queue) closes that hole by
+	 * leaving HasEA untouched on setxattr failure. */
+	ea_info_qsize += new_ea_size;
+
 	err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
 			sizeof(struct ea_information), false);
 	if (err)

@@ -804,12 +804,19 @@ Porting progress (one commit per item, in the order above):
   remount (the inode reload sets HasEA from the on-disk $EA). Found
   while writing `test_attr_add_enospc_fallback`: the set returns 0
   and the remount read-back is correct, but the same-mount get fails
-  -ENODATA. The fix is one line (`ea_info_qsize += new_ea_size;`
-  after the ea_query_length update in core/ntfs/ea.c); it is a
-  separate commit after this port, not part of it. Related but
-  different: `ac727d86fb84` (still in the queue) guards the flag
-  update with `if (!err)` on failure paths; it does not fix this
-  create-path staleness.
+  -ENODATA. **Fixed 2026-11-26** (one line, `ea_info_qsize +=
+  new_ea_size;` in core/ntfs/ea.c): the increment sits AFTER the $EA
+  write, because the append branch writes the new entry at offset
+  `ea_info_qsize` — incrementing earlier lands the entry one entry
+  too far and leaves a gap the lookup never crosses (caught by the
+  new test's add-path get). Regression test
+  `test_ea_first_set_same_mount_get` in `test_links` (488 checks, 0
+  failures; 2 failures without the fix, both create-path same-mount
+  gets returning -ENODATA); the deferred same-mount get in
+  `test_attr_add_enospc_fallback` is un-deferred in the same commit.
+  Related but different: `ac727d86fb84` (still in the queue) guards
+  the flag update with `if (!err)` on failure paths; it does not fix
+  this create-path staleness.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
