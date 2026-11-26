@@ -44,6 +44,12 @@
 #include "ntfs_image.h"
 #include "ntfs_logfile.h"
 #include "logfile_layout.h"
+#include <linux/fs.h>
+#include <linux/fs_context.h>
+
+/* super.c (PORT: exported); the fs_context ops carry the kernel's
+ * reconfigure (remount) entry point. */
+extern struct file_system_type ntfs_fs_type;
 
 /* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
  * some machines and the 16 TiB geometry image needs ~600 MiB while
@@ -705,6 +711,8 @@ static void test_one_flush_per_sync(void)
 	printf("test_one_flush_per_sync\n");
 }
 
+static void test_quota_removal_remount_rw(void);
+
 int main(void)
 {
 	test_journal_clean_rule();
@@ -714,6 +722,126 @@ int main(void)
 	test_probe_light_matches();
 	test_one_flush_per_sync();
 	test_boot_sector_geometry_refusals();
+	test_quota_removal_remount_rw();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
+}
+
+/* ---- quota removal: the kernel remount path --------------------------- */
+
+static int set_param(struct fs_context *fc, const char *key, const char *value)
+{
+	struct fs_parameter param = {
+		.key = key,
+		.type = value ? fs_value_is_string : fs_value_is_flag,
+		.string = (char *)value,
+		.size = value ? strlen(value) : 0,
+	};
+
+	return fc->ops->parse_param(fc, &param);
+}
+
+/*
+ * Quota removal (upstream cbe287fd65f1, "ntfs: remove unsupported quota
+ * handling"): the driver never maintained quota metadata, and the only
+ * runtime quota path was the rw-remount marker ntfs_mark_quotas_out_of_date(),
+ * which looked the $Q index up under the wrong name ("$I30") and always
+ * failed -- so remounting a volume with $Quota (every mkntfs image has
+ * one, MFT record 9) read-write through the kernel's reconfigure path
+ * returned -EROFS and flagged volume errors. The port's own mount path
+ * worked around it (ntfs_glue_make_rw skips the marker), but the kernel
+ * path stayed broken. With the quota code removed, the same remount
+ * succeeds. This drives the fs_context ops directly: read-only mount,
+ * reconfigure to read-write, then back to read-only for a clean teardown.
+ * A throwaway ntfs_mount first runs the one-time module init
+ * (ntfs_glue_module_init is static to super_glue.c).
+ */
+static void test_quota_removal_remount_rw(void)
+{
+	struct fs_context fc;
+	struct super_block *sb;
+	struct ntfs_bdev *dev;
+	struct ntfs_volume_info info;
+	ntfs_volume_t *vol;
+	int err;
+
+	printf("test_quota_removal_remount_rw\n");
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_quota_removal_remount_rw: no fixture\n");
+		return;
+	}
+	/* One-time module init, as ntfs_mount does it. */
+	{
+		struct ntfs_mount_options o = { .flags = NTFS_MOUNT_RDONLY,
+				.uid = 0, .gid = 0, .fmask = 022, .dmask = 022 };
+		dev = ntfs_bdev_open_path(scratch, false);
+		if (!dev) { unlink(scratch); return; }
+		err = ntfs_mount(dev, &o, &vol);
+		if (err) { ntfs_bdev_close(dev); unlink(scratch); return; }
+		ntfs_volume_get_info(vol, &info);
+		CHECK(info.read_only);
+		ntfs_unmount(vol);
+		ntfs_bdev_close(dev);
+	}
+
+	memset(&fc, 0, sizeof(fc));
+	dev = ntfs_bdev_open_path(scratch, false);
+	if (!dev) { unlink(scratch); return; }
+	fc.bdev = dev;
+	fc.purpose = FS_CONTEXT_FOR_MOUNT;
+	fc.sb_flags = SB_RDONLY;
+	err = ntfs_fs_type.init_fs_context(&fc);
+	CHECK(err == 0);
+	if (err) goto out_dev;
+	/* The mount options the glue applies, in miniature. */
+	CHECK(set_param(&fc, "uid", "0") == 0);
+	CHECK(set_param(&fc, "gid", "0") == 0);
+	CHECK(set_param(&fc, "fmask", "022") == 0);
+	CHECK(set_param(&fc, "dmask", "022") == 0);
+	CHECK(set_param(&fc, "errors", "remount-ro") == 0);
+	err = fc.ops->get_tree(&fc);
+	CHECK(err == 0);
+	if (err) goto out_fc;
+	sb = fc.root->d_sb;
+	CHECK(sb_rdonly(sb));
+
+	/* Read-write remount: -EROFS while the quota marker is in the way.
+	 * reconfigure() itself never touches sb->s_flags -- in the kernel
+	 * the VFS applies fc->sb_flags to the superblock after it returns
+	 * 0, so the test does that step itself, exactly as do_remount()
+	 * would. The assertion that matters is the return value. */
+	fc.sb_flags = 0;
+	err = fc.ops->reconfigure(&fc);
+	CHECK(err == 0);
+	if (err)
+		fprintf(stderr, "FAIL: rw remount refused (%d)\n", err);
+	else
+		sb->s_flags &= ~SB_RDONLY;
+	CHECK(!sb_rdonly(sb));
+
+	/* Back to read-only, so the teardown takes the clean path. */
+	fc.sb_flags = SB_RDONLY;
+	err = fc.ops->reconfigure(&fc);
+	CHECK(err == 0);
+	if (!err)
+		sb->s_flags |= SB_RDONLY;
+	CHECK(sb_rdonly(sb));
+
+	/* Teardown, mirroring ntfs_glue_teardown in super_glue.c. */
+	sync_filesystem(sb);
+	sb->s_flags &= ~SB_ACTIVE;
+	if (sb->s_root && sb->s_root->d_inode) {
+		iput(sb->s_root->d_inode);
+		sb->s_root->d_inode = NULL;
+	}
+	if (sb->s_op && sb->s_op->put_super)
+		sb->s_op->put_super(sb);
+	sb->s_fs_info = NULL;
+	sb_free(sb);
+out_fc:
+	if (fc.ops && fc.ops->free)
+		fc.ops->free(&fc);
+out_dev:
+	ntfs_bdev_close(dev);
+	unlink(scratch);
 }

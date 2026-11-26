@@ -12,8 +12,8 @@
  *   The volume is always mounted read-only first (nothing on disk is
  *   touched), its state is inspected, and only a clean volume is then
  *   switched read-write through super.c's own remount path
- *   (ntfs_reconfigure: re-checks the flags, empties the clean journal, marks
- *   quotas out of date). A dirty or hibernated volume, or one whose $LogFile
+ *   (ntfs_reconfigure: re-checks the flags, empties the clean journal).
+ *   A dirty or hibernated volume, or one whose $LogFile
  *   is not clean, stays read-only with the reason reported in
  *   ntfs_volume_info.ro_reason (or the mount fails with -EROFS when the
  *   caller did not ask for the fallback). The journal is never reset.
@@ -298,12 +298,13 @@ iput_out:
 /*
  * ntfs_glue_make_rw - switch a clean, read-only mounted volume read-write
  *
- * What super.c's ntfs_reconfigure() does for a rw remount, minus
- * ntfs_mark_quotas_out_of_date(): that upstream function looks up the
- * $Quota index under the wrong name ("$I30") and reads the entry's key as
- * its data, so it always fails; the kernel's own rw *mount* never calls it
- * (only remount does) and neither does ntfs-3g, so a rw mount here matches
- * both. Emptying a clean journal is what every rw mount of this driver does.
+ * What super.c's ntfs_reconfigure() does for a rw remount. Upstream removed
+ * quota handling in 7.2 (cbe287fd65f1): the driver never maintained quota
+ * metadata, and the old marker -- ntfs_mark_quotas_out_of_date(), which
+ * looked the $Q index up under the wrong name ("$I30") and always failed --
+ * could block a rw remount or force a mount read-only for nothing. There
+ * is no quota step on either path now. Emptying a clean journal is what
+ * every rw mount of this driver does.
  */
 static int ntfs_glue_make_rw(struct ntfs_volume *vol)
 {

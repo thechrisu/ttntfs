@@ -468,7 +468,28 @@ Porting progress (one commit per item, in the order above):
   0 and leaves a half-created link with reparse data but no index
   entry); plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all`
   265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
-  53 port items remain.
+- 2026-11-26: `cbe287fd65f1` (quota removal) — ported: deleted
+  `core/ntfs/quota.c`/`quota.h`, the `ntfs_mark_quotas_out_of_date()`
+  call in `ntfs_reconfigure()`, `load_and_init_quota()` and its call
+  site, `vol->quota_ino`/`quota_q_ino`, the `NV_QuotaOutOfDate` flag
+  and bit ops, and the quota commit/iput sites in `ntfs_put_super()`
+  and `ntfs_fill_super()`; kept the on-disk quota layout definitions
+  in `layout.h`, as upstream did. The super_glue notes were updated:
+  the rw path never called the marker (it always failed -- the $Q
+  index was looked up under the wrong name "$I30"), so the glue and
+  the kernel path now agree that there is no quota step. Regression
+  test `test_quota_removal_remount_rw` in `core/tests/test_mount.c`
+  drives the fs_context ops directly (read-only mount, reconfigure
+  to read-write, back to read-only for a clean teardown; the VFS flag
+  step is applied by the test, since `reconfigure()` itself never
+  touches `sb->s_flags` -- the kernel applies `fc->sb_flags` after
+  it returns 0). Evidence: test_mount 133 checks 0 failures with the
+  fix, 2 failures without it (rw remount refused -EROFS, volume
+  still read-only); plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1;
+  ntfscli cross-check (rebuilt tree): rw mount, file created, reads
+  back.
+  52 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
