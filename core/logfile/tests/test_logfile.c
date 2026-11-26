@@ -632,6 +632,9 @@ static void test_states(void)
 	ntfs_logfile_close(log);
 
 	/* Open, flag clear: dirty. */
+	/* ASan (2026-11-26): lb_init() mallocs a fresh buffer; re-init
+	 * without freeing the first one leaked 256 KiB. */
+	free(b.buf);
 	lb_init(&b, FIRST_PAGE, 2);
 	{
 		uint64_t l = lb_simple(&b, 0x18, LOP_Noop, LOP_Noop);
@@ -1162,7 +1165,10 @@ static void test_mft_record_ops(void)
 		ntfs_log_fixup_post_read(p, PS, 512, NULL);
 		lf_put64(b.buf + vbo + LR_HEADER_SIZE + NR_PAGE_LCNS, MFT_LCN + 11);
 		ntfs_log_fixup_pre_write(p, PS, 512);
-		vol_init(&v);	/* leaks previous disk? free first */
+		/* ASan (2026-11-26): vol_init() callocs a fresh disk; re-init
+		 * without freeing the first one leaked 256 KiB. */
+		free(v.disk);
+		vol_init(&v);
 	}
 	log = open_log(&m, &io);
 	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), -EINVAL);
@@ -1504,6 +1510,10 @@ static void test_flush_failure_is_not_a_partial_write(void)
 	CHECK_EQ(v.clu_writes, 1);	/* the write still happened */
 	CHECK_EQ(res.clusters_written, 1);
 	ntfs_logfile_close(log);
+	/* ASan (2026-11-26): free both buffers before the second block
+	 * re-inits them, or 2 x 256 KiB leak per block. */
+	free(b.buf);
+	free(v.disk);
 
 	/* a genuine write failure must NOT be reported as a flush failure */
 	build_bitmap_scenario(&b, true, false, NULL);
@@ -1516,6 +1526,8 @@ static void test_flush_failure_is_not_a_partial_write(void)
 	CHECK(ntfs_logfile_replay(log, &ap, false, &res) != 0);
 	CHECK(!res.flush_failed);
 	ntfs_logfile_close(log);
+	free(b.buf);
+	free(v.disk);
 }
 /*
  * Finding 19: a record that is the first thing ever written into a freshly
@@ -1602,6 +1614,9 @@ static void test_first_write_into_fresh_cluster_is_protected(void)
 	CHECK_EQ(ntfs_log_fixup_post_read(stored, VCS, LFS_SECTOR_SIZE, &torn), 0);
 	CHECK(!torn);
 	ntfs_logfile_close(log);
+	/* ASan (2026-11-26): neither buffer was freed -- 2 x 256 KiB. */
+	free(v.disk);
+	free(b.buf);
 }
 
 
