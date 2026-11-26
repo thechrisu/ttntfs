@@ -1438,6 +1438,26 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (401 s).
   11 port items remain.
 
+- 2026-11-26: `06769b8f23b4` (fix hole runlist memory leak in
+  insert range error path) — ported. One line verbatim:
+  `kfree(hole_rl)` added to the `ntfs_attr_map_whole_runlist`
+  error path in `ntfs_non_resident_attr_insert_range()`
+  (core/ntfs/attrib.c), matching the later paths in the same
+  function that already free it. No new test, honestly: the
+  function has zero callers in the port — upstream's caller is
+  `ntfs_insert_range()` (FALLOC_FL_INSERT_RANGE) in
+  fs/ntfs/file.c, which the port never ported (its fallocate is
+  `ntfs_attr_fallocate`, with no insert-range path) — so the leak
+  is unreachable here, and the error path needs
+  `map_whole_runlist` to fail on internal runlist state tests
+  cannot construct. Ported for upstream fidelity, same "no new
+  test, port note explains why" precedent as 71feaa7686fb.
+  Evidence (this commit): plain ctest 15/15 (115 s), UBSan ctest
+  15/15 (115 s), ASan ctest 15/15 (123 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (430 s).
+  10 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
