@@ -162,7 +162,9 @@ static int item_type_of(struct inode *vi)
 
 /*
  * noowners semantics (docs/PORTING.md §6): uid/gid are the mount's, the
- * permission bits come from the masks and the READONLY attribute.
+ * permission bits come from the masks and the READONLY attribute -- unless
+ * the file carries a per-file $LXMOD mode (upstream 4d730a4dd78c), which
+ * takes precedence over the mount masks. A symlink is always 0777.
  */
 static uint32_t mode_of(struct inode *vi)
 {
@@ -171,10 +173,12 @@ static uint32_t mode_of(struct inode *vi)
 	umode_t type = vi->i_mode & S_IFMT;
 	unsigned int perm;
 
-	if (S_ISDIR(vi->i_mode))
-		perm = 0777 & ~vol->dmask;
-	else if (S_ISLNK(vi->i_mode))
+	if (S_ISLNK(vi->i_mode))
 		perm = 0777;
+	else if (NInoHasLXMOD(ni))
+		perm = vi->i_mode & 07777;
+	else if (S_ISDIR(vi->i_mode))
+		perm = 0777 & ~vol->dmask;
 	else
 		perm = 0777 & ~vol->fmask;
 	/* Windows ignores READONLY on directories. */

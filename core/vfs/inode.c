@@ -656,6 +656,7 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	unsigned int name_len = 4, flags = 0;
 	int extend_sys = 0;
 	dev_t dev = 0;
+	bool has_lxmod = false;
 	bool vol_err = true;
 
 	ntfs_debug("Entering for i_ino 0x%llx.", ni->mft_no);
@@ -830,7 +831,17 @@ skip_attr_list_load:
 	err = ntfs_attr_lookup(AT_EA_INFORMATION, NULL, 0, 0, 0, NULL, 0, ctx);
 	if (!err) {
 		NInoSetHasEA(ni);
-		ntfs_ea_get_wsl_inode(vi, &dev, flags);
+		ntfs_ea_get_wsl_inode(vi, &dev, flags, &has_lxmod);
+		/*
+		 * PORT (upstream 4d730a4dd78c): remember whether a
+		 * per-file $LXMOD mode exists, for mode_of() and the
+		 * mask sites below. Set AND clear: the inode may be
+		 * re-loaded after the EA was removed.
+		 */
+		if (has_lxmod)
+			NInoSetHasLXMOD(ni);
+		else
+			NInoClearHasLXMOD(ni);
 	}
 
 	/*
@@ -875,7 +886,12 @@ skip_attr_list_load:
 			 * turned it into a junction; the type bits are ours to
 			 * decide, so clear them before setting the link type. */
 			vi->i_mode = (vi->i_mode & ~S_IFMT) | S_IFLNK;
-			vi->i_mode &= ~vol->fmask;
+			/*
+			 * PORT (upstream 4d730a4dd78c): a per-file $LXMOD
+			 * mode takes precedence over the mount mask.
+			 */
+			if (!has_lxmod)
+				vi->i_mode &= ~vol->fmask;
 			/*
 			 * PORT: migrate a pre-e6b3418 symlink off $EA
 			 * (docs/GAPS.md §2.5). Before e6b3418 every link was
@@ -888,9 +904,13 @@ skip_attr_list_load:
 			ntfs_migrate_symlink_ea(vi);
 		} else if (dir_record) {
 			vi->i_mode |= S_IFDIR;
-			/* Apply the directory permissions mask set in the mount
-			 * options. */
-			vi->i_mode &= ~vol->dmask;
+			/*
+			 * Apply the directory permissions mask set in the
+			 * mount options when no per-file WSL mode is
+			 * present (upstream 4d730a4dd78c).
+			 */
+			if (!has_lxmod)
+				vi->i_mode &= ~vol->dmask;
 			/* Things break without this kludge! */
 			if (vi->i_nlink > 1)
 				set_nlink(vi, 1);
@@ -899,9 +919,10 @@ skip_attr_list_load:
 				vi->i_mode |= lmode;	/* fifo, socket, device */
 			else
 				vi->i_mode |= S_IFREG;
-			/* Apply the file permissions mask set in the mount
-			 * options. */
-			vi->i_mode &= ~vol->fmask;
+			/* Apply the file permissions mask when no WSL mode
+			 * is present (upstream 4d730a4dd78c). */
+			if (!has_lxmod)
+				vi->i_mode &= ~vol->fmask;
 		}
 	}
 

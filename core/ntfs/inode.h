@@ -192,6 +192,7 @@ struct ntfs_inode {
  * NI_BeingDeleted		ntfs inode is being delated.
  * NI_BeingCreated		ntfs inode is being created.
  * NI_HasEA			ntfs inode has EA attribute.
+ * NI_HasLXMOD			ntfs inode has a $LXMOD EA (per-file mode).
  * NI_RunlistDirty		runlist need to be updated.
  */
 enum {
@@ -212,6 +213,7 @@ enum {
 	NI_BeingDeleted,
 	NI_BeingCreated,
 	NI_HasEA,
+	NI_HasLXMOD,
 	NI_DirRecord,		/* MFT_RECORD_IS_DIRECTORY, whatever i_mode says */
 	NI_RunlistDirty,
 };
@@ -272,6 +274,7 @@ NINO_FNS(FileNameDirty)
 TAS_NINO_FNS(FileNameDirty)
 NINO_FNS(BeingDeleted)
 NINO_FNS(HasEA)
+NINO_FNS(HasLXMOD)
 NINO_FNS(DirRecord)
 NINO_FNS(RunlistDirty)
 

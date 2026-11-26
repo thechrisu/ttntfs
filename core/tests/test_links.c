@@ -1886,16 +1886,16 @@ static void test_permissions(void)
 		return;
 	}
 
-	/* The mode passed to ntfs_create is NOT what comes back: 0777 & ~fmask
-	 * is. Asking for 0600 and being given 0755 is the contract, odd as it
-	 * looks, and the caller must not be able to talk the driver into
-	 * storing per-file permissions it cannot honour later. */
+	/* Upstream 4d730a4dd78c: the mode passed to ntfs_create IS what
+	 * comes back now -- it is stored in $LXMOD at create time and
+	 * takes precedence over the mount masks on load. Asking for
+	 * 0600 and being given 0600 is the contract. */
 	CHECK(ntfs_create(v.root, "f.bin", 0100600, &f) == 0);
 	if (f) {
 		CHECK(ntfs_getattr(f, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == (0777 & ~022),
-			  "file mode is %o, expected %o (0777 & ~fmask 022)",
-			  at.mode & 07777, 0777 & ~022);
+		CHECK_MSG((at.mode & 07777) == 0600,
+			  "file mode is %o, expected 0600 (stored $LXMOD)",
+			  at.mode & 07777);
 		CHECK((at.mode & S_IFMT) == S_IFREG);
 		CHECK_MSG(at.uid == 501 && at.gid == 20,
 			  "uid/gid are %u/%u, expected the mount's 501/20", at.uid, at.gid);
@@ -1903,9 +1903,9 @@ static void test_permissions(void)
 	CHECK(ntfs_mkdir(v.root, "d", 0700, &d) == 0);
 	if (d) {
 		CHECK(ntfs_getattr(d, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == (0777 & ~022),
-			  "dir mode is %o, expected %o (0777 & ~dmask 022)",
-			  at.mode & 07777, 0777 & ~022);
+		CHECK_MSG((at.mode & 07777) == 0700,
+			  "dir mode is %o, expected 0700 (stored $LXMOD)",
+			  at.mode & 07777);
 		CHECK((at.mode & S_IFMT) == S_IFDIR);
 	}
 	/* A symlink is always 0777: neither mask applies, because the mode of a
@@ -1918,18 +1918,18 @@ static void test_permissions(void)
 	}
 
 	/*
-	 * setattr(MODE) does not store a mode either. The only thing it can
-	 * express on NTFS is the READONLY file attribute, taken from the write
-	 * bits; the mode then comes back through the mask again, so clearing
-	 * write on a volume mounted fmask=022 gives 0555, not 0400.
+	 * Upstream 4d730a4dd78c: setattr(MODE) stores the mode in
+	 * $LXMOD, so chmod 0400 gives 0400 (not 0555) and chmod 0644
+	 * gives 0644 (not 0755). The READONLY file attribute still
+	 * follows the write bits.
 	 */
 	if (f) {
 		memset(&set, 0, sizeof(set));
 		set.mode = 0100400;
 		CHECK(ntfs_setattr(f, &set, NTFS_SETATTR_MODE) == 0);
 		CHECK(ntfs_getattr(f, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == 0555,
-			  "after chmod 0400 the mode is %o, expected 0555", at.mode & 07777);
+		CHECK_MSG((at.mode & 07777) == 0400,
+			  "after chmod 0400 the mode is %o, expected 0400", at.mode & 07777);
 		CHECK_MSG(at.file_attributes & 0x1,
 			  "chmod 0400 did not set the NTFS READONLY attribute (attrs %08x)",
 			  at.file_attributes);
@@ -1938,8 +1938,8 @@ static void test_permissions(void)
 		set.mode = 0100644;
 		CHECK(ntfs_setattr(f, &set, NTFS_SETATTR_MODE) == 0);
 		CHECK(ntfs_getattr(f, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == 0755,
-			  "after chmod 0644 the mode is %o, expected 0755", at.mode & 07777);
+		CHECK_MSG((at.mode & 07777) == 0644,
+			  "after chmod 0644 the mode is %o, expected 0644", at.mode & 07777);
 		CHECK_MSG(!(at.file_attributes & 0x1),
 			  "chmod 0644 did not clear READONLY (attrs %08x)", at.file_attributes);
 
@@ -1959,9 +1959,11 @@ static void test_permissions(void)
 	vol_down(&v);
 
 	/*
-	 * Remount with different masks. The same files must report different
-	 * modes: this is what proves the mode comes from the mount options and
-	 * not from something that was stored at create time.
+	 * Remount with different masks. The stored $LXMOD modes must
+	 * NOT change: this is what proves the mode comes from the
+	 * per-file $LXMOD and not from the mount options. The root
+	 * directory carries no $LXMOD (mkntfs made it), so it is the
+	 * control: it still follows the mask.
 	 */
 	if (vol_up(&v, 077, 027, 0, 0)) {
 		fprintf(stderr, "FAIL test_permissions: remount failed\n");
@@ -1969,11 +1971,15 @@ static void test_permissions(void)
 		unlink(scratch);
 		return;
 	}
+	CHECK(ntfs_getattr(v.root, &at) == 0);
+	CHECK_MSG((at.mode & 07777) == (0777 & ~027),
+		  "root without $LXMOD is %o under dmask 027, expected %o",
+		  at.mode & 07777, 0777 & ~027);
 	if (ntfs_lookup(v.root, "f.bin", &f) == 0) {
 		CHECK(ntfs_getattr(f, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == (0777 & ~077),
-			  "under fmask 077 the file mode is %o, expected %o",
-			  at.mode & 07777, 0777 & ~077);
+		CHECK_MSG((at.mode & 07777) == 0644,
+			  "under fmask 077 the file mode is %o, expected 0644 (stored $LXMOD)",
+			  at.mode & 07777);
 		CHECK_MSG(at.uid == 0 && at.gid == 0,
 			  "under uid=0,gid=0 the file reports %u/%u", at.uid, at.gid);
 		ntfs_inode_put(f);
@@ -1983,9 +1989,9 @@ static void test_permissions(void)
 	}
 	if (ntfs_lookup(v.root, "d", &d) == 0) {
 		CHECK(ntfs_getattr(d, &at) == 0);
-		CHECK_MSG((at.mode & 07777) == (0777 & ~027),
-			  "under dmask 027 the dir mode is %o, expected %o",
-			  at.mode & 07777, 0777 & ~027);
+		CHECK_MSG((at.mode & 07777) == 0700,
+			  "under dmask 027 the dir mode is %o, expected 0700 (stored $LXMOD)",
+			  at.mode & 07777);
 		ntfs_inode_put(d);
 		d = NULL;
 	} else {

@@ -276,9 +276,11 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	 * such a record as S_IFLNK, so what we write here we can read back.
 	 */
 	if (S_ISDIR(mode) || dir_link) {
-		if (S_ISDIR(mode))
-			mode &= ~vol->dmask;
-
+		/*
+		 * Upstream 4d730a4dd78c: do not mask the mode at
+		 * create -- it is stored in $LXMOD below and takes
+		 * precedence over the mount masks on load.
+		 */
 		NInoSetMstProtected(ni);
 		ni->itype.index.block_size = 4096;
 		ni->itype.index.block_size_bits = ntfs_ffs(4096) - 1;
@@ -292,9 +294,8 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			ni->itype.index.vcn_size_bits =
 				vol->sector_size_bits;
 		}
-	} else {
-		mode &= ~vol->fmask;
 	}
+	/* Upstream 4d730a4dd78c: no fmask here either (see above). */
 
 	if (IS_RDONLY(vi))
 		mode &= ~0222;

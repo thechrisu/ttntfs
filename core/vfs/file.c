@@ -345,14 +345,18 @@ int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr)
 		if (ia_valid & ATTR_MODE)
 			flags |= NTFS_EA_MODE;
 
-		if (S_ISDIR(vi->i_mode))
-			vi->i_mode &= ~vol->dmask;
-		else
-			vi->i_mode &= ~vol->fmask;
-
+		/*
+		 * Upstream 4d730a4dd78c: do not remask the in-memory
+		 * mode after setattr persists it -- the per-file
+		 * $LXMOD mode takes precedence over the mount masks.
+		 * The mode is stored by ntfs_ea_set_wsl_inode(),
+		 * which also records HasLXMOD for mode_of().
+		 */
 		mutex_lock(&ni->mrec_lock);
-		ntfs_ea_set_wsl_inode(vi, 0, NULL, flags);
+		err = ntfs_ea_set_wsl_inode(vi, 0, NULL, flags);
 		mutex_unlock(&ni->mrec_lock);
+		if (err)
+			goto out;
 	}
 
 	if (ia_valid & (ATTR_SIZE | ATTR_MTIME | ATTR_CTIME | ATTR_ATIME))

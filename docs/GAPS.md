@@ -1309,7 +1309,42 @@ Porting progress (one commit per item, in the order above):
   and a mirror-mismatch mount fails with `-EROFS` (verified
   empirically with a python patcher that flips one byte in the
   mirror's copy of record 1; patcher deleted).
+  Evidence (this commit): plain ctest 15/15, UBSan ctest 15/15,
+  ASan ctest PASS (123 s), `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (385 s).
   14 port items remain.
+
+- 2026-11-26: `4d730a4dd78c` (respect per-file chmod mode over
+  mount masks) — ported, upstream's five hunks plus the
+  port-necessary `mode_of()` half: `ntfs_ea_get_wsl_inode()` takes
+  a `bool *has_lxmod` out-param and loads $LXUID/$LXGID
+  best-effort (a missing optional EA no longer returns -EIO before
+  $LXMOD is read); `ntfs_read_locked_inode()` applies dmask/fmask
+  only when `!has_lxmod` (all three sites incl. the port's symlink
+  branch); `ntfs_setattr()` no longer remasks in memory after
+  persisting and propagates `ntfs_ea_set_wsl_inode()` errors;
+  `__ntfs_create()` no longer masks at create. PORT-EXTRA: the
+  mode users see comes from `mode_of()` in core/vfs/api.c, which
+  computed perm from the masks unconditionally — it now returns
+  `vi->i_mode & 07777` when the inode carries $LXMOD. That needs
+  the flag to survive on the inode, so `NI_HasLXMOD` was added
+  (core/ntfs/inode.h): set at load from `has_lxmod`, set in
+  `ntfs_ea_set_wsl_inode()` on a successful $LXMOD store (covers
+  create/setattr/xattr-set), cleared in `ntfs_set_ea()` when
+  $LXMOD is removed and in `ntfs_migrate_symlink_ea()` ($EA
+  stripped entirely). Symlinks keep the unconditional 0777 in
+  `mode_of()`. Discriminating test: `test_permissions()` in
+  core/tests/test_links.c — the old contract (create 0600 -> 0755,
+  chmod 0644 -> 0755, chmod 0400 -> 0555, remount under new masks
+  changes modes) is replaced by the new one (0600/0700/0400/0644
+  preserved, remount under fmask 077/dmask 027 leaves them
+  unchanged, root without $LXMOD still follows the mask at 0750).
+  Verified: 6 failures with the fix against the old expectations,
+  0 failures with the new ones; the new expectations fail on the
+  old code at the same six points (measured values, no revert
+  round-trip — the 0e4c83990541 lesson: verify the fix is present
+  before the ladder, and the dry-run file list before pushing).
+  13 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

@@ -465,6 +465,15 @@ out:
 			NInoSetHasEA(ni);
 		else
 			NInoClearHasEA(ni);
+		/*
+		 * PORT (upstream 4d730a4dd78c): a removed $LXMOD means
+		 * the per-file mode no longer exists, so mode_of()
+		 * must fall back to the mount masks.
+		 */
+		if ((flags & XATTR_REPLACE) && !val_size &&
+		    name_len == sizeof("$LXMOD") - 1 &&
+		    !memcmp(name, "$LXMOD", sizeof("$LXMOD") - 1))
+			NInoClearHasLXMOD(ni);
 	}
 
 	kvfree(ea_buf);
@@ -498,37 +507,42 @@ int ntfs_ea_pair_exists_vfs(struct inode *vi)
  * Check for the presence of an EA "$LXDEV" (used by WSL)
  * and return its value as a device address
  */
-int ntfs_ea_get_wsl_inode(struct inode *inode, dev_t *rdevp, unsigned int flags)
+int ntfs_ea_get_wsl_inode(struct inode *inode, dev_t *rdevp, unsigned int flags,
+			  bool *has_lxmod)
 {
 	int err;
 	__le32 v;
+
+	/* Upstream 4d730a4dd78c: record whether $LXMOD was found. */
+	*has_lxmod = false;
 
 	if (!(flags & NTFS_VOL_UID)) {
 		/* Load uid to lxuid EA */
 		err = ntfs_get_ea(inode, "$LXUID", sizeof("$LXUID") - 1, &v,
 				sizeof(v));
-		if (err < 0)
-			return err;
-		if (err != sizeof(v))
-			return -EIO;
-		i_uid_write(inode, le32_to_cpu(v));
+		/*
+		 * Upstream 4d730a4dd78c: continue loading even when an
+		 * optional $LXUID is missing -- chmod may create only
+		 * $LXMOD. The old code returned the error (or -EIO on a
+		 * short read) and never reached $LXMOD.
+		 */
+		if (err == sizeof(v))
+			i_uid_write(inode, le32_to_cpu(v));
 	}
 
 	if (!(flags & NTFS_VOL_GID)) {
 		/* Load gid to lxgid EA */
 		err = ntfs_get_ea(inode, "$LXGID", sizeof("$LXGID") - 1, &v,
 				sizeof(v));
-		if (err < 0)
-			return err;
-		if (err != sizeof(v))
-			return -EIO;
-		i_gid_write(inode, le32_to_cpu(v));
+		if (err == sizeof(v))
+			i_gid_write(inode, le32_to_cpu(v));
 	}
 
 	/* Load mode to lxmod EA */
 	err = ntfs_get_ea(inode, "$LXMOD", sizeof("$LXMOD") - 1, &v, sizeof(v));
 	if (err == sizeof(v)) {
 		inode->i_mode = le32_to_cpu(v);
+		*has_lxmod = true;
 	} else {
 		/* Everyone gets all permissions. */
 		inode->i_mode |= 0777;
@@ -577,6 +591,14 @@ int ntfs_ea_set_wsl_inode(struct inode *inode, dev_t rdev, __le16 *ea_size,
 				sizeof(v), 0, ea_size);
 		if (err)
 			return err;
+		/*
+		 * PORT (upstream 4d730a4dd78c): the per-file mode now
+		 * exists on disk, so mode_of() must report it instead
+		 * of the mount masks. Set here rather than at each
+		 * caller: create, setattr and the WSL xattr set path
+		 * all store $LXMOD through this function.
+		 */
+		NInoSetHasLXMOD(NTFS_I(inode));
 	}
 
 	if (rdev) {
@@ -645,6 +667,9 @@ void ntfs_migrate_symlink_ea(struct inode *vi)
 		}
 	}
 	NInoClearHasEA(ni);
+	/* PORT (upstream 4d730a4dd78c): $EA is gone entirely, so $LXMOD
+	 * is gone with it; mode_of() must fall back to the masks. */
+	NInoClearHasLXMOD(ni);
 	/* A later writeback re-syncs the index too if the direct sync below
 	 * fails partway (e.g. the parent is gone). */
 	NInoSetFileNameDirty(ni);
