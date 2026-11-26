@@ -1049,6 +1049,25 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   28 port items remain.
 
+- 2026-11-26: `8c5dc7587fdd` (ignore interrupted inode reads as
+  corruption) — ported: all five sites now skip the corruption
+  log and/or the volume-error flag for -EINTR / -ERESTARTSYS --
+  map_mft_record() (core/ntfs/mft.c), the err_out paths of
+  ntfs_read_locked_inode(), ntfs_read_locked_attr_inode() and
+  ntfs_read_locked_index_inode(), and the $BITMAP iget failure
+  in ntfs_read_locked_index_inode() (core/vfs/inode.c; the err
+  assignment moves above the log there so the guard can test
+  it). NOTE: neither error can reach these sites in the port --
+  the bdev layer retries EINTR (platform/src/bdev_file.c), the
+  port has no task/signal model (signal_pending() is #defined
+  0), and nothing produces -ERESTARTSYS -- so no discriminating
+  test is possible and the change is provably
+  behavior-preserving here; applied verbatim for upstream
+  fidelity. Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  27 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
