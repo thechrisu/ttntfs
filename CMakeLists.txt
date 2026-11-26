@@ -237,6 +237,7 @@ if(NTFS_BUILD_TESTS)
   target_link_libraries(test_links ntfscore ntfsplatform)
   target_include_directories(test_links PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/logfile
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   add_test(NAME links COMMAND test_links)
   set_tests_properties(links PROPERTIES

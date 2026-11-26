@@ -560,6 +560,26 @@ Porting progress (one commit per item, in the order above):
   edit instead, and the file was verified byte-identical to its
   pre-control state afterwards.
   47 port items remain.
+- 2026-11-26: `81684340963d` (validate usa_ofs before preserving the
+  update sequence number) — ported: upstream hunk verbatim in
+  `ntfs_mft_record_alloc()` (`core/ntfs/mft.c`): the old USN is only
+  preserved when usa_ofs is even and usa_ofs+2 <= mft_record_size,
+  otherwise usn stays 0. New test
+  `test_mft_alloc_usa_ofs_validated` in `core/tests/test_links.c`:
+  create A/C/D (records R/R+1/R+2, R discovered via getattr — 295 on
+  basic-4k.img), delete C, unmount, patch C's usa_ofs to 1024,
+  remount, create B reusing C's record; the reused record's USN must
+  be a fresh small value. C's record is page-aligned (R+1 is a
+  multiple of 4), so the unguarded read lands deterministically on
+  the first two bytes of D's record, "FI" = 0x4946. Evidence:
+  test_links 471 checks 0 failures with the fix; without it exactly
+  1 failure, USN reads back 0x4948 (0x4946 + 2 fixup increments).
+  A non-page-aligned target instead reads past the mapped folio
+  (heap garbage 0x5382 observed on the first attempt) — the same bug,
+  but nondeterministic, which is why the test asserts the target is
+  page-aligned. Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  46 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

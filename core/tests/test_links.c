@@ -41,6 +41,7 @@
 
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
+#include "ntfs_image.h"
 /*
  * The conversion itself, so the known values below are checked directly and
  * not only through a mount. Included by relative path on purpose: core/ntfs is
@@ -2185,6 +2186,175 @@ static void test_symlink_ea_migration(void)
 	unlink(scratch);
 }
 
+/* ---- 15. MFT record reuse validates usa_ofs (upstream 81684340963d) --- */
+
+/*
+ * When ntfs_mft_record_alloc() reuses a free MFT record it reads the old
+ * update sequence number straight from the on-disk record:
+ * usn = *(__le16 *)((u8 *)m + le16_to_cpu(m->usa_ofs)). The folio still
+ * holds unvalidated, MST-protected bytes there, so a corrupted usa_ofs
+ * reads outside the record (KASAN use-after-free on a real volume).
+ *
+ * Deterministic trigger: mount sets vol->mft_data_pos = 24, so after a
+ * remount the allocator reuses the lowest free record >= 24. Create A
+ * (record R, discovered via getattr -- 295 on basic-4k.img, whose $MFT
+ * bitmap already has records 24..294 in use), C (record R+1) and D
+ * (record R+2, a live "FILE" record), delete C, unmount, patch C's
+ * usa_ofs to mft_record_size (1024). R+1 is a multiple of 4, so its
+ * record starts a 4 KiB page and the unguarded read at m+1024 lands on
+ * the first two bytes of record R+2 -- "FI" = 0x4946 -- deterministically
+ * (a non-page-aligned target would read past the mapped folio instead,
+ * which is the same bug but with a heap-garbage value). Remount, create
+ * B: it reuses record R+1. Without the fix the preserved usn 0x4946 is
+ * restored into B's record (and then incremented by each
+ * pre_write_mst_fixup, so it reads back as 0x4948); with the fix usn is
+ * left 0 and the record keeps a fresh small USN (layout sets 1, each
+ * fixup increments it: 3 in this flow). The remount between patch and
+ * create matters: the allocator reads through the page cache, so
+ * patching while mounted would be invisible.
+ */
+static uint16_t le16_at(const uint8_t *p)
+{
+	uint16_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return le16_to_cpu(v);
+}
+
+static void test_mft_alloc_usa_ofs_validated(void)
+{
+	struct vol v;
+	ntfs_inode_t *a = NULL, *c = NULL, *d = NULL, *b = NULL;
+	struct ntfs_attr attr;
+	struct ntfs_image img;
+	uint64_t rec_no = 0, target = 0, rec_off;
+	uint8_t rec[512];
+	uint16_t usa_ofs, usn, patch;
+	int fd;
+
+	printf("test_mft_alloc_usa_ofs_validated\n");
+	if (copy_fixture("usaofs") != 0) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_create(v.root, "a.txt", 0100644, &a) == 0);
+	if (a) {
+		CHECK(ntfs_getattr(a, &attr) == 0);
+		rec_no = attr.inode_no;
+		ntfs_inode_put(a);
+		a = NULL;
+	}
+	CHECK(ntfs_create(v.root, "c.txt", 0100644, &c) == 0);
+	if (c) {
+		CHECK(ntfs_getattr(c, &attr) == 0);
+		CHECK(attr.inode_no == rec_no + 1);
+		target = attr.inode_no;
+		/* The target must start a page, or the unguarded read lands
+		 * past the mapped folio instead of on the next record. */
+		CHECK(target % 4 == 0);
+		ntfs_inode_put(c);
+		c = NULL;
+	}
+	CHECK(ntfs_create(v.root, "d.txt", 0100644, &d) == 0);
+	if (d) {
+		CHECK(ntfs_getattr(d, &attr) == 0);
+		/* D must be the very next record: its first two bytes ("FI")
+		 * are what the unguarded read lands on. */
+		CHECK(attr.inode_no == rec_no + 2);
+		ntfs_inode_put(d);
+		d = NULL;
+	}
+	CHECK(ntfs_unlink(v.root, "c.txt") == 0);
+	vol_down(&v);
+
+	/* Patch the target record's usa_ofs (u16 at record offset 4). */
+	if (ntfs_image_open(&img, scratch, true, 0, 0) != 0) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: cannot open image\n");
+		unlink(scratch);
+		return;
+	}
+	rec_off = ntfs_image_map(img.mft_runs, img.n_mft_runs, img.cluster_size,
+				 target * img.mft_record_size);
+	if (rec_off == UINT64_MAX) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: cannot map record %llu\n",
+			(unsigned long long)target);
+		ntfs_image_close(&img);
+		unlink(scratch);
+		return;
+	}
+	patch = cpu_to_le16((uint16_t)img.mft_record_size);
+	fd = open(scratch, O_RDWR);
+	if (fd < 0 || pwrite(fd, &patch, sizeof(patch), (off_t)(rec_off + 4)) != (ssize_t)sizeof(patch)) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: cannot patch image\n");
+		if (fd >= 0)
+			close(fd);
+		ntfs_image_close(&img);
+		unlink(scratch);
+		return;
+	}
+	close(fd);
+	ntfs_image_close(&img);
+
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_create(v.root, "b.txt", 0100644, &b) == 0);
+	if (b) {
+		CHECK(ntfs_getattr(b, &attr) == 0);
+		CHECK(attr.inode_no == target);
+		ntfs_inode_put(b);
+		b = NULL;
+	}
+	vol_down(&v);
+
+	/* Read the target record back from the image. */
+	if (ntfs_image_open(&img, scratch, false, 0, 0) != 0) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: cannot reopen image\n");
+		unlink(scratch);
+		return;
+	}
+	rec_off = ntfs_image_map(img.mft_runs, img.n_mft_runs, img.cluster_size,
+				 target * img.mft_record_size);
+	fd = open(scratch, O_RDONLY);
+	if (fd < 0 || pread(fd, rec, sizeof(rec), (off_t)rec_off) != (ssize_t)sizeof(rec)) {
+		fprintf(stderr, "SKIP test_mft_alloc_usa_ofs_validated: cannot read record %llu\n",
+			(unsigned long long)target);
+		if (fd >= 0)
+			close(fd);
+		ntfs_image_close(&img);
+		unlink(scratch);
+		return;
+	}
+	close(fd);
+	ntfs_image_close(&img);
+	usa_ofs = le16_at(rec + 4);
+	CHECK(usa_ofs != 0);
+	CHECK(usa_ofs < sizeof(rec));
+	if (usa_ofs >= sizeof(rec)) {
+		unlink(scratch);
+		return;
+	}
+	usn = le16_at(rec + usa_ofs);
+	/* Fresh sequence number, not the neighbour's bytes: layout sets 1
+	 * and each pre_write_mst_fixup() cyclically increments it (3 in
+	 * this flow: layout, the alloc write, one more flush). The
+	 * unguarded read would have restored 0x4946 ("FI") and the same
+	 * increments would leave 0x4948 -- far above any genuine count
+	 * for a record written a handful of times. */
+	CHECK(usn >= 1 && usn < 0x100);
+	if (!(usn >= 1 && usn < 0x100))
+		fprintf(stderr, "FAIL usa_ofs test: reused record USN 0x%04x, expected a fresh small value\n", usn);
+	fsck_clean("usaofs");
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -2201,6 +2371,7 @@ int main(void)
 	test_time_conversion();
 	test_timestamps();
 	test_permissions();
+	test_mft_alloc_usa_ofs_validated();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
