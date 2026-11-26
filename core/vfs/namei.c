@@ -1288,7 +1288,16 @@ int ntfs_vfs_unlink(struct inode *dir, const char *name, int len, bool rmdir)
 		err = -EISDIR;
 		goto out;
 	}
-	if (NVolSysImmutable(vol) && (vi->i_flags & S_IMMUTABLE)) {
+	/*
+	 * PORT-EXTRA: the upstream VFS refuses to unlink an immutable
+	 * inode unconditionally; this port has no such VFS, so the flag
+	 * itself is the gate. The old NVolSysImmutable() condition is
+	 * dropped: nothing in the port ever passes the sys_immutable
+	 * option, so the gate made this check (and the flag-setting in
+	 * ntfs_read_locked_inode) dead code, and system files stayed
+	 * deletable by default.
+	 */
+	if (vi->i_flags & S_IMMUTABLE) {
 		err = -EPERM;
 		goto out;
 	}
@@ -1386,6 +1395,16 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	struct ntfs_inode *old_dir_ni = NTFS_I(old_dir), *new_dir_ni = NTFS_I(new_dir);
 
 	old_ni = NTFS_I(old_inode);
+
+	/*
+	 * PORT-EXTRA: same reasoning as ntfs_vfs_unlink() above — the
+	 * upstream VFS refuses to rename an immutable inode (or rename
+	 * over one) and this port has no such VFS. Checked before any
+	 * lock is taken, so a plain return is safe here.
+	 */
+	if (IS_IMMUTABLE(old_inode) ||
+	    (new_inode && IS_IMMUTABLE(new_inode)))
+		return -EPERM;
 
 	mutex_lock_nested(&old_ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	mutex_lock_nested(&old_dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);

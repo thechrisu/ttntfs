@@ -570,6 +570,133 @@ static void test_windows_illegal_allowed(void)
 	printf("test_windows_illegal_allowed\n");
 }
 
+/* ---- 2b. system files are immutable, whatever the mount ------------ */
+
+/*
+ * Upstream f72df3a4c33b ("ntfs: make system files immutable to prevent
+ * corruption"): $Bitmap, $MFT and friends are maintained by the driver
+ * itself, so they are immutable regardless of the sys_immutable mount
+ * option — the old code only set the flag when that option was given.
+ * In the kernel the VFS enforces the flag; this port has no such VFS,
+ * so the public entry points enforce it themselves (PORT-EXTRA in
+ * core/vfs/api.c and core/vfs/namei.c), and the delete gate no longer
+ * requires the sys_immutable option, which nothing in the port ever
+ * passes. Directories are exempt (the root and $Extend stay usable),
+ * and so is every user file: only mft_no < FILE_first_user regular
+ * files carry the flag.
+ *
+ * The negative control is the flag block alone: revert just the two
+ * added lines in ntfs_read_locked_inode() and every -EPERM below
+ * becomes a success (the write lands, the unlink deletes), because
+ * the enforcement keys off the flag.
+ */
+static void test_system_files_immutable(void)
+{
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *bitmap, *mft, *plain;
+	char before[32], after[32];
+	struct ntfs_attr at = { .mode = 0600 };
+	ssize_t n;
+	int failures_before;
+
+	if (copy_fixture("names.img", "sysimm") != 0) {
+		fprintf(stderr, "SKIP test_system_files_immutable: no fixture\n");
+		return;
+	}
+	if (mount_scratch(NTFS_MOUNT_SHOW_SYSTEM, &vol, &root)) {
+		fprintf(stderr, "FAIL: could not mount for system-file test\n");
+		failures++; checks++;
+		unlink(scratch);
+		return;
+	}
+
+	/* Positive controls first: an ordinary file is fully mutable. */
+	CHECK_RC(ntfs_create(root, "plain.txt", 0100644, &plain), 0,
+		 "create plain.txt");
+	if (plain) {
+		CHECK(ntfs_write(plain, "hello", 5, 0) == 5);
+		CHECK_RC(ntfs_truncate(plain, 2), 0, "truncate plain.txt");
+		CHECK_RC(ntfs_fallocate(plain, 0, 4096, false), 0,
+			 "fallocate plain.txt");
+		CHECK_RC(ntfs_setattr(plain, &at, NTFS_SETATTR_MODE), 0,
+			 "chmod plain.txt");
+		CHECK_RC(ntfs_setxattr(plain, "user.test", "x", 1, 0), 0,
+			 "setxattr plain.txt");
+		ntfs_inode_put(plain);
+	}
+
+	/* Both system files are reachable by name and readable. */
+	CHECK_RC(ntfs_lookup(root, "$Bitmap", &bitmap), 0, "look up $Bitmap");
+	CHECK_RC(ntfs_lookup(root, "$MFT", &mft), 0, "look up $MFT");
+	if (!bitmap || !mft) {
+		if (bitmap)
+			ntfs_inode_put(bitmap);
+		if (mft)
+			ntfs_inode_put(mft);
+		ntfs_inode_put(root);
+		CHECK(ntfs_unmount(vol) == 0);
+		unlink(scratch);
+		return;
+	}
+	n = ntfs_read(bitmap, before, sizeof(before), 0);
+	CHECK(n == (ssize_t)sizeof(before));
+
+	/*
+	 * Every userspace mutation path refuses them. The unlinks run
+	 * last and only if every refusal above held: on the negative
+	 * control (flag block reverted) the earlier mutations really
+	 * land — the $Bitmap write corrupts the allocation bitmap, the
+	 * truncate frees it — and unlinking $MFT out of that wreckage
+	 * spins the driver forever instead of failing cleanly. A breach
+	 * is already proven by the first failed refusal; nothing after
+	 * it can be trusted, so stop there.
+	 */
+	failures_before = failures;
+	CHECK_RC(ntfs_write(bitmap, "XXXXXXXX", 8, 0), -EPERM,
+		 "write to $Bitmap");
+	CHECK(ntfs_read(bitmap, after, sizeof(after), 0) ==
+			(ssize_t)sizeof(after));
+	CHECK(memcmp(before, after, sizeof(before)) == 0);
+	CHECK_RC(ntfs_write(mft, "XXXXXXXX", 8, 0), -EPERM, "write to $MFT");
+	CHECK_RC(ntfs_truncate(bitmap, 0), -EPERM, "truncate $Bitmap");
+	CHECK_RC(ntfs_fallocate(bitmap, 0, 4096, false), -EPERM,
+		 "fallocate $Bitmap");
+	CHECK_RC(ntfs_setattr(bitmap, &at, NTFS_SETATTR_MODE), -EPERM,
+		 "chmod $Bitmap");
+	CHECK_RC(ntfs_setxattr(bitmap, "user.test", "x", 1, 0), -EPERM,
+		 "setxattr $Bitmap");
+	CHECK_RC(ntfs_removexattr(bitmap, "user.test"), -EPERM,
+		 "removexattr $Bitmap");
+	CHECK_RC(ntfs_rename(root, "$Bitmap", root, "bitmap.bak"), -EPERM,
+		 "rename $Bitmap away");
+	CHECK_RC(ntfs_rename(root, "plain.txt", root, "$Bitmap"), -EPERM,
+		 "rename a user file over $Bitmap");
+	if (failures != failures_before)
+		goto out;
+	/* Unlink last: on the negative control it really deletes. */
+	CHECK_RC(ntfs_unlink(root, "$Bitmap"), -EPERM, "unlink $Bitmap");
+	CHECK_RC(ntfs_unlink(root, "$MFT"), -EPERM, "unlink $MFT");
+
+	/* The refused mutations left nothing behind. */
+	{
+		struct namelist l;
+
+		list_dir(root, &l);
+		CHECK(listed(&l, "$Bitmap"));
+		CHECK(listed(&l, "$MFT"));
+		CHECK(!listed(&l, "bitmap.bak"));
+	}
+out:
+	ntfs_inode_put(bitmap);
+	ntfs_inode_put(mft);
+	ntfs_inode_put(root);
+	CHECK(ntfs_unmount(vol) == 0);
+	if (failures == failures_before)
+		structural_check("test_system_files_immutable");
+	unlink(scratch);
+	printf("test_system_files_immutable\n");
+}
+
 /* ---- 3. case-insensitive, case-preserving --------------------------- */
 
 /*
@@ -1205,6 +1332,7 @@ int main(void)
 {
 	test_windows_illegal_rejected();
 	test_windows_illegal_allowed();
+	test_system_files_immutable();
 	test_case_insensitive_preserving();
 	test_long_and_unicode_names();
 	test_xattr_as_stream();

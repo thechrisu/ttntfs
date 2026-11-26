@@ -277,6 +277,19 @@ int ntfs_setattr(ntfs_inode_t *h, const struct ntfs_attr *attr, uint32_t valid)
 		return -EINVAL;
 	if (IS_RDONLY(vi))
 		return -EROFS;
+	/*
+	 * PORT-EXTRA: the upstream VFS refuses every mutation of an
+	 * immutable inode (inode_change_ok) and this port has no such
+	 * VFS, so the public entry points enforce S_IMMUTABLE
+	 * themselves. Without this the flag upstream f72df3a4c33b sets
+	 * on system files would be unobservable — and the existing
+	 * delete gate was option-gated on sys_immutable, which nothing
+	 * in the port ever passes. Internal maintenance never uses
+	 * these entry points (it writes through ntfs_attr_write and
+	 * the mft code directly), so nothing legitimate is blocked.
+	 */
+	if (IS_IMMUTABLE(vi))
+		return -EPERM;
 	if ((valid & NTFS_SETATTR_SIZE) && S_ISDIR(vi->i_mode))
 		return -EISDIR;
 	/* A symlink has no addressable data stream; see ntfs_write(). Only the
@@ -1372,6 +1385,8 @@ ssize_t ntfs_write(ntfs_inode_t *h, const void *buf, size_t count, uint64_t offs
 		return -EIO;
 	if (IS_RDONLY(vi))
 		return -EROFS;
+	if (IS_IMMUTABLE(vi))	/* PORT-EXTRA: see ntfs_setattr() */
+		return -EPERM;
 	if (NInoEncrypted(ni))
 		return -EOPNOTSUPP;
 	if (!count)
@@ -1401,6 +1416,8 @@ int ntfs_fallocate(ntfs_inode_t *h, uint64_t offset, uint64_t len, bool keep_siz
 
 	if (!h)
 		return -EINVAL;
+	if (IS_IMMUTABLE(vi))	/* PORT-EXTRA: see ntfs_setattr() */
+		return -EPERM;
 	/* No symlink guard here: ntfs_vfs_fallocate() already refuses anything
 	 * that is not S_ISREG with -EINVAL, which covers it. */
 	if (!len)
@@ -1557,6 +1574,8 @@ int ntfs_setxattr(ntfs_inode_t *h, const char *name, const void *buf,
 		return -EINVAL;
 	if (IS_RDONLY(vi))
 		return -EROFS;
+	if (IS_IMMUTABLE(vi))	/* PORT-EXTRA: see ntfs_setattr() */
+		return -EPERM;
 	if (NVolShutdown(vol))
 		return -EIO;
 	ulen = xattr_uname(vol, name, &uname);
@@ -1652,6 +1671,8 @@ int ntfs_removexattr(ntfs_inode_t *h, const char *name)
 		return -EINVAL;
 	if (IS_RDONLY(vi))
 		return -EROFS;
+	if (IS_IMMUTABLE(vi))	/* PORT-EXTRA: see ntfs_setattr() */
+		return -EPERM;
 	if (NVolShutdown(vol))
 		return -EIO;
 	ulen = xattr_uname(vol, name, &uname);

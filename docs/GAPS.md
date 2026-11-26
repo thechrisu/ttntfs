@@ -14,6 +14,17 @@ Status words: `open` (do it), `done` (landed, with the commit),
 Work order is the order below: data-safety first, then features,
 then performance, then integration, then testing/shipping.
 
+End state, set 2026-11-26 by the owner: keep working until this is
+an industry-leading driver that does everything for all Macs
+perfectly and is at its physical limit for how fast and correct it
+can be — every supported Mac, every NTFS feature Paragon/Tuxera
+cover, journal-correct, as fast as the hardware allows. That reopens
+§4.3 (earlier macOS), §4.2-testing (Intel run), §3.1/§3.2
+(performance to the physical limit) and §2.3/§2.4 (re-examine TRIM
+and in-app fsck for any FSKit path) as active work after the port
+queue. §4.1 and §5.1 stay blocked on Apple/signing; the paid signing
+route was declined and is not re-proposed.
+
 ## 1. Data safety — fix first, these can eat data
 
 ### 1.1 Compressed-file creation corrupts files — done (2026-11-25)
@@ -155,14 +166,21 @@ preserved, nothing enforced). Paragon and Tuxera map NTFS ACLs to
 Unix permissions. Decide the mapping first; the v1 stance is recorded
 in `docs/PORTING.md` §6.
 
-### 2.3 No TRIM for SSDs — blocked (no FSKit path)
-There is no FSKit path to issue discards. Not fixable from the driver
-side; record it and move on unless Apple adds one.
+### 2.3 No TRIM for SSDs — open, re-examine (2026-11-26)
+Was blocked: no FSKit path to issue discards. Reopened by the
+owner's industry-leading bar — re-examine whether any FSKit path
+exists now (newer SDKs, `FSDiscard` or equivalent, discard via the
+block device). If genuinely impossible, keep the reason recorded
+here and move on; do not ship a fake TRIM.
 
-### 2.4 No verify / repair in the app — wontfix (stance)
-Deliberate: chkdsk is the tool and the project will not pretend
-otherwise. Journal recovery is the safe subset and it is done. Paragon
-ships Disk Utility verify/repair; this does not, on purpose.
+### 2.4 No verify / repair in the app — open, re-examine (2026-11-26)
+Was wontfix (stance): chkdsk is the tool and the project will not
+pretend otherwise. Reopened by the owner's industry-leading bar —
+Paragon ships Disk Utility verify/repair, so re-examine whether a
+safe subset belongs in the app after all (read-only verify first;
+repair only where the driver can prove the fix). Journal recovery
+is the safe subset and it is done; anything beyond it needs a
+design decision first, not a half-built fsck.
 
 ### 2.5 `$EA` migration for pre-e6b3418 symlinks — done (2026-11-25)
 Symlinks created before commit e6b3418 still carried `$EA`, and chkdsk
@@ -198,17 +216,23 @@ clone) -- the fix commit is `e6b3418`.
 
 ## 3. Performance — the structural gap
 
-### 3.1 Userspace costs what a kernel driver doesn't — open, mitigate only
+### 3.1 Userspace costs what a kernel driver doesn't — open, to the physical limit
 Paragon runs in the kernel. This runs in userspace over FSKit, so
 every metadata op pays an XPC round trip (~0.3–0.6 ms, 10–20× a kernel
-`stat`). A warm inode cache mitigates it; it cannot be eliminated.
-Measure, don't guess: benchmark metadata ops against Apple's exFAT
-and record the numbers per release.
+`stat`). The bar is now the physical limit, not "mitigate only":
+measure every metadata op against Apple's exFAT and Paragon's
+published figures where reachable, then squeeze what FSKit allows
+(warm inode cache, batching, fewer round trips per op) and record
+the measured numbers per release. Every perf claim needs measured
+numbers in the commit message, not assertions.
 
-### 3.2 Random 4 KiB writes miss the bar — open
+### 3.2 Random 4 KiB writes miss the bar — open, to the physical limit
 Phase 5 bar is "within 2× of Apple's exFAT"; random 4 KiB writes still
 miss it. Attributed to the macOS buffer cache rather than the driver —
-prove that attribution with a benchmark before changing code.
+prove that attribution with a benchmark before changing code, then
+close the gap as far as the hardware allows (write coalescing,
+alignment, fewer syncs per write). Same rule as §3.1: measured
+numbers in the commit message, not assertions.
 
 ## 4. macOS integration
 
@@ -245,12 +269,21 @@ x86_64-apple-darwin.
 
 Still open: nothing has ever *run* on Intel hardware — the universal
 build is verified by compilation and `lipo` on the arm64 runner only.
-A first run on a real Intel Mac (or a Rosetta-less x86_64 VM) is the
-remaining check; no Intel hardware is available here.
+Reopened as active work by the owner's industry-leading bar (2026-11-26):
+get the universal build actually tested on Intel — a GitHub Actions
+Intel runner if one is available, otherwise record exactly what is
+needed (real Intel Mac, or a Rosetta-less x86_64 VM) and why it is
+blocked. No Intel hardware is available on this VM.
 
-### 4.3 macOS 26 only — wontfix unless demand appears
-Deployment target is 26.0, one FSKit API generation. 15.4+ support
-only if demand appears.
+### 4.3 macOS 26 only — open (2026-11-26)
+Was wontfix unless demand appears; reopened by the owner's
+industry-leading bar ("everything for all Macs"). Extend support to
+earlier macOS versions as far as FSKit allows, and record exactly
+where the floor is and why: FSKit arrived in macOS 15.4, so the
+floor is somewhere in 15.4–26 depending on which FSKit APIs the
+driver needs. Deployment target is 26.0 today, one FSKit API
+generation; every API the driver uses needs a per-version
+availability check before the target can move down.
 
 ### 4.4 Enabling the extension is fragile — open, partly Apple
 The System Settings toggle is broken for third-party modules on
@@ -1368,6 +1401,42 @@ Porting progress (one commit per item, in the order above):
   ASan ctest PASS (120 s), `run-tests.sh all` 265 passed 0 failed
   with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (367 s).
   12 port items remain.
+
+- 2026-11-26: `f72df3a4c33b` (make system files immutable to
+  prevent corruption) — ported. Upstream's verbatim block in
+  `ntfs_read_locked_inode()` (core/vfs/inode.c): `mft_no <
+  FILE_first_user && S_ISREG(vi->i_mode)` sets `S_IMMUTABLE`,
+  directories skipped so the root and $Extend stay usable.
+  PORT-EXTRA enforcement half, same precedent as 4d730a4dd78c
+  (mode_of): the flag alone is unobservable in this port — no VFS
+  enforces `IS_IMMUTABLE`, the only consumer is the delete gate in
+  `ntfs_vfs_unlink` (core/vfs/namei.c:1291), itself gated on
+  `NVolSysImmutable`, and nothing in the port ever passes the
+  `sys_immutable` option (no glue flag, no FSKit option). So
+  `ntfs_write`, `ntfs_setattr` (truncate/mode/times),
+  `ntfs_fallocate`, `ntfs_setxattr`, `ntfs_removexattr`
+  (core/vfs/api.c) now refuse immutable inodes with -EPERM,
+  `ntfs_vfs_unlink` no longer requires `NVolSysImmutable`, and
+  `__ntfs_vfs_rename` refuses an immutable source or existing
+  target (checked before any lock, direct return). New
+  discriminating test `test_system_files_immutable()`
+  (core/tests/test_names.c, mounted with
+  `NTFS_MOUNT_SHOW_SYSTEM`): positive controls on `plain.txt`
+  first, then $Bitmap/$MFT refuse write/truncate/fallocate/
+  chmod/setxattr/removexattr/rename-away/rename-over/unlink and
+  read-back bytes are unchanged. Negative control: with only the
+  flag block reverted, 492 checks / 10 failures (all 10
+  mutation-refusal assertions), and the run exits cleanly under
+  `timeout 120` — the test's breach guard skips the unlink block
+  and `structural_check` on breach, because unlinking $MFT out of
+  the corrupted volume spins the driver at 77% CPU instead of
+  failing cleanly (first negative-control run had to be killed
+  after 3+ minutes).
+  Evidence (this commit): test_names 498 checks, 0 failures;
+  plain ctest 15/15 (172 s), UBSan ctest 15/15 (166 s), ASan ctest
+  15/15 (213 s), `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (401 s).
+  11 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
