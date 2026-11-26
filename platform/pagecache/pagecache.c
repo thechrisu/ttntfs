@@ -540,6 +540,12 @@ struct page *grab_cache_page_nowait(struct address_space *mapping, pgoff_t index
 }
 
 static void __remove_locked(struct address_space *m, struct folio *f);
+struct folio *filemap_grab_folio(struct address_space *mapping, pgoff_t index)
+{
+	return __filemap_get_folio(mapping, index,
+				   FGP_LOCK | FGP_CREAT | FGP_ACCESSED, 0);
+}
+
 struct folio *read_mapping_folio(struct address_space *mapping, pgoff_t index,
 				 struct file *file)
 {

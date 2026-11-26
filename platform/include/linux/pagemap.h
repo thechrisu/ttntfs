@@ -54,6 +54,12 @@ struct folio *filemap_get_folio(struct address_space *mapping, pgoff_t index);
 struct folio *filemap_lock_folio(struct address_space *mapping, pgoff_t index);
 struct folio *read_mapping_folio(struct address_space *mapping, pgoff_t index,
 				 struct file *file);
+/* Grab a locked folio without reading it in (kernel filemap_grab_folio):
+ * creates the folio if absent, returns it locked, never calls
+ * read_folio. The caller must unlock (and put) it; a folio that was
+ * never filled must not be marked uptodate. Only safe when the caller
+ * overwrites every byte of the folio before it is read. */
+struct folio *filemap_grab_folio(struct address_space *mapping, pgoff_t index);
 /* Legacy page helpers used by a few core call sites; same object. */
 static inline struct page *read_mapping_page(struct address_space *mapping,
 					     pgoff_t index, struct file *file)

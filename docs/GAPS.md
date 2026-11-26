@@ -1744,6 +1744,46 @@ Porting progress (one commit per item, in the order above):
   (211 s).
   3 port items remain.
 
+- 2026-11-26: `5b676a77f3e4` (skip reads for full compression
+  unit overwrites) — ported. `ntfs_compress_write()` read every
+  page in a compression unit before copying new data into it. The
+  read is unnecessary when an aligned write replaces every byte
+  covered by the page-cache folios, so a full page-aligned unit
+  overwrite now grabs locked cache folios without reading them;
+  partial units and units covering only part of a page keep the
+  read-modify-write path. Port adaptations: the port has no
+  filemap_grab_folio, so the primitive was added to the platform
+  (platform/pagecache/pagecache.c +
+  platform/include/linux/pagemap.h — __filemap_get_folio with
+  FGP_LOCK | FGP_CREAT | FGP_ACCESSED, which never calls
+  read_folio); the port hard-codes 4K pages, so upstream's
+  !page_offset and !(cb_size & (PAGE_SIZE - 1)) terms hold
+  unconditionally and only !off && bytes == cb_size is tested
+  (PORT comment at the site).
+  Measured, not asserted: same scratch benchmark as 33200693eb22
+  (256 MiB image, 16 MiB compressible write, 5 reps each) —
+  without the skip median 92.6 ms (92.4 / 100.7 / 105.2 / 92.6 /
+  88.9), with it median 85.1 ms (85.2 / 84.7 / 85.1 / 85.2 /
+  84.5), ~8% faster, ranges do not overlap (new max 85.2 < old
+  min 88.9) and variance collapses. Correctness: every byte of
+  every grabbed folio is overwritten by the copy loop before
+  ntfs_write_cb reads it, and the page-state loop marks folios
+  uptodate only on success (item b54559689a00); partial units
+  still take the read path.
+  Crash/disconnect at the worst instant: this is a read-path
+  change only — what is written to the device, and in what order,
+  is unchanged, so the crash story is unchanged: a crash mid-write
+  leaves either the old block or nothing new (the old block is
+  not punched out until the new block is safe). A grabbed folio
+  that was never on the disk holds only bytes the copy loop just
+  wrote; if the write then fails, the item-6 page-state fix clears
+  its uptodate flag, so no stale data is ever served.
+  Evidence (this commit): plain ctest 15/15 (59 s), UBSan ctest
+  15/15 (59 s), ASan ctest 15/15 (71 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (203 s).
+  2 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

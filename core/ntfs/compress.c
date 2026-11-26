@@ -1557,6 +1557,7 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 	while (count) {
 		pgoff_t index;
 		size_t copied, bytes;
+		bool full_cb;
 		int off;
 
 		off = pos & (cb_size - 1);
@@ -1566,6 +1567,13 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 
 		cb_off = pos & ~(cb_size - 1);
 		index = cb_off >> PAGE_SHIFT;
+		/* PORT: upstream also requires !page_offset (the unit starts
+		 * at a page boundary) and !(cb_size & (PAGE_SIZE - 1)) (the
+		 * unit is a whole number of pages). This port hard-codes 4K
+		 * pages and cb_size is always a multiple of 4 KiB, so both
+		 * hold unconditionally; only the two terms that can vary are
+		 * tested. */
+		full_cb = !off && bytes == cb_size;
 
 		if (unlikely(fault_in_iov_iter_readable(from, bytes))) {
 			err = -EFAULT;
@@ -1573,7 +1581,10 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 		}
 
 		for (i = 0; i < pages_per_cb; i++) {
-			folio = read_mapping_folio(mapping, index + i, NULL);
+			if (full_cb)
+				folio = filemap_grab_folio(mapping, index + i);
+			else
+				folio = read_mapping_folio(mapping, index + i, NULL);
 			if (IS_ERR(folio)) {
 				for (ip = 0; ip < i; ip++) {
 					folio_unlock(page_folio(pages[ip]));
@@ -1583,7 +1594,9 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 				goto out;
 			}
 
-			folio_lock(folio);
+			/* filemap_grab_folio already returns the folio locked. */
+			if (!full_cb)
+				folio_lock(folio);
 			pages[i] = folio_page(folio, 0);
 		}
 
