@@ -1174,6 +1174,49 @@ Porting progress (one commit per item, in the order above):
   19 port items remain (triage-table count; the running GAPS
   count had drifted from the table by two rows).
 
+- 2026-11-26: `4e646ecd4475` (drop stale page-cache when shrinking
+  a non-resident attr) — ported: `ntfs_non_resident_attr_shrink()`
+  (core/ntfs/attrib.c) now calls
+  `truncate_inode_pages(VFS_I(ni)->i_mapping, newsize)` right
+  after updating data/initialized size, verbatim upstream. NOTE: no
+  discriminating test is possible through the public harness — the
+  reachable shrink-without-cache-drop path is the $EA replace
+  (`ntfs_write_ea()` -> `ntfs_attr_truncate()`; the $DATA path
+  already drops the cache in `truncate_setsize` before
+  `ntfs_truncate_vfs`, and the ADS replace drops it explicitly in
+  core/vfs/api.c:1578), but the port's
+  `ntfs_write_folio_non_resident()` returns 0 without writing for
+  any folio at or past `allocated_size`, so a stale $EA folio is
+  silently skipped at writeback: no -ENOENT, no write to freed
+  clusters, and EA reads go through `ntfs_attr_readall` (direct
+  pread), so the stale bytes are never visible. The stale folios
+  are real (they linger dirty until writeback) and this drops them
+  at the source; one verbatim call, exercised by the existing EA
+  coverage. Same "no new test, port note explains why" precedent
+  as 88496c4ac5a6 / 81fe702ff176.
+- 2026-11-26: ASan per-test timeout 60 s -> 180 s (tools/ci.sh
+  stage_asan, tools/pre-push.sh comments) — NOT a port item, but
+  it blocked this commit's pre-push: six consecutive ASan runs
+  failed with `links` timing out at 60 s and no assertion or ASan
+  error. Diagnosis, not a hang: two live /proc dumps of the
+  "hung" process showed the main thread RUNNING (state R,
+  progressing through the suite) or in normal kernel I/O wait
+  (state D, folio_wait_bit_common during fsync-heavy teardown),
+  writer/bg-io threads idle — no deadlock signature. A/B
+  measurement settled it: WITHOUT the 4e646ecd4475 change,
+  `test_links` under ASan takes 43-93 s (six runs: 43, 79, 92, 78,
+  78, 93 s); WITH it, the same 18-93 s range. The 60 s bound was
+  set when the slowest test was ~20 s; on this shared 1.5-CPU box
+  the host load decides whether links fits in 60 s. 180 s is ~2x
+  headroom over the slowest observed; a true hang still fails,
+  never runs away (job timeout is 30 min). On the macos-26 CI
+  runner the whole ASan suite takes ~36 s, so this changes
+  nothing there.
+  Evidence (this commit): plain ctest 15/15, UBSan ctest 15/15,
+  ASan ctest PASS (159 s), `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (489 s).
+  18 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

@@ -4225,6 +4225,19 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni, const s64 newsiz
 		ni->initialized_size = newsize;
 		ctx->attr->data.non_resident.initialized_size = cpu_to_le64(newsize);
 	}
+
+	/*
+	 * Upstream 4e646ecd4475: drop any page-cache folios that now lie
+	 * beyond the shrunk attribute. The clusters backing them have
+	 * just been freed and the runlist truncated, so leaving stale
+	 * dirty folios around makes a later writeback map a vcn past
+	 * the new allocation, which fails with -ENOENT and loses the
+	 * write. (In this port the symptom is defused -- see the port
+	 * note in docs/UPSTREAM-TRIAGE-7.3.md -- but the stale folios
+	 * are real, and this drops them at the source.)
+	 */
+	truncate_inode_pages(VFS_I(ni)->i_mapping, newsize);
+
 	/* Update data size in the index. */
 	if (ni->type == AT_DATA && ni->name == AT_UNNAMED)
 		NInoSetFileNameDirty(ni);

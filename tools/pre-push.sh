@@ -34,7 +34,7 @@
 #                        macOS 26 ASan deadlocked in its own initialiser
 #                        (2026-09-14), and the user asked 2026-11-26 for
 #                        that hang to be fixed, not skipped. The per-test
-#                        ctest timeout (60 s) bounds a hang; the macos-26
+#                        ctest timeout (180 s) bounds a hang; the macos-26
 #                        CI asan job is the re-test (see stage_asan in
 #                        tools/ci.sh).
 #
@@ -135,7 +135,7 @@ stage_archs() {
 stage_asan() {
 	# No macOS skip: the user asked 2026-11-26 for ASan to run under
 	# macOS 26, not to be skipped there. If the 2026-09-14 hang still
-	# reproduces on this machine, the per-test timeout (60 s) bounds it
+	# reproduces on this machine, the per-test timeout (180 s) bounds it
 	# and the failure is real -- that is the diagnostic, not a reason
 	# to pass quietly (see stage_asan in tools/ci.sh).
 	"$HERE/ci.sh" --asan
