@@ -3294,6 +3294,22 @@ void ntfs_destroy_ext_inode(struct ntfs_inode *ni)
 				ni->mft_no);
 	if (NInoAttrList(ni) && ni->attr_list)
 		kvfree(ni->attr_list);
+	/*
+	 * FORK-FOUND (ASan, 2026-11-26): drop the pinned $MFT folio, as the
+	 * evict-path twin ntfs_destroy_extent_inode() does. Without this,
+	 * closing an extent inode mid-mount -- e.g. freeing its extension
+	 * record while unlinking names -- orphans the folio's caller
+	 * reference: the folio stays in the $MFT table with refcount 2, the
+	 * unmount truncate drops only the table ref, and the folio leaks
+	 * (29 folios for a 1023-link file). Upstream v7.1 omits the put
+	 * identically (vendored fs/ntfs/inode.c) and no fix is in the
+	 * v7.1->v7.3 drift; in the kernel the page stays cached and
+	 * reclaimable, so the leak only shows in this port's pagecache,
+	 * where a folio with a live reference and no table entry is
+	 * unreachable.
+	 */
+	if (ni->folio)
+		folio_put(ni->folio);
 	kfree(ni->mrec);
 	kmem_cache_free(ntfs_inode_cache, ni);
 }
