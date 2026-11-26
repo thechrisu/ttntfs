@@ -1710,6 +1710,40 @@ Porting progress (one commit per item, in the order above):
   clang 18.1.3 restored by the os-intent replay, went 9/9).
   4 port items remain.
 
+- 2026-11-26: `33200693eb22` (reuse the compression context
+  during writes) — ported. `ntfs_compress_block()` allocated and
+  initialised a ~40 KiB match-finder context for every 4 KiB
+  sub-block — sixteen large allocations per 64 KiB compression
+  unit. Now it takes the context as a parameter, `ntfs_write_cb()`
+  takes and passes it, and `ntfs_compress_write()` allocates one
+  context per write request and frees it in `out:`. Port
+  adaptations: the port has no kvzalloc_obj, so the plain
+  kvzalloc(sizeof(struct compress_context), GFP_NOFS) the old code
+  used is kept, once per request; the port's ntfs_write_cb has no
+  page_offset parameter, so ctx is its 5th argument. The
+  context's hash chains are reset per sub-block exactly as before
+  (the memset in ntfs_compress_block is untouched).
+  Measured, not asserted: scratch 256 MiB image, 16 MiB
+  compressible write (repeated 8-byte pattern, 1 MiB chunks),
+  5 reps each on this VM, fresh image per rep — old median 216 ms
+  (212.1 / 216.1 / 318.9 / 396.4 / 187.8), new median 92 ms
+  (137.2 / 89.6 / 90.7 / 114.5 / 91.6), ~2.4x faster, ranges do
+  not overlap (new max 137 < old min 188). The benchmark
+  (/tmp/bench_compress_write.c, not part of the suite) verifies
+  byte-exact read-back after a remount on every rep.
+  Crash/disconnect at the worst instant: this is a pure allocation
+  change on the write path — no write ordering, flush, or on-disk
+  layout changes, so the crash story is unchanged: a crash
+  mid-write leaves either the old block or nothing new (the old
+  block is not punched out until the new block is safe), and a
+  failed allocation now fails the whole write request with -ENOMEM
+  before any page is copied, instead of failing one sub-block in.
+  Evidence (this commit): plain ctest 15/15 (61 s), UBSan ctest
+  15/15 (62 s), ASan ctest 15/15 (70 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (211 s).
+  3 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
