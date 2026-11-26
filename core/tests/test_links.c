@@ -2664,6 +2664,16 @@ static int ea_set(ntfs_inode_t *f, const char *name, const void *val,
 	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, 0);
 }
 
+/* Same as ea_set but with the flags word passed through, so a
+ * test can force XATTR_CREATE / XATTR_REPLACE. */
+static int ea_set_flags(ntfs_inode_t *f, const char *name, const void *val,
+			size_t size, int flags)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, flags);
+}
+
 static int ea_remove(ntfs_inode_t *f, const char *name)
 {
 	const struct xattr_handler *h = ntfs_xattr_handlers[0];
@@ -2780,6 +2790,69 @@ static void test_ea_final_size_validated(void)
 	if (err != (int)sizeof(val4k))
 		fprintf(stderr, "FAIL ea replace: old value %s (get=%d, expected 4096)\n",
 			err < 0 ? "gone" : "shortened", err);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
+ * Upstream 60038154b40e: ntfs_setxattr() updated ctime and marked
+ * the inode dirty even when the operation failed. A failed
+ * setxattr(2) must not change file metadata; ctime is only
+ * updated on success.
+ *
+ * The failing set is XATTR_CREATE on an existing name (-EEXIST),
+ * which needs no crafted fixture. The ctime is read straight
+ * off the in-memory VFS inode. A 2s sleep between the successful
+ * set and the failing one makes the discriminator robust: the
+ * port's current_time() is wall-clock (ktime_get_coarse_real_ts64,
+ * truncated to s_time_gran), so without the fix the failed set
+ * bumps ctime to ~now, and with it ctime is untouched.
+ */
+static void test_ctime_untouched_on_setxattr_failure(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	struct timespec64 before, after;
+	int err;
+
+	printf("test_ctime_untouched_on_setxattr_failure\n");
+	if (copy_fixture("earewrite") != 0) {
+		fprintf(stderr, "SKIP test_ctime_untouched_on_setxattr_failure: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ctime_untouched_on_setxattr_failure: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "ctime.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ctime_untouched_on_setxattr_failure: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	if (ea_set(f, "user.a", "A", 1) != 0) {
+		fprintf(stderr, "SKIP test_ctime_untouched_on_setxattr_failure: setup set failed\n");
+		ntfs_inode_put(f);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	before = ((struct inode *)f)->i_ctime;
+	/* Cross a time boundary so a ctime bump is observable. */
+	sleep(2);
+	/* XATTR_CREATE on an existing name fails with -EEXIST. */
+	err = ea_set_flags(f, "user.a", "A", 1, XATTR_CREATE);
+	CHECK(err == -EEXIST);
+	if (err != -EEXIST)
+		fprintf(stderr, "FAIL ctime set with XATTR_CREATE: returned %d, expected -EEXIST (-17)\n", err);
+	after = ((struct inode *)f)->i_ctime;
+	CHECK(before.tv_sec == after.tv_sec && before.tv_nsec == after.tv_nsec);
+	if (before.tv_sec != after.tv_sec || before.tv_nsec != after.tv_nsec)
+		fprintf(stderr, "FAIL ctime moved on failed setxattr: %lld.%09ld -> %lld.%09ld\n",
+			(long long)before.tv_sec, before.tv_nsec,
+			(long long)after.tv_sec, after.tv_nsec);
 	ntfs_inode_put(f);
 	vol_down(&v);
 	unlink(scratch);
@@ -4204,6 +4277,7 @@ int main(void)
 	test_folio_fullpage_write();
 	test_readall_error_propagates();
 	test_hasea_untouched_on_set_failure();
+	test_ctime_untouched_on_setxattr_failure();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
 	test_reparse_dt_unknown_on_lookup_failure();

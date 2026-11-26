@@ -1015,6 +1015,22 @@ Porting progress (one commit per item, in the order above):
   failed with NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   30 port items remain.
 
+- 2026-11-26: `60038154b40e` (do not update ctime when setxattr
+  fails) — ported: the `out:` label in ntfs_setxattr()
+  (core/ntfs/ea.c) now only updates ctime and marks the inode
+  dirty on success. New test
+  test_ctime_untouched_on_setxattr_failure (core/tests/test_links.c):
+  XATTR_CREATE on an existing name fails with -EEXIST; ctime is
+  read off the in-memory VFS inode before and after, with a 2s
+  sleep between so a bump is observable (the port's
+  current_time() is wall-clock). New ea_set_flags() helper in
+  the test passes flags through to the handler. Evidence:
+  test_links 799 checks, 0 failures with the fix (under ctest);
+  without it exactly 1 failure (ctime moves by the 2s sleep).
+  Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  29 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

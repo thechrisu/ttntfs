@@ -1094,8 +1094,13 @@ set_fattr:
 	mutex_unlock(&ni->mrec_lock);
 
 out:
-	inode_set_ctime_current(inode);
-	mark_inode_dirty(inode);
+	/* PORT: upstream 60038154b40e: only update ctime on
+	 * success. A failed setxattr(2) must not change file
+	 * metadata. */
+	if (!err) {
+		inode_set_ctime_current(inode);
+		mark_inode_dirty(inode);
+	}
 	return err;
 }
 
