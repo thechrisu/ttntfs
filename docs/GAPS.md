@@ -513,7 +513,26 @@ Porting progress (one commit per item, in the order above):
   (the overrun reads the heap `lcn_empty_bits_per_page` array,
   silent without ASan) and is carried verbatim, proven by the
   byte-identical diff.
-  50 port items remain.
+- 2026-11-26: `766062a82e1c` (empty mapping pairs) — ported: both
+  hunks verbatim in `ntfs_mapping_pairs_decompress()`
+  (`core/ntfs/runlist.c`): an empty array is refused with -EIO
+  unless it describes a zero-length attribute, and a genuinely
+  empty attribute reuses the old runlist when one was passed in.
+  New fixture patcher
+  `tools/mkfixtures/patch_empty_mapping_pairs.py` zeroes the first
+  mapping-pairs byte of a file's non-resident $DATA (sizes and
+  highest_vcn left as the driver wrote them). Regression test
+  `test_empty_mapping_pairs` in `core/tests/test_compress.c`:
+  one-cluster file, remount, metadata still readable, read refused
+  -EIO. Evidence: test_compress 526 checks 0 failures with the fix,
+  1 failure without it (read returns 4096, expected -EIO; verified
+  independently with ntfscli: the read succeeds and returns the
+  file's bytes as zeroes); plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  A truncate-to-zero round trip still works with the fix (the driver
+  converts the attribute to resident rather than leaving an empty
+  non-resident array).
+  49 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

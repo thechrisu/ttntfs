@@ -1863,6 +1863,88 @@ static void test_mapping_pairs_bounds(void)
 	}
 }
 
+/*
+ * Upstream 766062a82e1c ("ntfs: reject invalid empty mapping pairs"):
+ * an empty mapping-pairs array is valid only for a zero-length
+ * attribute. Before the fix the decoder accepted the empty array for
+ * any attribute and returned a runlist with no runs at all, so a read
+ * of a nonzero file silently returned 0 bytes (EOF) instead of its
+ * data. The patcher empties the array by hand -- the allocator always
+ * writes at least one run for a nonzero file, so a driver-created
+ * volume can never reach this state on its own.
+ */
+static void test_empty_mapping_pairs(void)
+{
+	const char *py = getenv("NTFS_PATCH_EMPTY_MAPPING_PAIRS");
+	static unsigned char buf[4096];
+	char cmd[2048], out[256];
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct ntfs_attr a;
+	uint64_t mft_no;
+	long highest_vcn, allocated, data_size, initialized;
+	FILE *p;
+	int rc;
+
+	printf("test_empty_mapping_pairs\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_empty_mapping_pairs: NTFS_PATCH_EMPTY_MAPPING_PAIRS not set\n");
+		return;
+	}
+	if (copy_fixture("empty.img") != 0) {
+		fprintf(stderr, "SKIP test_empty_mapping_pairs: no fixture\n");
+		return;
+	}
+	if (mount_scratch()) { failures++; checks++; unlink(scratch); return; }
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+	CHECK_EQ(ntfs_create(root, "empty-pairs.bin", 0100644, &f), 0, "create");
+	if (!f) { ntfs_inode_put(root); umount_scratch(); unlink(scratch); return; }
+	mft_no = ntfs_inode_number(f);
+	memset(buf, 'A', sizeof(buf));
+	CHECK_EQ(ntfs_write(f, buf, sizeof(buf), 0), (ssize_t)sizeof(buf), "seed write");
+	CHECK_EQ(ntfs_volume_sync(g_vol), 0, "volume sync");
+	ntfs_inode_put(f);
+	ntfs_inode_put(root);
+	umount_scratch();
+
+	/* Empty the mapping-pairs array, on disk. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu",
+		 py, scratch, (unsigned long long)mft_no);
+	p = popen(cmd, "r");
+	if (!p || !fgets(out, sizeof(out), p)) {
+		fprintf(stderr, "FAIL patch_empty_mapping_pairs.py produced no output\n");
+		failures++; checks++;
+		if (p) pclose(p);
+		unlink(scratch);
+		return;
+	}
+	rc = pclose(p);
+	CHECK_EQ(rc, 0, "patch_empty_mapping_pairs.py exit status");
+	CHECK(sscanf(out, "%ld %ld %ld %ld", &highest_vcn, &allocated,
+		     &data_size, &initialized) == 4);
+	/* Pin what the patcher left behind: a nonzero file whose array is
+	 * empty, so a refusal here is the new check firing and not some
+	 * other corruption. */
+	CHECK_EQ(highest_vcn, 0, "highest_vcn of one-cluster file");
+	CHECK_EQ(allocated, 4096, "allocated_size");
+	CHECK_EQ(data_size, 4096, "data_size");
+	CHECK_EQ(initialized, 4096, "initialized_size");
+
+	CHECK_EQ(mount_scratch(), 0, "remount");
+	CHECK_EQ(ntfs_volume_root(g_vol, &root), 0, "root");
+	CHECK_EQ(ntfs_lookup(root, "empty-pairs.bin", &f), 0, "lookup");
+	if (f) {
+		CHECK(ntfs_getattr(f, &a) == 0);
+		/* Metadata still readable: only the data is refused. */
+		CHECK_EQ(a.size, (int64_t)sizeof(buf), "size after patch");
+		CHECK_EQ(ntfs_read(f, buf, sizeof(buf), 0),
+			 -EIO, "read of empty mapping pairs refused");
+		ntfs_inode_put(f);
+	}
+	ntfs_inode_put(root);
+	umount_scratch();
+	unlink(scratch);
+}
+
 int main(void)
 {
 	static const struct { void (*fn)(void); const char *name; } groups[] = {
@@ -1881,6 +1963,7 @@ int main(void)
 		{ test_compressed_block_survives_failed_rewrite,
 					 "failed_rewrite" },
 		{ test_mapping_pairs_bounds,	 "mapping_pairs_bounds" },
+		{ test_empty_mapping_pairs,	 "empty_mapping_pairs" },
 	};
 
 	/* Per-group counts, so a group that silently stopped checking anything
