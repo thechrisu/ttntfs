@@ -2972,6 +2972,146 @@ static void test_getxattr_erange(void)
 }
 
 /*
+ * Upstream 1923eeffa63e ("ntfs: propagate folio errors"):
+ * __ntfs_inode_non_resident_attr_pwrite() replaced an
+ * __filemap_get_folio() failure with -ENOMEM instead of returning
+ * the folio's own error (the adjacent partial-page branch already
+ * propagates PTR_ERR correctly). One line, ported verbatim.
+ *
+ * The failure itself is not reproducible through the public API:
+ * the folio allocator has no fault-injection hook, and the only
+ * discriminating error is -EINVAL from a destroyed mapping, which
+ * is unreachable for a live attribute inode (attribute inodes are
+ * internal -- ntfs_attr_iget and ntfs_inode_attr_pwrite live in
+ * core/ntfs/inode.h, which tests cannot include). Per the round-8
+ * precedent, the propagation is therefore proven by the verbatim
+ * one-line diff. What this test does prove is the branch the fix
+ * sits in: a full-page (count == PAGE_SIZE) write to a non-resident
+ * attribute takes the FGP_CREAT branch. It drives that branch
+ * through the EA append path -- a first EA with an 8192-byte
+ * record makes the $EA non-resident (see
+ * test_attr_add_enospc_fallback), and the second
+ * EA is sized so its record is exactly one page
+ * (new_ea_size = ALIGN(9 + name_len + val_size, 4) = PAGE_SIZE
+ * for name "user.pg" and val_size PAGE_SIZE - 16) -- and asserts
+ * the data lands byte-for-byte, same-mount and after remount.
+ *
+ * NOTE: the first EA's value is 8175 bytes (8192-byte record) so
+ * the append lands at a page-aligned offset. The pwrite assumes
+ * count == PAGE_SIZE implies a page-aligned pos and writes at
+ * folio offset 0 unconditionally; a page-sized write at an
+ * unaligned offset (e.g. first EA 8192 bytes -> stream 8212,
+ * append at pos 8212) lands 20 bytes early and the entry tail is
+ * never written, so the same-mount get returns -ENODATA. That is
+ * a separate fork-found bug (present in upstream v7.1 through
+ * v7.3, no fix in the drift) and is fixed in the follow-up commit,
+ * which changes this test's first EA back to 8192 bytes.
+ */
+static void test_folio_fullpage_write(void)
+{
+	static char val8k[8192];
+	static char valpg[4096];
+	struct vol v;
+	ntfs_inode_t *files = NULL, *sz = NULL, *f = NULL;
+	char buf[8192];
+	int err;
+
+	printf("test_folio_fullpage_write\n");
+	memset(val8k, 'B', sizeof(val8k));
+	memset(valpg, 'P', sizeof(valpg));
+	if (copy_fixture("folio") != 0) {
+		fprintf(stderr, "SKIP test_folio_fullpage_write: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_folio_fullpage_write: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_folio_fullpage_write: lookup failed\n");
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* First EA (8175-byte value -> 8192-byte record) makes the $EA
+	 * non-resident with a page-aligned stream, so the second
+	 * EA's append lands at a page-aligned offset. */
+	err = ea_set(f, "user.big", val8k, 8175);
+	CHECK(err == 0);
+	if (err != 0) {
+		fprintf(stderr, "SKIP test_folio_fullpage_write: setup set failed (%d)\n", err);
+		ntfs_inode_put(f);
+		ntfs_inode_put(sz);
+		ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* Second EA: record is exactly one page, so the append write
+	 * takes the FGP_CREAT branch in
+	 * __ntfs_inode_non_resident_attr_pwrite(). */
+	err = ea_set(f, "user.pg", valpg, PAGE_SIZE - 16);
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL folio: page-sized set returned %d, expected 0\n", err);
+	err = ea_get(f, "user.pg", buf, sizeof(buf));
+	CHECK(err == (int)(PAGE_SIZE - 16));
+	if (err != (int)(PAGE_SIZE - 16))
+		fprintf(stderr, "FAIL folio: same-mount get returned %d, expected %d\n",
+			err, (int)(PAGE_SIZE - 16));
+	if (err == (int)(PAGE_SIZE - 16)) {
+		CHECK(memcmp(buf, valpg, PAGE_SIZE - 16) == 0);
+		if (memcmp(buf, valpg, PAGE_SIZE - 16) != 0)
+			fprintf(stderr, "FAIL folio: same-mount get value mismatch\n");
+	}
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	f = sz = files = NULL;
+	vol_down(&v);
+
+	/* Remount: the page must have reached the disk. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_folio_fullpage_write: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "FAIL test_folio_fullpage_write: lookup after remount failed\n");
+		failures++; checks++;
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.pg", buf, sizeof(buf));
+	CHECK(err == (int)(PAGE_SIZE - 16));
+	if (err != (int)(PAGE_SIZE - 16))
+		fprintf(stderr, "FAIL folio: remount get returned %d, expected %d\n",
+			err, (int)(PAGE_SIZE - 16));
+	if (err == (int)(PAGE_SIZE - 16)) {
+		CHECK(memcmp(buf, valpg, PAGE_SIZE - 16) == 0);
+		if (memcmp(buf, valpg, PAGE_SIZE - 16) != 0)
+			fprintf(stderr, "FAIL folio: remount get value mismatch\n");
+	}
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 56cc42a7b387 ("ntfs: return errors from ntfs_attr_readall"):
  * ntfs_attr_readall() returned NULL on every failure -- attribute
  * lookup, allocation and read -- so every caller lost the errno and
@@ -3364,6 +3504,7 @@ int main(void)
 	test_ea_final_size_validated();
 	test_ea_first_set_same_mount_get();
 	test_getxattr_erange();
+	test_folio_fullpage_write();
 	test_readall_error_propagates();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();

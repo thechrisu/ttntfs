@@ -831,6 +831,51 @@ Porting progress (one commit per item, in the order above):
   `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
   36 port items remain.
 
+- 2026-11-26: `1923eeffa63e` (propagate folio errors) — ported:
+  `__ntfs_inode_non_resident_attr_pwrite()` replaced an
+  `__filemap_get_folio()` failure with -ENOMEM instead of returning
+  the folio's own error; the adjacent partial-page branch already
+  propagates PTR_ERR correctly. One line, verbatim upstream
+  (`ret = PTR_ERR(folio)` in the FGP_CREAT branch,
+  core/vfs/inode.c). The failure itself is not reproducible through
+  the public API (no allocation-failure hook in the platform; the
+  only discriminating error is -EINVAL from a destroyed mapping,
+  unreachable for a live attribute inode), so the propagation is
+  proven by the verbatim diff per the round-8 precedent. New test
+  `test_folio_fullpage_write` in `core/tests/test_links.c` proves
+  the branch the fix sits in: a full-page (count == PAGE_SIZE)
+  write to a non-resident attribute takes the FGP_CREAT path,
+  driven through the EA append (first EA 8175-byte value ->
+  8192-byte record makes $EA non-resident; second EA "user.pg"
+  sized so its record is exactly one page, 4080-byte value);
+  same-mount and remount gets return the exact bytes. 501 checks,
+  0 failures. Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  35 port items remain.
+
+- 2026-11-26: **Found during porting** (not in the upstream drift —
+  present in upstream v7.1, no fix in the v7.1→v7.3 drift):
+  `__ntfs_inode_non_resident_attr_pwrite()` assumes count ==
+  PAGE_SIZE implies a page-aligned pos and writes at folio offset 0
+  unconditionally. A page-sized write at an unaligned offset (the EA
+  append path: `ntfs_write_ea()` calls it with ea_off = stream size,
+  essentially never page-aligned, and ea_size can be exactly
+  PAGE_SIZE) lands the data at the folio start instead of at the
+  offset, and the entry tail past the folio end is never written —
+  the same-mount get then returns -ENODATA and the stream is
+  corrupt (the write also overwrites the tail of the previous
+  entry). Found while writing `test_folio_fullpage_write`: with the
+  first EA 8192 bytes (stream 8212, append at pos 8212) the test
+  fails 2 checks (same-mount and remount gets -ENODATA); padding
+  the first EA to an 8192-byte record (append at pos 8192, aligned)
+  makes it pass. Upstream v7.3 `fs/ntfs/ea.c` calls
+  `ntfs_inode_attr_pwrite` identically, so upstream has the bug too.
+  Other callers are safe (index/attrib/attrlist/reparse all write
+  at pos 0 or with count 1). **Fix next**: only take the FGP_CREAT
+  full-page path when the write covers a whole folio (count ==
+  PAGE_SIZE and pos page-aligned); otherwise read the folio from
+  disk first so bytes outside the write range are preserved.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

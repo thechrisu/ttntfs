@@ -3629,7 +3629,11 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 					FGP_CREAT | FGP_LOCK,
 					mapping_gfp_mask(mapping));
 			if (IS_ERR(folio)) {
-				ret = -ENOMEM;
+				/* PORT: upstream 1923eeffa63e: return the
+				 * folio error instead of replacing it with
+				 * -ENOMEM (the adjacent partial-page branch
+				 * already propagates PTR_ERR correctly). */
+				ret = PTR_ERR(folio);
 				break;
 			}
 		} else {
