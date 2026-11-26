@@ -431,6 +431,11 @@ struct vol {
 	int mft_writes, clu_writes, syncs;
 	int sync_errno;		/* non-zero: the device refuses the barrier */
 	int write_errno;	/* non-zero: the device refuses the writes themselves */
+	/* Fault-injection budget for the flush (§1.3): >= 0 counts down one
+	 * per flush write (MFT record or cluster run) and refuses with
+	 * -EIO at zero, without writing; -1 is unlimited. Reads never
+	 * consume it — only flush_overlay writes through these callbacks. */
+	int write_limit;
 	uint64_t last_mft_no;
 };
 
@@ -524,6 +529,7 @@ static void vol_init(struct vol *v)
 {
 	uint8_t rec[VRS];
 	memset(v, 0, sizeof(*v));
+	v->write_limit = -1;
 	v->disk = calloc(VOL_CLUSTERS, VCS);
 	build_record(rec, 0, MFT_RECORD_IN_USE, fill_mft);
 	vol_put_record(v, 0, rec);
@@ -546,6 +552,10 @@ static int v_read_mft(void *ctx, uint64_t no, void *buf)
 static int v_write_mft(void *ctx, uint64_t no, const void *buf)
 {
 	struct vol *v = ctx;
+	if (v->write_limit == 0)
+		return -EIO;
+	if (v->write_limit > 0)
+		v->write_limit--;
 	if (no >= MFT_CLUSTERS * VCS / VRS)
 		return -ENOENT;
 	memcpy(v->disk + MFT_LCN * VCS + no * VRS, buf, VRS);
@@ -566,6 +576,10 @@ static int v_read_clu(void *ctx, uint64_t lcn, uint32_t n, void *buf)
 static int v_write_clu(void *ctx, uint64_t lcn, uint32_t n, const void *buf)
 {
 	struct vol *v = ctx;
+	if (v->write_limit == 0)
+		return -EIO;
+	if (v->write_limit > 0)
+		v->write_limit--;
 	if (lcn + n > VOL_CLUSTERS)
 		return -EIO;
 	memcpy(v->disk + lcn * VCS, buf, (size_t)n * VCS);
@@ -1529,6 +1543,249 @@ static void test_flush_failure_is_not_a_partial_write(void)
 	free(b.buf);
 	free(v.disk);
 }
+
+/* ---- §1.3: replay atomicity ------------------------------------------- */
+
+/*
+ * Build the cut-point scenario: one committed transaction whose redo
+ * dirties two MFT records and one bitmap cluster, so the flush has
+ * three writes plus the barrier. The MFT half is test_mft_record_ops'
+ * (InitializeFileRecordSegment of record 40, UpdateResidentValue on
+ * record 30); the cluster half is build_bitmap_scenario's SetBits on
+ * BITMAP_LCN, bits 100..102. The plan must be [MFT 40, MFT 30,
+ * clusters BITMAP_LCN] — the flush writes MFT records first, then
+ * clusters, then the barrier.
+ */
+static void build_replay_cut_scenario(struct lb *b)
+{
+	uint8_t oat[256], newrec[VRS], br[BR_SIZE];
+	uint32_t oatn = build_oatbl(oat, 6, ATTR_TYPE_DATA);
+	uint64_t start, oa_lsn, restart_lsn;
+	struct crec c;
+	static const uint8_t newsi[0x30] = { 9, 9, 9, 9 };
+
+	lb_init(b, FIRST_PAGE, 2);
+	start = lb_simple(b, 0x18, LOP_Noop, LOP_Noop);
+	oa_lsn = lb_table_dump(b, LOP_OpenAttributeTableDump, oat, oatn);
+	restart_lsn = lb_checkpoint(b, 0, oa_lsn, oatn, 0, 0, 0, 0);
+
+	/* InitializeFileRecordSegment of record 40 (page: vcn 10 -> lcn 26). */
+	build_record(newrec, 40, MFT_RECORD_IN_USE, fill_plain);
+	memset(&c, 0, sizeof(c));
+	c.redo_op = LOP_InitializeFileRecordSegment;
+	c.undo_op = LOP_Noop;
+	c.target_attr = 0x18;
+	c.lcns = 1;
+	c.lcn[0] = MFT_LCN + 10;
+	c.target_vcn = 10;
+	c.cluster_off = 0;
+	c.redo = newrec;
+	c.redo_len = (uint16_t)lf_get32(newrec + MR_BYTES_IN_USE);
+	lb_client(b, 0x40, 0, &c);
+	/* UpdateResidentValue on record 30: $STANDARD_INFORMATION value. */
+	memset(&c, 0, sizeof(c));
+	c.redo_op = LOP_UpdateResidentValue;
+	c.undo_op = LOP_UpdateResidentValue;
+	c.target_attr = 0x18;
+	c.lcns = 1;
+	c.lcn[0] = MFT_LCN + 7;
+	c.target_vcn = 7;
+	c.cluster_off = 2048 / 512;
+	c.record_off = MR_FIXUP_OFFSET_3 + 8;
+	c.attr_off = AT_RESIDENT_SIZE;
+	c.redo = newsi; c.redo_len = sizeof(newsi);
+	c.undo = newsi; c.undo_len = sizeof(newsi);
+	lb_client(b, 0x40, 0, &c);
+	/* SetBits in the bitmap cluster, bits 100..102. */
+	lf_put32(br + BR_BITMAP_OFF, 100);
+	lf_put32(br + BR_BITS, 3);
+	memset(&c, 0, sizeof(c));
+	c.redo_op = LOP_SetBitsInNonresidentBitMap;
+	c.undo_op = LOP_ClearBitsInNonresidentBitMap;
+	c.target_attr = 0x40;
+	c.lcns = 1;
+	c.lcn[0] = BITMAP_LCN;
+	c.redo = br; c.redo_len = BR_SIZE;
+	c.undo = br; c.undo_len = BR_SIZE;
+	lb_client(b, 0x40, 0, &c);
+	lb_simple(b, 0x40, LOP_CommitTransaction, LOP_Noop);
+	lb_simple(b, 0x40, LOP_ForgetTransaction, LOP_Noop);
+	lb_restart(b, b->last_lsn, b->last_len, start, restart_lsn, 0, false);
+	lb_protect(b);
+}
+
+/*
+ * GAPS.md §1.3 — replay atomicity, the gate for §1.2 Phase 0 (and for
+ * any later performance work that touches the write path). Finding 17b:
+ * flush writes records one at a time and the overlay protects planning
+ * only, so nothing demonstrated a partial flush and nothing ruled one
+ * out. This test is the proof, in the same cut-point shape as
+ * test_crash.c's table: run the replay against a device that stops
+ * accepting writes after N of them — the fault-injection model of a
+ * process killed mid-flush, where the writes before the cut landed and
+ * the writes after it did not — then run the replay again with the
+ * device restored and require the volume to come out byte-identical
+ * to an uninterrupted replay. A replay that is atomic must converge:
+ * whatever the cut, the second run reaches exactly the state the
+ * uninterrupted run reached, never a torn mixture, and never claims
+ * success for the cut run.
+ *
+ * The cut is a write refusal through the apply callbacks, which are
+ * the device writes: flush_overlay is their only caller. A SIGKILL
+ * mid-flush leaves the same on-disk state (the writes before the cut
+ * landed, the rest did not); only the reporting differs, and the cut
+ * run is required to report failure, never success.
+ */
+static void test_replay_cut_points(void)
+{
+	struct lb b;
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t *ref_disk, *log_copy;
+	int ref_mft, ref_clu, ref_syncs, total, cut;
+	int n_converged = 0, n_cuts = 0;
+
+	printf("test_replay_cut_points\n");
+
+	/* Reference run: uninterrupted replay, snapshot the final disk. */
+	build_replay_cut_scenario(&b);
+	m.buf = b.buf; m.size = LSIZE; m.writes = 0;
+	log = open_log(&m, &io);
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	memset(&res, 0, sizeof(res));
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	CHECK_EQ(res.plan_len, 3);
+	if (res.plan_len == 3) {
+		CHECK_EQ(res.plan[0].kind, NTFS_PLAN_MFT_RECORD);
+		CHECK_EQ(res.plan[0].mft_no, 40);
+		CHECK_EQ(res.plan[1].kind, NTFS_PLAN_MFT_RECORD);
+		CHECK_EQ(res.plan[1].mft_no, 30);
+		CHECK_EQ(res.plan[2].kind, NTFS_PLAN_CLUSTERS);
+		CHECK_EQ(res.plan[2].lcn, BITMAP_LCN);
+	}
+	memset(&res, 0, sizeof(res));
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK(!res.needs_chkdsk);
+	CHECK_EQ(res.records_redone, 3);
+	ref_mft = v.mft_writes;
+	ref_clu = v.clu_writes;
+	ref_syncs = v.syncs;
+	CHECK_EQ(ref_mft, 2);
+	CHECK_EQ(ref_clu, 1);
+	CHECK_EQ(ref_syncs, 1);
+	CHECK_EQ(v.disk[BITMAP_LCN * VCS + 12], 0x70);
+	ref_disk = malloc(VOL_CLUSTERS * VCS);
+	CHECK(ref_disk != NULL);
+	if (!ref_disk) { ntfs_logfile_close(log); free(b.buf); free(v.disk); return; }
+	memcpy(ref_disk, v.disk, VOL_CLUSTERS * VCS);
+	log_copy = malloc(LSIZE);
+	CHECK(log_copy != NULL);
+	if (!log_copy) { ntfs_logfile_close(log); free(b.buf); free(v.disk); free(ref_disk); return; }
+	memcpy(log_copy, b.buf, LSIZE);
+	ntfs_logfile_close(log);
+	free(b.buf);
+	free(v.disk);
+	total = ref_mft + ref_clu;
+
+	printf("  cut  landed  replay2  disk==ref  log untouched\n");
+	printf("  ---  ------  -------  ----------  -------------\n");
+
+	/* Write cuts 0..total: cut writes land, the next is refused. */
+	for (cut = 0; cut <= total; cut++) {
+		int landed, rc1, rc2, disk_ok, log_ok;
+		int mft_before, clu_before;
+
+		build_replay_cut_scenario(&b);
+		m.buf = b.buf; m.size = LSIZE; m.writes = 0;
+		log = open_log(&m, &io);
+		vol_init(&v);
+		vol_apply(&v, &ap);
+		v.write_limit = cut;
+		memset(&res, 0, sizeof(res));
+		rc1 = ntfs_logfile_replay(log, &ap, false, &res);
+		landed = v.mft_writes + v.clu_writes;
+		/* The cut run must not claim success; the log must be
+		 * untouched by it, or the second run could not converge. */
+		if (cut < total) {
+			CHECK(rc1 != 0);
+			CHECK_EQ(landed, cut);
+		} else {
+			CHECK_EQ(rc1, 0);
+			CHECK_EQ(landed, total);
+		}
+		CHECK(memcmp(b.buf, log_copy, LSIZE) == 0);
+		CHECK_EQ(m.writes, 0);
+		log_ok = memcmp(b.buf, log_copy, LSIZE) == 0 && m.writes == 0;
+		/* Restore the device and replay again on the same log. */
+		v.write_limit = -1;
+		mft_before = v.mft_writes;
+		clu_before = v.clu_writes;
+		memset(&res, 0, sizeof(res));
+		rc2 = ntfs_logfile_replay(log, &ap, false, &res);
+		CHECK_EQ(rc2, 0);
+		CHECK(!res.needs_chkdsk);
+		disk_ok = memcmp(v.disk, ref_disk, VOL_CLUSTERS * VCS) == 0;
+		CHECK(disk_ok);
+		/* The second run rewrites what the cut missed; pages the
+		 * cut already landed are skipped by LSN, so its write
+		 * count varies by cut — only the final disk is asserted. */
+		(void)mft_before; (void)clu_before;
+		printf("  %3d  %2d/%d    %s      %s         %s\n", cut, landed, total,
+		       rc2 == 0 ? "ok" : "FAIL", disk_ok ? "yes" : "NO",
+		       log_ok ? "yes" : "NO");
+		if (rc2 == 0 && disk_ok && log_ok)
+			n_converged++;
+		n_cuts++;
+		ntfs_logfile_close(log);
+		free(b.buf);
+		free(v.disk);
+	}
+
+	/* Barrier cut: every write lands, only the sync is refused. */
+	{
+		int rc1, rc2, disk_ok;
+
+		build_replay_cut_scenario(&b);
+		m.buf = b.buf; m.size = LSIZE; m.writes = 0;
+		log = open_log(&m, &io);
+		vol_init(&v);
+		vol_apply(&v, &ap);
+		v.sync_errno = -EIO;
+		memset(&res, 0, sizeof(res));
+		rc1 = ntfs_logfile_replay(log, &ap, false, &res);
+		CHECK(rc1 != 0);
+		CHECK(res.flush_failed);
+		CHECK_EQ(v.mft_writes + v.clu_writes, total);
+		CHECK_EQ(v.syncs, 1);
+		v.sync_errno = 0;
+		memset(&res, 0, sizeof(res));
+		rc2 = ntfs_logfile_replay(log, &ap, false, &res);
+		CHECK_EQ(rc2, 0);
+		disk_ok = memcmp(v.disk, ref_disk, VOL_CLUSTERS * VCS) == 0;
+		CHECK(disk_ok);
+		printf("  sync %2d/%d    %s      %s         %s\n", total, total,
+		       rc2 == 0 ? "ok" : "FAIL", disk_ok ? "yes" : "NO", "yes");
+		if (rc2 == 0 && disk_ok)
+			n_converged++;
+		n_cuts++;
+		ntfs_logfile_close(log);
+		free(b.buf);
+		free(v.disk);
+	}
+
+	printf("  %d/%d cut points converged to the uninterrupted state\n",
+	       n_converged, n_cuts);
+	CHECK_EQ(n_converged, n_cuts);
+	free(ref_disk);
+	free(log_copy);
+	printf("test_replay_cut_points\n");
+}
+
 /*
  * Finding 19: a record that is the first thing ever written into a freshly
  * allocated cluster must still leave a PROTECTED index block.
@@ -1632,6 +1889,7 @@ int main(void)
 	test_tables_api();
 	test_v2_log();
 	test_flush_failure_is_not_a_partial_write();
+	test_replay_cut_points();
 	test_first_write_into_fresh_cluster_is_protected();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);

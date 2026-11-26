@@ -207,15 +207,18 @@ metadata against metadata, where WAL orders log against metadata.
 
 ### 3.6 The writer makes replay atomicity a gate (GAPS.md §1.3)
 
-Today replay atomicity is unproven (finding 17b: flush writes
-records one at a time, the overlay protects planning only) and replay
-stays opt-in per volume. Once we write our own records, our replay
-must apply them after a crash that may itself have interrupted a
-replay — so §1.3's fault-injection proof becomes a prerequisite,
-not a parallel item. The writer also needs a round-trip property the
-reader never had: records we write must replay through our own
-engine to exactly the state the metadata already has (idempotence
-via the per-record LSN skip the replay engine already implements).
+Replay atomicity is proven at the engine level since 2026-11-26
+(`test_replay_cut_points`, core/logfile/tests/test_logfile.c: 5/5
+cut points converge to the uninterrupted state; see GAPS.md §1.3
+for the boundary — synthetic logs, not a real-volume mount proof).
+Once we write our own records, our replay must apply them after a
+crash that may itself have interrupted a replay — so §1.3's
+fault-injection proof was a prerequisite, not a parallel item, and
+that prerequisite is now met. The writer also needs a round-trip
+property the reader never had: records we write must replay
+through our own engine to exactly the state the metadata already
+has (idempotence via the per-record LSN skip the replay engine
+already implements).
 
 ### 3.7 Torn writes and the log's own integrity
 

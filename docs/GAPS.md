@@ -126,14 +126,29 @@ with an empty journal and nothing to replay. This implementation is
 what replaces that policy; until it lands the gap is open and
 recorded as such. See docs/JOURNAL-DESIGN.md §0.
 
-### 1.3 Replay atomicity unproven — open
+### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
 gate for any later performance work that touches the write path.
-Nothing demonstrated a partial write during replay, nothing rules one
-out (`docs/UPSTREAM-BUGS.md` finding 17b). Flush writes records one at
-a time; the overlay protects planning only. This is why replay stays
-opt-in per volume. Verify: fault-injection test that kills the process
-mid-replay and shows the volume still mounts / replays cleanly.
+Proven by `test_replay_cut_points` (core/logfile/tests/
+test_logfile.c): one committed transaction dirtying two MFT records
+and one bitmap cluster (3 flush writes + barrier); a write budget
+on the apply callbacks cuts the flush after 0/1/2/3 writes, plus a
+barrier-refusal cut; every cut run must report failure and leave
+the log untouched, and a second replay with the device restored
+must return 0 and land byte-identical to an uninterrupted replay.
+5/5 cut points converged. Negative control (second replay
+skipped): cuts 0/1/2 leave a partial disk that fails the memcmp,
+2/5 converged — the test is live, not vacuous. The cut is a write
+refusal through the apply callbacks, which are the device writes
+(flush_overlay is their only caller): a SIGKILL mid-flush leaves
+the same on-disk state, only the reporting differs.
+Boundary, stated honestly: this proves the replay ENGINE is
+atomic on synthetic logs. It does not prove a real dirty volume
+mounts — that needs a real $LogFile with a dirty journal, which
+only Windows can produce (the port never writes $LogFile records;
+no tool materializes a synthetic log into a real image). The
+mount-level proof belongs to §1.2 Phase 5 (Windows round trip).
+Replay stays opt-in per volume until then.
 
 ### 1.4 Hibernated volumes untested — blocked (needs Windows)
 Fast Startup (B2) is handled. A real hibernated volume (B1) was
@@ -1865,6 +1880,35 @@ Porting progress (one commit per item, in the order above):
   passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
   (201 s).
   0 port items remain — the port queue is done.
+
+- 2026-11-26: §1.3 replay atomicity proven at the engine level.
+  New test `test_replay_cut_points` (core/logfile/tests/
+  test_logfile.c) + a write-budget fault hook on the fake volume's
+  flush callbacks. One committed transaction dirties two MFT
+  records (InitializeFileRecordSegment record 40,
+  UpdateResidentValue record 30) and one bitmap cluster (SetBits
+  BITMAP_LCN bits 100..102): 3 flush writes + barrier. Cuts after
+  0/1/2/3 writes plus a barrier refusal; every cut run must report
+  failure and leave the log untouched, and a second replay with
+  the device restored must return 0 and land byte-identical to
+  an uninterrupted replay. 5/5 cut points converged
+  (test_logfile 341 checks, 0 failures). Negative control
+  (second replay skipped): cuts 0/1/2 leave a partial disk that
+  fails the memcmp, 2/5 converged. Boundary: engine-level proof
+  on synthetic logs, not a real-volume mount proof — that needs a
+  real dirty $LogFile from Windows (§1.2 Phase 5). §1.3 no longer
+  gates §1.2 Phase 0.
+  Crash/disconnect at the worst instant: a replay interrupted at
+  any flush write leaves the volume dirty with its log intact, so
+  the next attempt redoes the full plan and converges to the
+  uninterrupted state — a torn volume is detected (the cut run
+  reports failure, the log is never marked clean), never silently
+  papered over.
+  Evidence (this commit): test_logfile 341 checks, 0 failures;
+  plain ctest 15/15 (62 s), UBSan ctest 15/15 (61 s), ASan ctest
+  15/15 (71 s), `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (196 s).
+  Next: §1.2 journal writing, Phase 0/1.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
