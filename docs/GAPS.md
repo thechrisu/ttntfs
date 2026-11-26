@@ -1247,7 +1247,37 @@ Porting progress (one commit per item, in the order above):
   fixes are 2-3 lines each in error paths, exercised by the
   existing allocation/free coverage. Same "no new test, port note
   explains why" precedent as 4e646ecd4475 / 88496c4ac5a6.
+  Evidence (this commit): plain ctest 15/15, UBSan ctest 15/15,
+  ASan ctest PASS (67 s), `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (488 s).
   16 port items remain.
+
+- 2026-11-26: `631946431ddc` (account for MFT records added
+  during allocation) — ported, six hunks: (1)
+  `ntfs_mft_bitmap_extend_initialized_nolock()` no longer credits a
+  fixed 64; (2) `ntfs_mft_record_alloc()` credits the records
+  actually added, `nr_new_mft_records = (i_size - old_data_size) >>
+  mft_record_size_bits`, before dropping the lock; (3)
+  `ntfs_mft_record_free()` credits the record only when
+  `ntfs_bitmap_clear_bit()` succeeded; (4)
+  `__get_nr_free_mft_records()` always stores the clamped scan
+  result; (5) `ntfs_statfs()` clamps `f_ffree` to `[0, f_files]`
+  with a warning; (6) the `NVolFreeClusterKnown` gate is removed
+  from `inc/dec_free_mft_records`. New discriminating test
+  `test_mft_free_records_track_extension()` (core/tests/test_links.c):
+  creates files until $MFT grows, then requires the live counter to
+  equal the bitmap rescan after a remount. Verified: fails without
+  the fix (free 29 vs true 45 after 16 files — the $MFT data grows
+  one record per file while the bitmap was already initialized past
+  the new end, so the old code credited nothing) and passes with it.
+  The check runs every 16 creates: checking only every 64 would
+  miss the drift, because 64 creates happen to grow the $MFT by
+  exactly one 64-record bitmap chunk. (Diagnostic note: the
+  remount rescan was briefly suspected of reading a stale bitmap —
+  disproved by reading the on-disk $MFT/$BITMAP directly with
+  python: 266 set bits in the first 311, i.e. the true free count
+  45; the in-memory counter was the wrong one.)
+  15 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

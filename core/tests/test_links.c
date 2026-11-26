@@ -4353,6 +4353,88 @@ static void test_ea_pair_teardown(void)
 	unlink(scratch);
 }
 
+/* ---- MFT free-record counter tracks $MFT extension ------------------- */
+
+/*
+ * Upstream 631946431ddc: when $MFT grows, the free-record counter must
+ * be credited with the records actually added, not a fixed 64 per
+ * bitmap extend. On this fixture the $MFT data grows one record per
+ * file once the initial free pool runs out, while the bitmap was
+ * already initialized past the new end -- so the old code credited
+ * nothing for the growth and the live counter drifted below the $MFT
+ * bitmap truth by one per file (free 29 vs the true 45 after 16
+ * files). Only a remount (which rescans the bitmap) showed the real
+ * count. The statfs clamp in the same commit hides the drift at the
+ * get_info level, so the discriminating check is the remount
+ * comparison: the counter before the remount must equal the rescanned
+ * counter after it. The check runs every 16 creates: checking only
+ * every 64 would miss the drift, because 64 creates happen to grow
+ * the $MFT by exactly one 64-record bitmap chunk.
+ */
+static void test_mft_free_records_track_extension(void)
+{
+	struct vol v;
+	struct ntfs_volume_info info;
+	ntfs_inode_t *f = NULL;
+	uint64_t total0, total1, free1, free2;
+	char name[32];
+	int created = 0, i, rc;
+
+	printf("test_mft_free_records_track_extension\n");
+	if (copy_fixture("mftfree") != 0) {
+		fprintf(stderr, "SKIP test_mft_free_records_track_extension: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_mft_free_records_track_extension: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_volume_get_info(v.vol, &info) == 0);
+	total0 = info.total_mft_records;
+	/* Create files until $MFT grows (or give up). */
+	for (i = 0; i < 4000 && info.total_mft_records == total0; i++) {
+		snprintf(name, sizeof(name), "f%04d", i);
+		rc = ntfs_create(v.root, name, 0100644, &f);
+		if (rc) {
+			fprintf(stderr, "SKIP test_mft_free_records_track_extension: create failed at %d (rc %d)\n", i, rc);
+			goto out;
+		}
+		ntfs_inode_put(f);
+		f = NULL;
+		created++;
+		if ((created & 15) == 0) {
+			CHECK(ntfs_volume_get_info(v.vol, &info) == 0);
+			if (info.total_mft_records != total0)
+				break;
+		}
+	}
+	CHECK(ntfs_volume_get_info(v.vol, &info) == 0);
+	total1 = info.total_mft_records;
+	free1 = info.free_mft_records;
+	CHECK_MSG(total1 > total0, "$MFT never extended after %d files (total %llu)",
+		  created, (unsigned long long)total1);
+	if (total1 <= total0)
+		goto out;
+	/* The counter must stay within the volume. */
+	CHECK_MSG(free1 <= total1, "free MFT records %llu exceed total %llu after extension",
+		  (unsigned long long)free1, (unsigned long long)total1);
+	/* And it must agree with the bitmap truth a remount rescans. */
+	vol_down(&v);
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		CHECK_MSG(0, "remount failed");
+		goto out;
+	}
+	CHECK(ntfs_volume_get_info(v.vol, &info) == 0);
+	free2 = info.free_mft_records;
+	CHECK_MSG(free1 == free2, "free MFT records %llu before remount, %llu after (bitmap rescan)",
+		  (unsigned long long)free1, (unsigned long long)free2);
+out:
+	vol_down(&v);
+	fsck_clean("mft free records");
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -4387,6 +4469,7 @@ int main(void)
 	test_attrlist_update_inactive_sb();
 	test_ea_stream_rewrite();
 	test_ea_pair_teardown();
+	test_mft_free_records_track_extension();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

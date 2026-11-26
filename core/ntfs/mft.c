@@ -1534,7 +1534,13 @@ static int ntfs_mft_bitmap_extend_initialized_nolock(struct ntfs_volume *vol)
 	ret = ntfs_attr_set(mftbmp_ni, old_initialized_size, 8, 0);
 	if (likely(!ret)) {
 		ntfs_debug("Done.  (Wrote eight initialized bytes to mft bitmap.");
-		ntfs_inc_free_mft_records(vol, 8 * 8);
+		/*
+		 * Upstream 631946431ddc: no fixed +64 credit here any
+		 * more. The records newly visible through the $MFT size
+		 * are credited in ntfs_mft_record_alloc() from the
+		 * actual size growth, so a dynamically sized tail
+		 * reserve no longer over-counts free records.
+		 */
 		return 0;
 	}
 	ntfs_error(vol->sb, "Failed to write to mft bitmap.");
@@ -2137,6 +2143,7 @@ int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 			  struct mft_record **ni_mrec)
 {
 	s64 ll, bit, old_data_initialized, old_data_size;
+	s64 nr_new_mft_records = 0;
 	unsigned long flags;
 	struct folio *folio;
 	struct ntfs_inode *mft_ni, *mftbmp_ni;
@@ -2402,8 +2409,18 @@ have_alloc_rec:
 			mft_ni->initialized_size);
 	WARN_ON(i_size_read(vol->mft_ino) > mft_ni->allocated_size);
 	WARN_ON(mft_ni->initialized_size > i_size_read(vol->mft_ino));
+	/*
+	 * Upstream 631946431ddc: the records newly visible through
+	 * the $MFT size are counted from the actual growth, not a
+	 * fixed 64 per bitmap extend.
+	 */
+	nr_new_mft_records = (i_size_read(vol->mft_ino) - old_data_size) >>
+			     vol->mft_record_size_bits;
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 mft_rec_already_initialized:
+	/* Account for newly visible MFT records before dropping the lock. */
+	if (nr_new_mft_records > 0)
+		ntfs_inc_free_mft_records(vol, nr_new_mft_records);
 	/*
 	 * We can finally drop the mft bitmap lock as the mft data attribute
 	 * has been fully updated.  The only disparity left is that the
@@ -2692,6 +2709,13 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 	if (base_ni->mft_no != FILE_MFT)
 		down_write(&vol->mftbmp_lock);
 	err = ntfs_bitmap_clear_bit(vol->mftbmp_ino, mft_no);
+	/*
+	 * Upstream 631946431ddc: credit the freed record only when
+	 * the bitmap bit was actually cleared. The old code credited
+	 * unconditionally after unmap_mft_record(), even on failure.
+	 */
+	if (!err)
+		ntfs_inc_free_mft_records(vol, 1);
 	if (base_ni->mft_no != FILE_MFT)
 		up_write(&vol->mftbmp_lock);
 	memalloc_nofs_restore(memalloc_flags);
@@ -2699,7 +2723,6 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 		goto bitmap_rollback;
 
 	unmap_mft_record(ni);
-	ntfs_inc_free_mft_records(vol, 1);
 	return 0;
 
 	/* Rollback what we did... */

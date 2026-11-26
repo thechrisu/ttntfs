@@ -247,17 +247,17 @@ static inline void ntfs_dec_free_clusters(struct ntfs_volume *vol, s64 nr)
 
 static inline void ntfs_inc_free_mft_records(struct ntfs_volume *vol, s64 nr)
 {
-	if (!NVolFreeClusterKnown(vol))
-		return;
-
+	/*
+	 * Upstream 631946431ddc: MFT counter updates are independent
+	 * of the asynchronous free-cluster scan -- the old
+	 * NVolFreeClusterKnown gate dropped allocations made before
+	 * the scan completed.
+	 */
 	atomic64_add(nr, &vol->free_mft_records);
 }
 
 static inline void ntfs_dec_free_mft_records(struct ntfs_volume *vol, s64 nr)
 {
-	if (!NVolFreeClusterKnown(vol))
-		return;
-
 	atomic64_sub(nr, &vol->free_mft_records);
 }
 
