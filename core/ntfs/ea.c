@@ -198,6 +198,9 @@ static int ntfs_set_ea(struct inode *inode, const char *name, size_t name_len,
 	struct ea_attr *p_ea;
 	u32 ea_info_qsize = 0;
 	char *ea_buf = NULL;
+	char *new_ea_buf;
+	char *old_ea_buf = NULL;
+	struct ea_information old_ea_info;
 	size_t new_ea_size = ALIGN(struct_size(p_ea, ea_name, 1 + name_len + val_size), 4);
 	s64 ea_off, ea_info_size, all_ea_size, ea_size;
 
@@ -264,6 +267,20 @@ create_ea_info:
 			goto out;
 		}
 
+		/* PORT: upstream 41e1cf4ec10d: snapshot the stream
+		 * before removing the old entry, so a failed metadata
+		 * update below can restore it. kvmemdup does not
+		 * exist in the port; kvzalloc + memcpy is the same. */
+		if ((flags & XATTR_REPLACE) && !val_size) {
+			old_ea_info = *p_ea_info;
+			old_ea_buf = kvzalloc(all_ea_size, GFP_NOFS);
+			if (!old_ea_buf) {
+				err = -ENOMEM;
+				goto out;
+			}
+			memcpy(old_ea_buf, ea_buf, all_ea_size);
+		}
+
 		/* PORT: upstream 650a2751c9ae: check the final $EA size
 		 * before removing the old entry. The old code only checked
 		 * the new entry's size at the end, after the shortened
@@ -294,17 +311,54 @@ create_ea_info:
 		ea_info_qsize -= ea_size;
 		p_ea_info->ea_query_length = cpu_to_le32(ea_info_qsize);
 
-		err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
-				sizeof(struct ea_information), false);
-		if (err)
-			goto out;
+		/* PORT: upstream 41e1cf4ec10d: tear the $EA /
+		 * $EA_INFORMATION pair down when the last entry is
+		 * removed. This block did not exist in the port (the
+		 * pair was left behind empty); it is restored here
+		 * with the fix's restore-on-failure: if removing
+		 * $EA_INFORMATION fails after $EA is gone, the
+		 * original $EA is put back so the two stay consistent. */
+		if ((flags & XATTR_REPLACE) && !val_size && !ea_info_qsize) {
+			err = ntfs_attr_remove(ni, AT_EA, AT_UNNAMED, 0);
+			if (err)
+				goto out;
 
-		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, ea_info_qsize, true);
-		if (err)
+			err = ntfs_attr_remove(ni, AT_EA_INFORMATION, AT_UNNAMED, 0);
+			if (err) {
+				/* Restore the original $EA if $EA_INFORMATION removal failed. */
+				ntfs_attr_add(ni, AT_EA, AT_UNNAMED, 0, old_ea_buf,
+					      all_ea_size);
+				ea_info_qsize = le32_to_cpu(old_ea_info.ea_query_length);
+			}
 			goto out;
+		}
 
+		/* PORT: upstream 41e1cf4ec10d: on removal, write the
+		 * compacted $EA stream first and $EA_INFORMATION
+		 * after it, restoring the original pair if either
+		 * write fails. The old order (info first, then $EA)
+		 * is gone: a replacement with a new value no longer
+		 * commits the compacted stream here at all -- it
+		 * falls through to alloc_new_ea, which rewrites the
+		 * whole stream from offset zero. */
 		if ((flags & XATTR_REPLACE) && !val_size) {
-			/* Remove xattr. */
+			err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, ea_info_qsize,
+					    true);
+			if (err) {
+				ntfs_write_ea(ni, AT_EA, old_ea_buf, 0,
+					      all_ea_size, false);
+				goto out;
+			}
+
+			err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info,
+					    0, sizeof(struct ea_information), false);
+			if (err) {
+				ntfs_write_ea(ni, AT_EA, old_ea_buf, 0,
+					      all_ea_size, false);
+				ntfs_write_ea(ni, AT_EA_INFORMATION,
+					      (char *)&old_ea_info, 0,
+					      sizeof(old_ea_info), false);
+			}
 			goto out;
 		}
 	} else {
@@ -321,21 +375,29 @@ create_ea_info:
 			goto out;
 		}
 	}
-	kvfree(ea_buf);
-
 alloc_new_ea:
-	ea_buf = kzalloc(new_ea_size, GFP_NOFS);
-	if (!ea_buf) {
+	/* PORT: upstream 41e1cf4ec10d: build the complete $EA
+	 * stream in memory -- the surviving compacted entries
+	 * followed by the new one -- and rewrite it from offset
+	 * zero below, instead of appending the new entry at
+	 * ea_info_qsize after a separately committed compacted
+	 * stream. */
+	new_ea_buf = kvzalloc(ea_info_qsize + new_ea_size, GFP_NOFS);
+	if (!new_ea_buf) {
 		err = -ENOMEM;
 		goto out;
 	}
+	if (ea_info_qsize)
+		memcpy(new_ea_buf, ea_buf, ea_info_qsize);
+	kvfree(ea_buf);
+	ea_buf = new_ea_buf;
+	p_ea = (struct ea_attr *)(ea_buf + ea_info_qsize);
 
 	/*
 	 * EA and REPARSE_POINT compatibility not checked any more,
 	 * required by Windows 10, but having both may lead to
 	 * problems with earlier versions.
 	 */
-	p_ea = (struct ea_attr *)ea_buf;
 	memcpy(p_ea->ea_name, name, name_len);
 	p_ea->ea_name_length = name_len;
 	p_ea->ea_name[name_len] = 0;
@@ -357,14 +419,17 @@ alloc_new_ea:
 	/*
 	 * no EA or EA_INFORMATION : add them
 	 */
+	/* PORT: upstream 41e1cf4ec10d: the whole stream (surviving
+	 * entries + new entry) is written from offset zero, not
+	 * appended at ea_info_qsize. */
 	if (!ntfs_attr_exist(ni, AT_EA, AT_UNNAMED, 0)) {
-		err = ntfs_attr_add(ni, AT_EA, AT_UNNAMED, 0, (char *)p_ea,
-				new_ea_size);
+		err = ntfs_attr_add(ni, AT_EA, AT_UNNAMED, 0, ea_buf,
+				    ea_info_qsize + new_ea_size);
 		if (err)
 			goto out;
 	} else {
-		err = ntfs_write_ea(ni, AT_EA, (char *)p_ea, ea_info_qsize,
-				new_ea_size, false);
+		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0,
+				    ea_info_qsize + new_ea_size, true);
 		if (err)
 			goto out;
 	}
@@ -374,14 +439,11 @@ alloc_new_ea:
 	 * $EA), so without this the out: label below sees 0 and clears
 	 * the HasEA flag even though the $EA was just created, and a
 	 * same-mount getxattr returns -ENODATA until remount. Fork-found
-	 * bug, no upstream fix in the v7.1 -> v7.3 drift. This must sit
-	 * AFTER the $EA write above: the append branch writes the new
-	 * entry at offset ea_info_qsize, so incrementing earlier would
-	 * land the entry one entry too far and leave a gap the lookup
-	 * never crosses. Note: on a set that fails after this point the
-	 * flag can now be set while the stream was not written; upstream
-	 * ac727d86fb84 (still in the port queue) closes that hole by
-	 * leaving HasEA untouched on setxattr failure. */
+	 * bug, no upstream fix in the v7.1 -> v7.3 drift. Note: on a set
+	 * that fails after this point the flag can now be set while the
+	 * stream was not written; upstream ac727d86fb84 (still in the
+	 * port queue) closes that hole by leaving HasEA untouched on
+	 * setxattr failure. */
 	ea_info_qsize += new_ea_size;
 
 	err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
@@ -399,9 +461,30 @@ out:
 		NInoClearHasEA(ni);
 
 	kvfree(ea_buf);
+	kvfree(old_ea_buf);
 	kvfree(p_ea_info);
 
 	return err;
+}
+
+/*
+ * Test hook: whether the $EA / $EA_INFORMATION pair exists on the
+ * file (bit 1 = $EA, bit 2 = $EA_INFORMATION). The test TU cannot
+ * call ntfs_attr_exist() itself (attrib.h is not includable --
+ * struct ntfs_attr collides with ntfscore.h), so the check lives
+ * here. Used by the 41e1cf4ec10d test to assert the pair is torn
+ * down when the last EA entry is removed.
+ */
+int ntfs_ea_pair_exists_vfs(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	int r = 0;
+
+	if (ntfs_attr_exist(ni, AT_EA, AT_UNNAMED, 0))
+		r |= 1;
+	if (ntfs_attr_exist(ni, AT_EA_INFORMATION, AT_UNNAMED, 0))
+		r |= 2;
+	return r;
 }
 
 /*

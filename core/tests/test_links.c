@@ -2664,6 +2664,14 @@ static int ea_set(ntfs_inode_t *f, const char *name, const void *val,
 	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, 0);
 }
 
+static int ea_remove(ntfs_inode_t *f, const char *name)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, NULL, 0,
+		      XATTR_REPLACE);
+}
+
 static int ea_get(ntfs_inode_t *f, const char *name, void *buf, size_t size)
 {
 	const struct xattr_handler *h = ntfs_xattr_handlers[0];
@@ -3788,6 +3796,274 @@ static void test_attrlist_update_inactive_sb(void)
 	unlink(scratch);
 }
 
+/* ---- 21. EA stream rewrite (upstream 41e1cf4ec10d) --- */
+
+/*
+ * Upstream 41e1cf4ec10d: updating an EA removed the old record and
+ * appended its replacement -- the compacted stream was committed
+ * first, then the new entry appended at ea_info_qsize.
+ * generic/642 (fsstress xattr churn, including large values)
+ * showed the append path can leave an invalid record layout on
+ * disk. The fix builds the complete $EA stream in memory and
+ * rewrites it from offset zero, and writes the compacted stream
+ * before $EA_INFORMATION on removal (restoring the original pair
+ * if the metadata update fails).
+ *
+ * The test churns a file's EAs through the VFS handler --
+ * set/replace-with-large-value/remove/add -- and checks after
+ * every step that every surviving entry reads back with the
+ * right value and removed entries are -ENODATA, then remounts
+ * and checks again (the on-disk layout must be valid). The
+ * teardown half (last entry removed) is covered by
+ * test_ea_pair_teardown below, on a fixture file with no $LX*
+ * entries: driver-created files always keep $LXUID/$LXGID/$LXMOD,
+ * so their stream is never empty.
+ */
+int ntfs_ea_pair_exists_vfs(struct inode *vi);
+
+static void test_ea_stream_rewrite(void)
+{
+	static char val8k[8192], val8k2[8192];
+	static char small_a[4] = { 'A', 'A', 'A', 'A' };
+	static char small_b[4] = { 'B', 'B', 'B', 'B' };
+	static char small_c[4] = { 'C', 'C', 'C', 'C' };
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	char buf[8192];
+	int err;
+
+	printf("test_ea_stream_rewrite\n");
+	memset(val8k, 'A', sizeof(val8k));
+	memset(val8k2, 'D', sizeof(val8k2));
+	if (copy_fixture("earewrite") != 0) {
+		fprintf(stderr, "SKIP test_ea_stream_rewrite: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_stream_rewrite: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "rw.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_stream_rewrite: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* Three small entries. */
+	err = ea_set(f, "user.a", small_a, sizeof(small_a));
+	CHECK(err == 0);
+	err = ea_set(f, "user.b", small_b, sizeof(small_b));
+	CHECK(err == 0);
+	err = ea_set(f, "user.c", small_c, sizeof(small_c));
+	CHECK(err == 0);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_a));
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_b));
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_c));
+	/* Replace the first entry with a large value: the old code
+	 * compacted the stream and appended the new entry; the new
+	 * code rewrites the whole stream. Every entry must stay
+	 * reachable. */
+	err = ea_set(f, "user.a", val8k, sizeof(val8k));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-rewrite: replace user.a returned %d\n", err);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val8k));
+	if (err == (int)sizeof(val8k))
+		CHECK(memcmp(buf, val8k, sizeof(val8k)) == 0);
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_b));
+	if (err == (int)sizeof(small_b))
+		CHECK(memcmp(buf, small_b, sizeof(small_b)) == 0);
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_c));
+	if (err == (int)sizeof(small_c))
+		CHECK(memcmp(buf, small_c, sizeof(small_c)) == 0);
+	/* Remove the middle entry, then add a large one. */
+	err = ea_remove(f, "user.b");
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-rewrite: remove user.b returned %d\n", err);
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val8k));
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_c));
+	err = ea_set(f, "user.d", val8k2, sizeof(val8k2));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-rewrite: set user.d returned %d\n", err);
+	err = ea_get(f, "user.d", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val8k2));
+	if (err == (int)sizeof(val8k2))
+		CHECK(memcmp(buf, val8k2, sizeof(val8k2)) == 0);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val8k));
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(small_c));
+	/* Remove the remaining user entries ($LX* stay). */
+	err = ea_remove(f, "user.a");
+	CHECK(err == 0);
+	err = ea_remove(f, "user.c");
+	CHECK(err == 0);
+	err = ea_remove(f, "user.d");
+	CHECK(err == 0);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.d", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "$LXUID", buf, sizeof(buf));
+	CHECK(err == 4);
+	ntfs_inode_put(f);
+	f = NULL;
+	vol_down(&v);
+	/* Remount: the churned stream must parse back from disk. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_stream_rewrite: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "rw.bin", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_stream_rewrite: re-lookup failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.c", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "user.d", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	err = ea_get(f, "$LXUID", buf, sizeof(buf));
+	CHECK(err == 4);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/* ---- 22. EA pair teardown on last removal (upstream 41e1cf4ec10d) --- */
+
+/*
+ * Same upstream commit, second half: when the final EA entry is
+ * removed the $EA / $EA_INFORMATION pair is torn down, and if
+ * removing $EA_INFORMATION fails after $EA is already gone the
+ * original $EA is restored. The port did not have the teardown
+ * block at all (the pair was left behind empty); it is restored
+ * here with the fix's restore logic.
+ *
+ * /nested/top.bin is a fixture file with no $LX* entries, so
+ * removing its only user EA empties the stream and must tear
+ * the pair down. The pair's presence is checked with the
+ * ntfs_ea_pair_exists_vfs() hook (bit 1 = $EA, bit 2 =
+ * $EA_INFORMATION): without the fix the pair is left behind
+ * (3) after the removal.
+ */
+static void test_ea_pair_teardown(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL, *nested = NULL;
+	char buf[16];
+	int err, pair;
+
+	printf("test_ea_pair_teardown\n");
+	if (copy_fixture("eateardown") != 0) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "nested", &nested) != 0 || !nested) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: nested lookup failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(nested, "top.bin", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: top.bin lookup failed\n");
+		ntfs_inode_put(nested);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	pair = ntfs_ea_pair_exists_vfs((struct inode *)f);
+	CHECK(pair == 0);
+	if (pair != 0)
+		fprintf(stderr, "FAIL ea-teardown: fixture file already has EA pair (%d)\n", pair);
+	err = ea_set(f, "user.a", "AAAA", 4);
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-teardown: set user.a returned %d\n", err);
+	pair = ntfs_ea_pair_exists_vfs((struct inode *)f);
+	CHECK(pair == 3);
+	if (pair != 3)
+		fprintf(stderr, "FAIL ea-teardown: pair after set is %d, expected 3\n", pair);
+	err = ea_remove(f, "user.a");
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-teardown: remove user.a returned %d\n", err);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	pair = ntfs_ea_pair_exists_vfs((struct inode *)f);
+	CHECK(pair == 0);
+	if (pair != 0)
+		fprintf(stderr, "FAIL ea-teardown: pair after last removal is %d, expected 0 (torn down)\n", pair);
+	/* The create path works again after the teardown. */
+	err = ea_set(f, "user.b", "BBBB", 4);
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea-teardown: set user.b after teardown returned %d\n", err);
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == 4);
+	if (err == 4)
+		CHECK(memcmp(buf, "BBBB", 4) == 0);
+	ntfs_inode_put(f);
+	ntfs_inode_put(nested);
+	f = nested = NULL;
+	vol_down(&v);
+	/* Remount: the re-added entry must parse back from disk. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "nested", &nested) != 0 || !nested) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: nested re-lookup failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(nested, "top.bin", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_pair_teardown: top.bin re-lookup failed\n");
+		ntfs_inode_put(nested);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.b", buf, sizeof(buf));
+	CHECK(err == 4);
+	if (err == 4)
+		CHECK(memcmp(buf, "BBBB", 4) == 0);
+	err = ea_get(f, "user.a", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	ntfs_inode_put(f);
+	ntfs_inode_put(nested);
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -3817,6 +4093,8 @@ int main(void)
 	test_reparse_dt_unknown_on_lookup_failure();
 	test_reserved_lxattr_rejected();
 	test_attrlist_update_inactive_sb();
+	test_ea_stream_rewrite();
+	test_ea_pair_teardown();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

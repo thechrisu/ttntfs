@@ -957,6 +957,38 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   32 port items remain.
 
+- 2026-11-26: `41e1cf4ec10d` (rewrite EA stream before updating
+  metadata) — ported: `ntfs_set_ea()` (core/ntfs/ea.c) now builds
+  the complete $EA stream in memory and rewrites it from offset
+  zero instead of committing a compacted stream and appending
+  the new entry at ea_info_qsize; on removal the compacted $EA
+  is written before $EA_INFORMATION, restoring the original pair
+  if either write fails; when the last entry is removed the $EA /
+  $EA_INFORMATION pair is torn down, restoring the original $EA
+  if the $EA_INFORMATION removal fails. The port did not have
+  the teardown block at all (the pair was left behind empty);
+  restored here with the fix's restore logic. PORT: kvmemdup
+  does not exist in the port, so the snapshot uses kvzalloc +
+  memcpy. New tests in core/tests/test_links.c:
+  `test_ea_stream_rewrite` (set/replace-with-8K/remove/add
+  churn, every surviving entry verified after each step, then
+  remount) and `test_ea_pair_teardown` (fixture file
+  /nested/top.bin has no $LX* entries, so removing its only
+  user EA must tear the pair down; pair presence via the new
+  `ntfs_ea_pair_exists_vfs()` hook in ea.c). Evidence:
+  test_links 571 checks, 0 failures with the fix; without it
+  exactly 1 failure (the pair is left behind, value 3, after
+  the last removal) -- negative control used the pre-fix ea.c
+  from GitHub main plus only the test hook, diff-verified.
+  The stream test passes on old code too (single-threaded end
+  state is identical; the rewrite's benefit is the
+  crash-consistency / fsstress layout class from generic/642),
+  but it guards the rewrite's correctness (a misplaced entry
+  would read back -ENODATA). Plain ctest 15/15, UBSan ctest
+  15/15, `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  31 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
