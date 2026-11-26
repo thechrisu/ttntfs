@@ -989,6 +989,32 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   31 port items remain.
 
+- 2026-11-26: `772e4c8f2555` (remove empty EA attribute pair) —
+  already covered by the 41e1cf4ec10d port above: the teardown
+  block it adds is a subset of what that port restored (the two
+  $EA / $EA_INFORMATION removes, plus restore-on-failure), and
+  test_ea_pair_teardown verifies it. No separate code change.
+
+- 2026-11-26: `ac727d86fb84` (leave HasEA flag untouched on
+  setxattr failure) — ported: the `out:` label in ntfs_set_ea()
+  (core/ntfs/ea.c) now only updates HasEA on success. An error
+  before ea_info_qsize was set (e.g. a failed $EA read) used to
+  clear the flag and hide existing on-disk EAs until the inode
+  was evicted. The fork-found HasEA comment in the same function
+  is updated: ac727d86fb84 is now ported, so the failure hole it
+  used to leave open is closed. New test
+  test_hasea_untouched_on_set_failure (core/tests/test_links.c):
+  OOB-$EA fixture (same patch as
+  test_readall_error_propagates); a set fails with -EIO while
+  ea_info_qsize is still 0, and the following get is the
+  discriminator -- -ENODATA without the fix (flag cleared), -EIO
+  with it (flag intact, read attempted). Evidence: test_links
+  797 checks, 0 failures with the fix (under ctest); without it
+  exactly 1 failure (get returns -61/-ENODATA). Plain ctest
+  15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed 0
+  failed with NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  30 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

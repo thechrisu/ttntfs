@@ -3273,6 +3273,121 @@ static void test_readall_error_propagates(void)
 }
 
 /*
+ * Upstream ac727d86fb84: the ntfs_set_ea() exit path updated the
+ * HasEA flag unconditionally, so an error before ea_info_qsize
+ * was set cleared the flag and hid existing on-disk EAs until
+ * the inode was evicted. The flag must only be updated on
+ * success.
+ *
+ * Same OOB-$EA fixture as test_readall_error_propagates: after
+ * the patch, a set fails on the $EA read with -EIO while
+ * ea_info_qsize is still 0. The discriminator is the get that
+ * follows it: with the old code the failed set cleared HasEA,
+ * so the get reports -ENODATA (as if no EA existed); with the
+ * fix the flag is untouched and the get reaches the $EA read
+ * and reports -EIO.
+ */
+static void test_hasea_untouched_on_set_failure(void)
+{
+	static char val8k[8192];
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	uint64_t mft_no;
+	char cmd[2048], out[256];
+	const char *py = getenv("NTFS_PATCH_OOB_EA");
+	char buf[8192];
+	int err;
+	FILE *p;
+	int rc;
+
+	printf("test_hasea_untouched_on_set_failure\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: NTFS_PATCH_OOB_EA not set\n");
+		return;
+	}
+	memset(val8k, 'A', sizeof(val8k));
+	if (copy_fixture("readall-ea") != 0) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "ea3.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	mft_no = ntfs_inode_number(f);
+	if (ea_set(f, "user.big", val8k, sizeof(val8k)) != 0) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: setup set failed\n");
+		ntfs_inode_put(f);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	if (err != 8192) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: setup get returned %d\n", err);
+		ntfs_inode_put(f);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_volume_sync(v.vol) == 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	vol_down(&v);
+
+	/* Rewrite the $EA run out of the volume, on disk. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu",
+		 py, scratch, (unsigned long long)mft_no);
+	p = popen(cmd, "r");
+	if (!p || !fgets(out, sizeof(out), p)) {
+		fprintf(stderr, "FAIL patch_oob_ea.py produced no output\n");
+		failures++; checks++;
+		if (p) pclose(p);
+		unlink(scratch);
+		return;
+	}
+	rc = pclose(p);
+	CHECK(rc == 0);
+
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "ea3.bin", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_hasea_untouched_on_set_failure: lookup failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* The set fails on the $EA read (-EIO) with ea_info_qsize
+	 * still 0. Old: the exit path clears HasEA. New: the flag
+	 * is left alone. */
+	err = ea_set(f, "user.other", "x", 1);
+	CHECK(err == -EIO);
+	if (err != -EIO)
+		fprintf(stderr, "FAIL ea set on corrupt $EA: returned %d, expected -EIO (-5)\n", err);
+	/* The get is the discriminator. Old: -ENODATA (HasEA was
+	 * cleared, so the get bails before touching the disk). New:
+	 * -EIO (HasEA is intact, so the get reaches the $EA read
+	 * and reports the real error). */
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	CHECK(err == -EIO);
+	if (err != -EIO)
+		fprintf(stderr, "FAIL ea get after failed set: returned %d, expected -EIO (-5)\n", err);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 8efe00b098b5 + ba1b61ddaa76: ntfs_resident_attr_record_add()
  * collapsed every failure to -EIO at its put_err_out label, and
  * ntfs_non_resident_attr_record_add() returned the literal -1
@@ -4088,6 +4203,7 @@ int main(void)
 	test_getxattr_erange();
 	test_folio_fullpage_write();
 	test_readall_error_propagates();
+	test_hasea_untouched_on_set_failure();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
 	test_reparse_dt_unknown_on_lookup_failure();

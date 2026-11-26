@@ -439,11 +439,11 @@ alloc_new_ea:
 	 * $EA), so without this the out: label below sees 0 and clears
 	 * the HasEA flag even though the $EA was just created, and a
 	 * same-mount getxattr returns -ENODATA until remount. Fork-found
-	 * bug, no upstream fix in the v7.1 -> v7.3 drift. Note: on a set
-	 * that fails after this point the flag can now be set while the
-	 * stream was not written; upstream ac727d86fb84 (still in the
-	 * port queue) closes that hole by leaving HasEA untouched on
-	 * setxattr failure. */
+	 * bug, no upstream fix in the v7.1 -> v7.3 drift. (Upstream
+	 * ac727d86fb84, ported below, closes the failure hole this
+	 * used to leave open: the flag is now only updated on
+	 * success, so a set that fails after this point leaves the
+	 * flag untouched instead of setting it.) */
 	ea_info_qsize += new_ea_size;
 
 	err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
@@ -455,10 +455,17 @@ alloc_new_ea:
 		*packed_ea_size = p_ea_info->ea_length;
 	mark_mft_record_dirty(ni);
 out:
-	if (ea_info_qsize > 0)
-		NInoSetHasEA(ni);
-	else
-		NInoClearHasEA(ni);
+	/* PORT: upstream ac727d86fb84: only update the HasEA flag
+	 * on success. The exit path used to update it
+	 * unconditionally, so an error before ea_info_qsize was
+	 * set (e.g. a failed $EA read) cleared the flag and hid
+	 * existing on-disk EAs until the inode was evicted. */
+	if (!err) {
+		if (ea_info_qsize > 0)
+			NInoSetHasEA(ni);
+		else
+			NInoClearHasEA(ni);
+	}
 
 	kvfree(ea_buf);
 	kvfree(old_ea_buf);
