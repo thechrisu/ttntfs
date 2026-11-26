@@ -1031,6 +1031,24 @@ Porting progress (one commit per item, in the order above):
   passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   29 port items remain.
 
+- 2026-11-26: `4dc8f4ee2d46` (handle signal interruption in
+  fallocate) — ported verbatim: both signal_pending() checks in
+  ntfs_attr_fallocate() (core/ntfs/attrib.c) now jump to a new
+  signal_out: label that sets err = -EINTR only when no other
+  error is pending, preserving a completed allocation (err == 0
+  after the loops) and other errors. NOTE: in this port
+  signal_pending() is #defined to 0
+  (platform/include/linux/kernel.h:110 -- the port has no
+  task/signal model), so neither check can fire and no
+  discriminating test is possible; the change is provably
+  behavior-preserving here and is applied for upstream fidelity.
+  The affected loops are exercised by the existing fallocate
+  coverage (test_compress.c: 1MB keep_size fallocate, 531
+  checks, 0 failures). Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  28 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

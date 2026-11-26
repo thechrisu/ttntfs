@@ -5633,7 +5633,7 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 					goto out;
 
 				if (signal_pending(current))
-					goto out;
+					goto signal_out;
 
 				vcn += alloc_cnt;
 				try_alloc_cnt -= alloc_cnt;
@@ -5654,7 +5654,7 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 		up_write(&ni->runlist.lock);
 		mutex_unlock(&ni->mrec_lock);
 		if (err || signal_pending(current))
-			goto out;
+			goto signal_out;
 
 		vcn += alloc_cnt;
 		try_alloc_cnt -= alloc_cnt;
@@ -5680,4 +5680,20 @@ out_unmap:
 	mutex_unlock(&ni->mrec_lock);
 out:
 	return err >= 0 ? 0 : err;
+	/* PORT: upstream 4dc8f4ee2d46: a signal interrupting the
+	 * allocation loops used to return success (err == 0 at the
+	 * goto). Route through signal_out so an interrupted
+	 * allocation returns -EINTR, while a completed allocation
+	 * (err == 0 after the loops) and other errors are
+	 * preserved. NOTE: in this port signal_pending() is
+	 * #defined to 0 (platform/include/linux/kernel.h:110 --
+	 * the port has no task/signal model), so neither check can
+	 * fire here and no discriminating test is possible; the
+	 * fix is applied verbatim for upstream fidelity, and the
+	 * affected loops are exercised by the existing fallocate
+	 * coverage (test_compress.c: 1MB keep_size fallocate). */
+signal_out:
+	if (!err)
+		err = -EINTR;
+	goto out;
 }
