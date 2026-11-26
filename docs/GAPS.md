@@ -1566,6 +1566,41 @@ Porting progress (one commit per item, in the order above):
   pre-push 9/9 PASS (379 s).
   8 port items remain.
 
+- 2026-11-26: `b54559689a00` (fix initialized size and page state
+  after compressed writes) — ported. Two of upstream's three hunks
+  in `ntfs_compress_write()` (core/ntfs/compress.c): the `!copied`
+  guard returns -EFAULT via the new `release_pages:` label instead
+  of calling `ntfs_write_cb` with zero bytes copied, and the
+  page-state loop is now `if (!err) { clear_dirty; mark_uptodate; }
+  else { clear_uptodate; }` instead of `if (i < ip)` marking pages
+  uptodate unconditionally even on error. The initialized-size hunk
+  was deliberately NOT ported per-block: the port already publishes
+  initialized_size once at the end of the function, only for a write
+  that ran to completion (PORT comment at :1633) — a more
+  conservative choice than upstream's per-block publication, kept on
+  purpose. New discriminating test: a pre-unmount read-back
+  assertion in `test_compressed_block_survives_failed_rewrite()`
+  (core/tests/test_compress.c) — after the ENOSPC failed overwrite
+  of a compressed block, the OLD block must read back, not the new
+  bytes sitting in the cache. Negative control (page-state hunk only
+  reverted, `!copied` guard kept): test_compress 493 checks /
+  1 failure, exactly the new assertion (`first_diff` at
+  test_compress.c:1729; the failed write had copied 65536 bytes,
+  ip=15, then `ntfs_write_cb` failed -ENOSPC); with the fix 493 / 0.
+  Lesson from this item, recorded so it is not re-learned: manual
+  test runs must execute from the repo root — from `build/` the
+  relative tool paths (`tools/.local/sbin/mkntfs`) break,
+  `make_image()` SKIPs silently, and the test is vacuous (0 checks,
+  0 failures, nothing tested). The first "positive" and "negative"
+  runs of this item were both vacuous for exactly that reason; the
+  real negative control only ran once the binary was executed from
+  the repo root.
+  Evidence (this commit): test_compress 493 checks, 0 failures;
+  plain ctest 15/15 (125 s), UBSan ctest 15/15 (137 s), ASan ctest
+  15/15 (153 s), `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (697 s, slow under load).
+  7 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

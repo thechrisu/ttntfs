@@ -1715,6 +1715,17 @@ static void test_compressed_block_survives_failed_rewrite(void)
 	w = ntfs_write(f, new_block, CB_SIZE, 0);
 	CHECK_EQ(w, -ENOSPC, "overwrite of a compressed block on a full volume "
 		 "must fail ENOSPC");
+	/* Upstream b54559689a00, page-state half: the failed write copied
+	 * the new block into the page cache before ntfs_write_cb failed,
+	 * so the folios must not be left uptodate — a read-back here, with
+	 * no unmount in between, must return the OLD block from the disk,
+	 * not the new bytes sitting in the cache. Without the fix the
+	 * folios are marked uptodate unconditionally and this read
+	 * returns the new block. */
+	CHECK_EQ(read_exact(f, back, CB_SIZE, 0), 0,
+		 "read victim after failed overwrite, before unmount -- new "
+		 "bytes here mean the failed write left stale uptodate pages");
+	CHECK(first_diff(old_block, back, CB_SIZE) < 0);
 	ntfs_inode_put(f);
 	f = NULL;
 	ntfs_inode_put(root);

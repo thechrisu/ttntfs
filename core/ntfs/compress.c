@@ -1609,13 +1609,21 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 			}
 		}
 
+		if (!copied) {
+			err = -EFAULT;
+			goto release_pages;
+		}
+
 		err = ntfs_write_cb(ni, pos, pages, pages_per_cb);
 
+release_pages:
 		for (i = 0; i < pages_per_cb; i++) {
 			folio = page_folio(pages[i]);
-			if (i < ip) {
+			if (!err) {
 				folio_clear_dirty(folio);
 				folio_mark_uptodate(folio);
+			} else {
+				folio_clear_uptodate(folio);
 			}
 			folio_unlock(folio);
 			folio_put(folio);
