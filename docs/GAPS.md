@@ -1113,6 +1113,27 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   25 port items remain.
 
+- 2026-11-26: `81fe702ff176` (avoid stale runlist element
+  dereference in MFT writeback) — ported:
+  ntfs_write_mft_block() (core/ntfs/mft.c) now computes the
+  remaining run length (rl_len) while the runlist lock is held
+  and uses that scalar for the folio_sz decision after unlock,
+  instead of carrying the borrowed runlist_element across the
+  lock boundary. NOTE: unlike the fallocate twin
+  (88496c4ac5a6), this race is theoretically reachable in the
+  port -- writeback is an async path (sync/flush) while $MFT
+  allocation extension runs on request threads -- but no
+  discriminating test is possible in the single-threaded UBSan
+  harness (it needs a concurrent writer plus ASan to observe);
+  applied verbatim for upstream fidelity. The function is
+  exercised by every test that creates files and syncs.
+  Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  (Pre-push initially failed at the darwin stage: a cell
+  rebuild had wiped /tmp and removed clang; reinstalled clang
+  18.1.3 via apt, darwin stage green again.)
+  24 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
