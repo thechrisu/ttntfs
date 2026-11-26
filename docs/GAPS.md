@@ -598,6 +598,33 @@ Porting progress (one commit per item, in the order above):
   Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
   0 failed with NTFS_REQUIRE_FSCK=1.
   45 port items remain.
+- 2026-11-26: `a83e82b0ec3a` + `ffc755828de1` (non-resident attribute
+  validation) — ported: the port has no
+  `ntfs_non_resident_attr_value_is_valid()`; the inline validator in
+  `ntfs_attr_find()` (`core/ntfs/attrib.c`) checked only
+  mapping_pairs_offset bounds. It now also raises min_len from 64 to
+  72 for sparse/compressed attrs (ffc755828de1), requires the name to
+  lie within the attribute without overlapping the mapping pairs, and
+  requires 8 bytes of room after mapping_pairs_offset for the
+  compressed_size field a sparse conversion would add (a83e82b0ec3a).
+  New test `test_nonres_attr_validation` in `core/tests/test_links.c`
+  plus fixture patcher `tools/mkfixtures/patch_nonres_attr.py` with
+  three cases, each on its own fixture copy: room64 (unnamed $DATA
+  length := 64, room 0 < 8), sparse64 (same + ATTR_IS_SPARSE, isolates
+  the min_len-72 check since the room check is skipped for sparse),
+  mpinside (ADS mapping_pairs_offset inside the name, so
+  name_end > mp_offset). The trigger must stop at the attribute find
+  (lookup for the unnamed $DATA, getxattr size query for the ADS): a
+  read is NOT discriminating, because the mapping-pairs decompressor
+  bounds the pairs by the attribute length (so a length-64 $DATA fails
+  there in both builds) and ntfs_attr_iget already refuses
+  name_offset >= mp_offset (so mp_offset := 64 fails in both builds).
+  Evidence: test_links 482 checks 0 failures with the fix; without it
+  exactly 3 failures, one per case (operations return 0 instead of
+  -EIO). No fsck_clean for this test: the images are deliberately
+  corrupt. Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all`
+  265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  44 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

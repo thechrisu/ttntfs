@@ -2427,6 +2427,157 @@ static void test_lookup_err_mref_normalized(void)
 	unlink(scratch);
 }
 
+/* ---- 17. Non-resident attribute validation (upstream a83e82b0ec3a + ffc755828de1) --- */
+
+/*
+ * The port's inline validator in ntfs_attr_find() checked only
+ * mapping_pairs_offset bounds, with min_len 64 for every non-resident
+ * attribute. Upstream ffc755828de1 raises min_len to 72 for
+ * sparse/compressed attributes (the compressed_size field), and upstream
+ * a83e82b0ec3a requires the name to lie within the attribute without
+ * overlapping the mapping pairs, plus 8 bytes of room after
+ * mapping_pairs_offset for the compressed_size field a conversion to
+ * sparse would add. A failed validation makes ntfs_attr_find() return
+ * -EIO ("is corrupt. Run chkdsk.").
+ *
+ * Three cases, each on its own fixture copy (a validation failure sets
+ * the volume error flag, so cases must not share a mount):
+ *   room64:    unnamed $DATA length := 64, mp_offset stays 64, so room
+ *              after it is 0 < 8 -- the new room check rejects it.
+ *   sparse64:  same, plus ATTR_IS_SPARSE set -- the room check is
+ *              skipped for sparse attributes, so only the new min_len-72
+ *              check rejects it; this isolates ffc755828de1.
+ *   mpinside:  a large xattr's named $DATA (ADS) has its
+ *              mapping_pairs_offset := name_offset + name_length,
+ *              strictly inside the name, so name_end > mp_offset --
+ *              the new name check rejects it. The name itself is
+ *              untouched, so the name comparison still matches and the
+ *              validator is reached; mp_offset stays > name_offset,
+ *              so ntfs_attr_iget's own check passes and the old code's
+ *              size query succeeds. (mp_offset := 64 would also trip
+ *              the new check, but ntfs_attr_iget already refuses
+ *              name_offset >= mp_offset, so it fails in both builds.)
+ * Without the fix all three operations succeed; with it they fail with
+ * -EIO. The trigger must stop at the attribute find: ntfs_lookup() for
+ * the unnamed $DATA (iget looks it up via ntfs_attr_lookup) and a
+ * getxattr SIZE query (buf NULL) for the ADS. A read must NOT be the
+ * trigger: the mapping-pairs decompressor bounds the pairs by the
+ * attribute length, so a length-64 $DATA fails there in BOTH builds,
+ * and a garbage runlist from the name bytes fails the ADS read in
+ * both builds. No fsck_clean: the images are deliberately corrupt.
+ */
+static int nonres_case_setup(struct vol *v, const char *tag, bool with_xattr,
+			     uint64_t *rec_no_out)
+{
+	ntfs_inode_t *f = NULL;
+	struct ntfs_attr attr;
+	static char big[8192];
+	int err = 0;
+
+	memset(big, 'A', sizeof(big));
+	if (copy_fixture(tag) != 0)
+		return -1;
+	if (vol_up(v, 022, 022, 501, 20))
+		return -1;
+	if (ntfs_create(v->root, "f.bin", 0100644, &f) != 0)
+		err = -1;
+	if (!err && ntfs_write(f, big, sizeof(big), 0) != (ssize_t)sizeof(big))
+		err = -1;
+	if (!err && ntfs_getattr(f, &attr) == 0)
+		*rec_no_out = attr.inode_no;
+	else if (!err)
+		err = -1;
+	if (!err && with_xattr &&
+	    ntfs_setxattr(f, "user.big", big, sizeof(big), 0) != 0)
+		err = -1;
+	if (f) {
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	vol_down(v);
+	return err;
+}
+
+static int nonres_case_patch(const char *mode, uint64_t rec_no, const char *name)
+{
+	const char *py = getenv("NTFS_PATCH_NONRES_ATTR");
+	char cmd[PATH_MAX * 2 + 256];
+	int rc;
+
+	if (!py || !*py || access(py, R_OK) != 0)
+		return -2;
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu %s %s >/dev/null 2>&1",
+		 py, scratch, (unsigned long long)rec_no, mode, name);
+	rc = system(cmd);
+	return rc == 0 ? 0 : -1;
+}
+
+static void test_nonres_attr_validation(void)
+{
+	static const struct {
+		const char *tag, *mode, *what;
+		bool with_xattr;
+	} cases[] = {
+		{ "nonres-room", "room64", "room after mapping pairs", false },
+		{ "nonres-sparse", "sparse64", "sparse min_len 72", false },
+		{ "nonres-mp", "mpinside", "name overlaps mapping pairs", true },
+	};
+	struct vol v;
+	size_t i, n = sizeof(cases) / sizeof(cases[0]);
+
+	printf("test_nonres_attr_validation\n");
+	for (i = 0; i < n; i++) {
+		ntfs_inode_t *f = NULL;
+		uint64_t rec_no = 0;
+		size_t len = 0;
+		int err, prc;
+
+		if (nonres_case_setup(&v, cases[i].tag, cases[i].with_xattr, &rec_no) != 0) {
+			fprintf(stderr, "SKIP nonres %s: setup failed\n", cases[i].what);
+			unlink(scratch);
+			continue;
+		}
+		prc = nonres_case_patch(cases[i].mode, rec_no, "user.big");
+		if (prc == -2) {
+			fprintf(stderr, "SKIP test_nonres_attr_validation: NTFS_PATCH_NONRES_ATTR not set\n");
+			unlink(scratch);
+			return;
+		}
+		CHECK_MSG(prc == 0, "patch_nonres_attr.py %s failed", cases[i].mode);
+		if (prc != 0) {
+			unlink(scratch);
+			continue;
+		}
+		if (vol_up(&v, 022, 022, 501, 20)) {
+			fprintf(stderr, "SKIP nonres %s: remount failed\n", cases[i].what);
+			unlink(scratch);
+			continue;
+		}
+		err = ntfs_lookup(v.root, "f.bin", &f);
+		if (cases[i].with_xattr) {
+			/* The file lookup itself must succeed (its unnamed
+			 * $DATA is intact); the ADS size query is the
+			 * trigger -- it stops at the attribute find and
+			 * never reads the (garbage) runlist. */
+			CHECK(err == 0);
+			if (err == 0 && f) {
+				err = ntfs_getxattr(f, "user.big", NULL, 0, &len);
+				ntfs_inode_put(f);
+				f = NULL;
+			}
+		} else if (err == 0 && f) {
+			ntfs_inode_put(f);
+			f = NULL;
+		}
+		CHECK(err == -EIO);
+		if (err != -EIO)
+			fprintf(stderr, "FAIL nonres %s: lookup/read returned %d, expected -EIO (-5)\n",
+				cases[i].what, err);
+		vol_down(&v);
+		unlink(scratch);
+	}
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -2445,6 +2596,7 @@ int main(void)
 	test_permissions();
 	test_mft_alloc_usa_ofs_validated();
 	test_lookup_err_mref_normalized();
+	test_nonres_attr_validation();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

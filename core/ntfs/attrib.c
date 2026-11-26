@@ -767,15 +767,46 @@ static int ntfs_attr_find(const __le32 type, const __le16 *name,
 		} else {
 			u32 min_len;
 			u16 mp_offset;
+			u16 name_offset;
+			u32 name_end;
 
 			min_len = offsetof(struct attr_record, data.non_resident.initialized_size) +
 				  sizeof(a->data.non_resident.initialized_size);
+			/* PORT: upstream ffc755828de1: sparse and compressed
+			 * attributes have the extra compressed_size field, so
+			 * the fixed header is 8 bytes longer (min_len 72). */
+			if (a->flags & (ATTR_IS_SPARSE | ATTR_COMPRESSION_MASK))
+				min_len += sizeof(a->data.non_resident.compressed_size);
 			if (le32_to_cpu(a->length) < min_len)
 				break;
 
 			mp_offset = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
 			if (mp_offset < min_len ||
 			    mp_offset > le32_to_cpu(a->length))
+				break;
+
+			/* PORT: upstream a83e82b0ec3a: the name must lie within
+			 * the attribute and must not overlap the mapping pairs,
+			 * and a non-sparse attribute needs room for the
+			 * compressed_size field ntfs_attr_update_meta() adds
+			 * when converting to sparse. */
+			if (a->name_length) {
+				name_offset = le16_to_cpu(a->name_offset);
+
+				if (name_offset < min_len ||
+				    name_offset >= le32_to_cpu(a->length))
+					break;
+
+				name_end = name_offset + a->name_length * sizeof(__le16);
+				if (name_end > le32_to_cpu(a->length) ||
+				    name_end > mp_offset)
+					break;
+			}
+
+			/* Ensure there's room for the compressed_size field if needed. */
+			if (!(a->flags & (ATTR_IS_SPARSE | ATTR_COMPRESSION_MASK)) &&
+			    le32_to_cpu(a->length) - mp_offset <
+					sizeof(a->data.non_resident.compressed_size))
 				break;
 		}
 
