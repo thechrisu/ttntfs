@@ -28,6 +28,15 @@
 #                        CMake CMAKE_OSX_ARCHITECTURES default must both
 #                        name arm64 and x86_64 (GAPS.md §4.2). Runs
 #                        everywhere; the real universal build is CI's job.
+#   9. ctest under ASan  tools/ci.sh --asan: the whole ctest suite built
+#                        with -DNTFS_ASAN=ON in its own build dir
+#                        (build-asan). Runs on Darwin too -- no skip: on
+#                        macOS 26 ASan deadlocked in its own initialiser
+#                        (2026-09-14), and the user asked 2026-11-26 for
+#                        that hang to be fixed, not skipped. The per-test
+#                        ctest timeout (60 s) bounds a hang; the macos-26
+#                        CI asan job is the re-test (see stage_asan in
+#                        tools/ci.sh).
 #
 # Not covered here, by design -- CI owns them:
 #   - the fixture suite (tools/run-tests.sh all): slow; run it
@@ -123,6 +132,15 @@ stage_archs() {
 	"$HERE/check-archs.sh"
 }
 
+stage_asan() {
+	# No macOS skip: the user asked 2026-11-26 for ASan to run under
+	# macOS 26, not to be skipped there. If the 2026-09-14 hang still
+	# reproduces on this machine, the per-test timeout (60 s) bounds it
+	# and the failure is real -- that is the diagnostic, not a reason
+	# to pass quietly (see stage_asan in tools/ci.sh).
+	"$HERE/ci.sh" --asan
+}
+
 run_stage "darwin preprocess (macOS-only breakage)" stage_darwin
 run_stage "shellcheck (tools/*.sh)" stage_shellcheck
 run_stage "python compile (tools/*.py)" stage_python
@@ -131,6 +149,7 @@ run_stage "ci.sh --quick (toolchain + ctest + UBSan)" stage_ci_quick
 run_stage "fuzz check (seeds + regression images)" stage_fuzz_check
 run_stage "upstream port-diff (core/ntfs vs pinned pristine)" stage_upstream_port_diff
 run_stage "arch consistency (Xcode ARCHS vs CMake default)" stage_archs
+run_stage "ctest under ASan" stage_asan
 
 printf '\n==================== pre-push summary ====================\n'
 printf '%s\n' "${results[@]}"

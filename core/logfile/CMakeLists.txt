@@ -66,10 +66,11 @@ if(PROJECT_IS_TOP_LEVEL OR NTFS_LOGFILE_TOOLS)
 	# sanitizer build is there for whoever wants it on a toolchain where it works.
 	# Same policy as the top-level build: both off here, on in a separate build
 	# directory that tools/ci.sh configures. The replay engine reads packed
-	# on-disk structures constantly, so UBSan earns its place; ASan hangs on
-	# macOS 26 (see the top-level CMakeLists for the detail).
+	# on-disk structures constantly, so UBSan earns its place; ASan runs via
+	# tools/ci.sh --asan, on macOS 26 in CI (see docs/GAPS.md §5.5 -- the
+	# 2026-09-14 macOS hang is under re-test there).
 	option(NTFS_LOGFILE_UBSAN "Build the logfile tests with UBSan" OFF)
-	option(NTFS_LOGFILE_ASAN "Build the logfile tests with ASan (hangs on macOS 26)" OFF)
+	option(NTFS_LOGFILE_ASAN "Build the logfile tests with ASan (Linux-only: hangs on macOS 26)" OFF)
 	option(NTFS_LOGFILE_SANITIZE "Deprecated: same as both of the above ON" OFF)
 	if(NTFS_LOGFILE_SANITIZE)
 		set(NTFS_LOGFILE_ASAN ON)

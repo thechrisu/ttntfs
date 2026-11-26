@@ -44,6 +44,17 @@ set(CMAKE_C_EXTENSIONS ON)	# -std=gnu11
 # Xcode update: ASan is what originally found the work-queue use-after-free and
 # the lookup-versus-invalidate race (docs/progress/platform-review.md).
 #
+# ASan DOES run on Linux, and since 2026-11-26 it runs in CI on macos-26:
+# the dedicated `asan` job in .github/workflows/ci.yml runs `tools/ci.sh
+# --asan` (stage_asan: own build-asan dir, asserts the suite executed), and
+# tools/pre-push.sh stage 9 runs the same stage locally. First run found
+# three leaks (extent-inode $MFT folio, two pagecache test double-gets,
+# eight logfile test buffers) -- see docs/GAPS.md §5.5. The macos-26 job
+# is also the re-test of the 2026-09-14 macOS hang (below): the user asked
+# 2026-11-26 for the hang to be fixed, not skipped. If the job goes green,
+# the hang is gone on current Xcode and the stage can join the default
+# ci.sh sequence.
+#
 # Both default OFF, and that is a constraint rather than a preference: this
 # build tree produces libntfscore.a, which the Xcode app links directly
 # (NTFS_CORE_MODE=real). An instrumented static library needs the sanitizer
@@ -54,11 +65,13 @@ set(CMAKE_C_EXTENSIONS ON)	# -std=gnu11
 #   cmake -S . -B build-ubsan -DNTFS_UBSAN=ON && ctest --test-dir build-ubsan
 #
 #   -DNTFS_UBSAN=ON      UBSan (works; on in CI)
-#   -DNTFS_ASAN=ON       add ASan (see above before you do)
+#   -DNTFS_ASAN=ON       add ASan (runs in CI on macos-26 via tools/ci.sh
+#                         --asan; the 2026-09-14 macOS hang is under
+#                         re-test there -- see above and GAPS.md §5.5)
 #   -DNTFS_SANITIZE=ON   both, the old spelling, kept working
 option(NTFS_SANITIZE "Deprecated: same as -DNTFS_ASAN=ON -DNTFS_UBSAN=ON" OFF)
 option(NTFS_UBSAN "Build with UndefinedBehaviorSanitizer (use a separate build dir)" OFF)
-option(NTFS_ASAN "Build the tests with AddressSanitizer (hangs on macOS 26)" OFF)
+option(NTFS_ASAN "Build the tests with AddressSanitizer (Linux-only: hangs on macOS 26)" OFF)
 option(NTFS_BUILD_TESTS "Build the unit tests" ON)
 option(NTFS_FUZZ "Build the libFuzzer target (Clang only; use a separate build dir)" OFF)
 if(NTFS_FUZZ AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")

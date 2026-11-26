@@ -3,6 +3,7 @@
 #
 #   tools/ci.sh              run all stages
 #   tools/ci.sh --quick      skip the fixture suite (the slow one)
+#   tools/ci.sh --asan       run only the ASan stage
 #   tools/ci.sh --list       print the stages and exit
 #
 # Why this exists. Until 2026-09-14 nothing ran these suites automatically, and
@@ -23,11 +24,13 @@ ROOT=$(cd "$HERE/.." && pwd)
 cd "$ROOT" || exit 1
 
 QUICK=0
+ASAN=0
 for a in "$@"; do
 	case "$a" in
 	--quick) QUICK=1 ;;
+	--asan) ASAN=1 ;;
 	--list) sed -n '/^[^#]*run_stage "/{s/.*run_stage "\([^"]*\)".*/  \1/p;}' "$0" | grep -v '\[\^' ; exit 0 ;;
-	*) echo "usage: $0 [--quick] [--list]" >&2; exit 2 ;;
+	*) echo "usage: $0 [--quick] [--asan] [--list]" >&2; exit 2 ;;
 	esac
 done
 
@@ -91,12 +94,48 @@ stage_ctest() {
 # --- the same tests, instrumented ------------------------------------------
 # A separate build directory on purpose: the default tree produces the
 # libntfscore.a the Xcode app links, and an instrumented static library cannot
-# be linked into a shipping app. ASan is left off because it deadlocks in its
-# own initialiser on macOS 26 (see the top-level CMakeLists).
+# be linked into a shipping app. ASan lives in stage_asan below, not here,
+# because it needs its own build dir and its own stage (it runs on macOS 26
+# too -- see stage_asan).
 stage_ubsan() {
 	cmake -S . -B build-ubsan -DNTFS_UBSAN=ON -DNTFS_LOGFILE_UBSAN=ON >/dev/null || return 1
 	cmake --build build-ubsan -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null || return 1
 	ctest --test-dir build-ubsan --output-on-failure
+}
+
+# --- the same tests under AddressSanitizer ---------------------------------
+# Own build dir, like UBSan: the app must stay sanitizer-free. Runs on
+# Linux and on macOS 26, via `tools/ci.sh --asan`, from the dedicated
+# `asan` job in .github/workflows/ci.yml (macos-26) and from
+# tools/pre-push.sh stage 9. History: on macOS 26 ASan deadlocked inside
+# __asan::AsanInitInternal() before main() (confirmed 2026-09-14, every
+# test; one runaway burned a core for 23 h), so the stage was Linux-only
+# until 2026-11-26, when the user asked for macOS 26 to be fixed rather
+# than skipped. The CI job on macos-26 is the re-test on the current
+# runner image / Xcode: if it goes green, the hang is gone on current
+# Xcode; if it hangs, the per-test timeout below bounds it and the log
+# shows which tests stall. Not yet in the default ci.sh sequence: the
+# checks job on macos-26 runs the plain suite, and this stage stays
+# separately runnable until the hang is resolved or confirmed gone.
+# Per-test timeout 60 s: the slowest test under ASan on Linux is ~20 s,
+# so 60 s is 3x headroom and a hang becomes a failed test, never a
+# runaway. The stage asserts the suite actually executed: ctest must
+# report 100% passed over at least one test. That is the 2026-09-14
+# failure mode -- a run that executes nothing must fail loudly, never
+# read green.
+stage_asan() {
+	cmake -S . -B build-asan -DNTFS_ASAN=ON -DNTFS_LOGFILE_ASAN=ON >/dev/null || return 1
+	cmake --build build-asan -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null || return 1
+	local out rc
+	out=$(ctest --test-dir build-asan --timeout 60 --output-on-failure 2>&1)
+	rc=$?
+	printf '%s\n' "$out"
+	[ $rc -eq 0 ] || return 1
+	printf '%s\n' "$out" | grep -Eq '100% tests passed, 0 tests failed out of [1-9][0-9]*' || {
+		echo "ASan stage: ctest exited 0 but the suite did not execute its tests -- failing loudly (see the 2026-09-14 note above)."
+		return 1
+	}
+	return 0
 }
 
 # --- the differential fixture suite ----------------------------------------
@@ -144,6 +183,21 @@ stage_build_app() {
 	check_universal "$ext_bin" || return 1
 	return 0
 }
+
+# ASan-only mode: the toolchain first (the fixture-creating tests need
+# mkntfs/ntfsck; stage_toolchain is a stamp no-op when already built),
+# then just that stage, then the summary. Not part of the default sequence
+# (see stage_asan). This branch sits before the default stages so --asan
+# never runs them.
+if [ "$ASAN" = 1 ]; then
+	run_stage "toolchain (ntfsprogs + ntfsprogs-plus)" stage_toolchain
+	run_stage "ctest under ASan" stage_asan
+	printf '\n==================== ci summary ====================\n'
+	printf '%s\n' "${results[@]}"
+	printf 'total %ss\n' "$(( $(date +%s) - start_all ))"
+	echo "(--asan: only the ASan stage ran)"
+	exit $fail
+fi
 
 run_stage "toolchain (ntfsprogs + ntfsprogs-plus)" stage_toolchain
 run_stage "ctest (platform, mount decisions, logfile, scripts)" stage_ctest

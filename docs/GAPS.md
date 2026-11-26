@@ -1139,13 +1139,48 @@ The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
 does.
 
+### 5.5 ASan ctest stage — done on Linux (2026-11-26); macOS 26 under re-test
+The ctest suite now runs under AddressSanitizer: `tools/ci.sh --asan`
+(stage_asan, own build-asan dir with -DNTFS_ASAN=ON -DNTFS_LOGFILE_ASAN=ON),
+pre-push stage 9, and a dedicated `asan` job in .github/workflows/ci.yml
+on macos-26. History: on macOS 26 ASan deadlocked inside
+__asan::AsanInitInternal() before main() (confirmed 2026-09-14, every
+test; one runaway burned a core for 23 h), so the stage was Linux-only
+until 2026-11-26, when the user asked for the macOS hang to be fixed
+rather than skipped. The macos-26 job is the re-test on the current
+runner image / Xcode, with a 60 s per-test ctest timeout bounding any
+hang (slowest test under ASan on Linux is ~20 s): if it goes green, the
+hang is gone on current Xcode and the stage can join the default ci.sh
+sequence; if it hangs, the log shows which tests stall and the fix
+follows. The NTFS_ASAN / NTFS_LOGFILE_ASAN option descriptions still
+say "hangs on macOS 26" until the re-test reports -- they are updated
+with the fix, not before. The stage asserts the suite executed (ctest
+must report 100% passed over >= 1 test) so a run that executes nothing
+fails loudly -- the 2026-09-14 failure mode, when the logfile suite's
+243 checks silently did not execute for a day.
+
+First run (2026-11-26, 12/15 pass) found three leaks, no memory errors,
+each fixed in its own commit with a regression test and a negative control:
+- Extent-inode $MFT folio (driver): ntfs_destroy_ext_inode() never put
+  its pinned folio -- 122,728 B in 58 allocations via test_many_links
+  (29 extension records). Upstream v7.1 omits the put identically; no fix
+  in the v7.1->v7.3 drift.
+- Pagecache test double-gets: test_invalidate() and test_reclaim() each
+  called filemap_get_folio() once inside CHECK() and again inside
+  folio_put() -- 8,464 B in 4 allocations.
+- Logfile test buffers: lb_init()/vol_init() 256 KiB buffers never freed
+  in four test functions -- 2,097,152 B in 8 allocations.
+Full ASan ctest suite now 15/15.
+
 ## 6. What each CI check covers, and the fast local equivalent
 
 CI (`tools/ci.sh`, run on macos-26) has six stages: toolchain
 (ntfsprogs + ntfsprogs-plus), ctest, ctest under UBSan, fixtures
 (`run-tests.sh all`, fsck required), Swift unit tests, app + extension
 build. The mount-test job is manual, `continue-on-error`, and needs
-signing (see 4.5).
+signing (see 4.5). A seventh stage, ctest under ASan, runs on macos-26
+too (dedicated `asan` job, §5.5) -- the re-test of the 2026-09-14 macOS
+hang, not yet in the default sequence.
 
 Local fast checks (`tools/pre-push.sh`, installed as the pre-push hook
 by `tools/install-hooks.sh`) run everything CI runs that can run here,
@@ -1154,6 +1189,7 @@ plus the check CI cannot do for itself:
 | CI stage | Local fast equivalent | Notes |
 |---|---|---|
 | toolchain, ctest, UBSan | `tools/ci.sh --quick` | same script, skips fixtures |
+| ctest under ASan (macos-26 CI job) | `tools/ci.sh --asan`, pre-push stage 9 | 2026-09-14 macOS hang under re-test (see §5.5); the stage asserts the suite executed, so a run that executes nothing fails loudly |
 | fixtures | run `tools/run-tests.sh all` explicitly before pushing core changes | slow; CI is the backstop |
 | Swift tests, app build | none — need xcodebuild / macOS SDK | CI owns these |
 | mount test | none — needs signing + real mount | manual, maintainer only |
