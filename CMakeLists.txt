@@ -3,7 +3,8 @@
 # NTFS for macOS: user-space port of the Linux 7.1 fs/ntfs driver.
 #
 #   cmake -S . -B build && cmake --build build && ctest --test-dir build
-#   UBSan is on by default; -DNTFS_ASAN=ON adds ASan, which hangs on macOS 26.
+#   UBSan is on by default; -DNTFS_ASAN=ON adds ASan, which runs in CI on
+#   macos-26 (the 2026-09-14 hang is gone on current Xcode -- GAPS.md §5.5).
 #
 # Targets:
 #   ntfsplatform   platform/src/*.c + platform/pagecache/pagecache.c  (static)
@@ -66,12 +67,12 @@ set(CMAKE_C_EXTENSIONS ON)	# -std=gnu11
 #
 #   -DNTFS_UBSAN=ON      UBSan (works; on in CI)
 #   -DNTFS_ASAN=ON       add ASan (runs in CI on macos-26 via tools/ci.sh
-#                         --asan; the 2026-09-14 macOS hang is under
-#                         re-test there -- see above and GAPS.md §5.5)
+#                         --asan; the 2026-09-14 macOS hang is gone on
+#                         current Xcode -- see above and GAPS.md §5.5)
 #   -DNTFS_SANITIZE=ON   both, the old spelling, kept working
 option(NTFS_SANITIZE "Deprecated: same as -DNTFS_ASAN=ON -DNTFS_UBSAN=ON" OFF)
 option(NTFS_UBSAN "Build with UndefinedBehaviorSanitizer (use a separate build dir)" OFF)
-option(NTFS_ASAN "Build the tests with AddressSanitizer (Linux-only: hangs on macOS 26)" OFF)
+option(NTFS_ASAN "Build the tests with AddressSanitizer (use a separate build dir)" OFF)
 option(NTFS_BUILD_TESTS "Build the unit tests" ON)
 option(NTFS_FUZZ "Build the libFuzzer target (Clang only; use a separate build dir)" OFF)
 if(NTFS_FUZZ AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")

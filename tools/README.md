@@ -46,12 +46,16 @@ before `main()` (confirmed 2026-09-14, every test; one runaway burned a
 core for 23 h), so the stage was Linux-only until 2026-11-26, when the
 user asked for the macOS hang to be fixed rather than skipped. A
 dedicated `asan` job in `.github/workflows/ci.yml` runs it on `macos-26`
--- that job is the re-test on the current runner image / Xcode, with a
-60 s per-test `ctest` timeout bounding any hang. It is not yet in the
-default `ci.sh` sequence; if the job goes green, the hang is gone on
-current Xcode and the stage can join it. The stage asserts the suite
-actually executed -- `ctest` must report 100% passed over at least one
-test -- so a run that executes nothing fails loudly rather than reading
+-- that job re-tested it on the current runner image / Xcode, with a
+60 s per-test `ctest` timeout bounding any hang, and the hang is gone:
+run 45785443966's asan job executed all 14 tests in 35.56 s with no
+stall, and run 45787227610's asan job went green (d3fbebe3 fixed the
+stage's own summary assertion to accept the macOS ctest format). It
+is not yet in the default `ci.sh` sequence; joining it would roughly
+double the checks job's macOS time for a suite the `asan` job already
+covers. The stage asserts the suite actually executed -- `ctest` must
+report 100% passed over at least one test, with at least one Passed
+line -- so a run that executes nothing fails loudly rather than reading
 green (the 2026-09-14 failure mode).
 
 Deliberately **not** run: `fskit/scripts/mount-test.sh`, which needs the FSKit
@@ -88,7 +92,7 @@ check that fails, is there a fast local check". The stages, fast first:
 | `tools/fuzz.sh check` | seeds mount, regression images fail cleanly (standalone runner) |
 | `tools/upstream-drift.sh port-diff` | what the port changed vs the pinned pristine copy (informational, <1s) |
 | `tools/check-archs.sh` | the Xcode ARCHS and the CMake `CMAKE_OSX_ARCHITECTURES` default both name arm64 and x86_64 (GAPS.md §4.2); the generated project sets ARCHS nowhere. The real universal build is CI's job (`tools/ci.sh` checks both slices with `lipo`). Verified by negative test: reverting either side makes it fail. |
-| `tools/ci.sh --asan` | the whole `ctest` suite under AddressSanitizer (own `build-asan` dir; asserts 100% passed over >= 1 test; 60 s per-test timeout). Runs on macOS too -- no skip: the 2026-09-14 macOS hang is under re-test in the macos-26 CI `asan` job. First run (2026-11-26) found three leaks -- an extent-inode `$MFT` folio, two pagecache test double-gets, eight logfile test buffers -- all fixed with regression evidence (GAPS.md §5.5). |
+| `tools/ci.sh --asan` | the whole `ctest` suite under AddressSanitizer (own `build-asan` dir; asserts 100% passed over >= 1 test plus a Passed line; 60 s per-test timeout). Runs on macOS too -- no skip: the 2026-09-14 macOS hang is gone on current Xcode (re-test runs 45785443966 / 45787227610). First run (2026-11-26) found three leaks -- an extent-inode `$MFT` folio, two pagecache test double-gets, eight logfile test buffers -- all fixed with regression evidence (GAPS.md §5.5). |
 
 Not in the hook, by design: the fixture suite (`tools/run-tests.sh all`) is
 slow — run it explicitly before pushing a change to the core; the Swift unit

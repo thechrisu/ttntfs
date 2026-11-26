@@ -1139,7 +1139,7 @@ The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
 does.
 
-### 5.5 ASan ctest stage — done on Linux (2026-11-26); macOS 26 under re-test
+### 5.5 ASan ctest stage — done (2026-11-26); macOS 26 hang gone on current Xcode
 The ctest suite now runs under AddressSanitizer: `tools/ci.sh --asan`
 (stage_asan, own build-asan dir with -DNTFS_ASAN=ON -DNTFS_LOGFILE_ASAN=ON),
 pre-push stage 9, and a dedicated `asan` job in .github/workflows/ci.yml
@@ -1147,16 +1147,22 @@ on macos-26. History: on macOS 26 ASan deadlocked inside
 __asan::AsanInitInternal() before main() (confirmed 2026-09-14, every
 test; one runaway burned a core for 23 h), so the stage was Linux-only
 until 2026-11-26, when the user asked for the macOS hang to be fixed
-rather than skipped. The macos-26 job is the re-test on the current
-runner image / Xcode, with a 60 s per-test ctest timeout bounding any
-hang (slowest test under ASan on Linux is ~20 s): if it goes green, the
-hang is gone on current Xcode and the stage can join the default ci.sh
-sequence; if it hangs, the log shows which tests stall and the fix
-follows. The NTFS_ASAN / NTFS_LOGFILE_ASAN option descriptions still
-say "hangs on macOS 26" until the re-test reports -- they are updated
-with the fix, not before. The stage asserts the suite executed (ctest
-must report 100% passed over >= 1 test) so a run that executes nothing
-fails loudly -- the 2026-09-14 failure mode, when the logfile suite's
+rather than skipped. Re-test on the current runner image / Xcode,
+2026-11-26: run 45785443966's asan job executed all 14 tests under
+ASan in 35.56 s with no stall (geometry slowest at 17.56 s) -- the
+hang is gone. That job still failed, but only on the stage's own
+execution assertion: macOS ctest prints "100% tests passed out of N"
+while the grep expected the Linux form "100% tests passed, 0 tests
+failed out of N". The assertion now accepts both forms and also
+requires a Passed line (d3fbebe3); run 45787227610's asan job went
+green. The NTFS_ASAN / NTFS_LOGFILE_ASAN option descriptions no
+longer say "hangs on macOS 26". The stage stays separately runnable
+(dedicated `asan` job + `ci.sh --asan`), not in the default ci.sh
+sequence: joining it would roughly double the checks job's macOS
+time for a suite the asan job already covers. The stage asserts the
+suite executed (ctest must report 100% passed over >= 1 test, with
+at least one Passed line) so a run that executes nothing fails
+loudly -- the 2026-09-14 failure mode, when the logfile suite's
 243 checks silently did not execute for a day.
 
 First run (2026-11-26, 12/15 pass) found three leaks, no memory errors,
@@ -1189,7 +1195,7 @@ plus the check CI cannot do for itself:
 | CI stage | Local fast equivalent | Notes |
 |---|---|---|
 | toolchain, ctest, UBSan | `tools/ci.sh --quick` | same script, skips fixtures |
-| ctest under ASan (macos-26 CI job) | `tools/ci.sh --asan`, pre-push stage 9 | 2026-09-14 macOS hang under re-test (see §5.5); the stage asserts the suite executed, so a run that executes nothing fails loudly |
+| ctest under ASan (macos-26 CI job) | `tools/ci.sh --asan`, pre-push stage 9 | 2026-09-14 macOS hang gone on current Xcode (see §5.5); the stage asserts the suite executed, so a run that executes nothing fails loudly |
 | fixtures | run `tools/run-tests.sh all` explicitly before pushing core changes | slow; CI is the backstop |
 | Swift tests, app build | none — need xcodebuild / macOS SDK | CI owns these |
 | mount test | none — needs signing + real mount | manual, maintainer only |

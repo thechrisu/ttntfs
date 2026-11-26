@@ -56,21 +56,23 @@ if(PROJECT_IS_TOP_LEVEL OR NTFS_LOGFILE_TOOLS)
 	# Tests: the whole module is recompiled with sanitizers.
 	# Sanitizers are opt-in (-DNTFS_LOGFILE_SANITIZE=ON), not the default.
 	#
-	# On macOS 26 / Apple Silicon the ASan runtime hangs inside
-	# __asan::AsanInitInternal() before main() ever runs: the test never starts,
-	# ctest never returns, and a runaway process sits burning a core. One did
-	# for 23 hours before it was noticed on 2026-09-14, and because
-	# logfile_unit is the first test in this project's suite it blocked
-	# logfile_images behind it too. The suite itself is fine -- 243 checks,
-	# 0 failures, a few seconds -- so the default build runs it and the
-	# sanitizer build is there for whoever wants it on a toolchain where it works.
-	# Same policy as the top-level build: both off here, on in a separate build
-	# directory that tools/ci.sh configures. The replay engine reads packed
-	# on-disk structures constantly, so UBSan earns its place; ASan runs via
-	# tools/ci.sh --asan, on macOS 26 in CI (see docs/GAPS.md §5.5 -- the
-	# 2026-09-14 macOS hang is under re-test there).
+	# On macOS 26 / Apple Silicon the ASan runtime used to hang inside
+	# __asan::AsanInitInternal() before main() ever ran: the test never
+	# started, ctest never returned, and a runaway process sat burning a
+	# core. One did for 23 hours before it was noticed on 2026-09-14, and
+	# because logfile_unit is the first test in this project's suite it
+	# blocked logfile_images behind it too. The hang is gone on the
+	# current runner image / Xcode (re-tested 2026-11-26, GAPS.md §5.5),
+	# so ASan is no longer Linux-only here. The suite itself was always
+	# fine -- 243 checks, 0 failures, a few seconds -- so the default
+	# build runs it and the sanitizer build is there for whoever wants
+	# it. Same policy as the top-level build: both off here, on in a
+	# separate build directory that tools/ci.sh configures. The replay
+	# engine reads packed on-disk structures constantly, so UBSan earns
+	# its place; ASan runs via tools/ci.sh --asan, on macOS 26 in CI
+	# (see docs/GAPS.md §5.5).
 	option(NTFS_LOGFILE_UBSAN "Build the logfile tests with UBSan" OFF)
-	option(NTFS_LOGFILE_ASAN "Build the logfile tests with ASan (Linux-only: hangs on macOS 26)" OFF)
+	option(NTFS_LOGFILE_ASAN "Build the logfile tests with ASan" OFF)
 	option(NTFS_LOGFILE_SANITIZE "Deprecated: same as both of the above ON" OFF)
 	if(NTFS_LOGFILE_SANITIZE)
 		set(NTFS_LOGFILE_ASAN ON)

@@ -111,12 +111,14 @@ stage_ubsan() {
 # __asan::AsanInitInternal() before main() (confirmed 2026-09-14, every
 # test; one runaway burned a core for 23 h), so the stage was Linux-only
 # until 2026-11-26, when the user asked for macOS 26 to be fixed rather
-# than skipped. The CI job on macos-26 is the re-test on the current
-# runner image / Xcode: if it goes green, the hang is gone on current
-# Xcode; if it hangs, the per-test timeout below bounds it and the log
-# shows which tests stall. Not yet in the default ci.sh sequence: the
-# checks job on macos-26 runs the plain suite, and this stage stays
-# separately runnable until the hang is resolved or confirmed gone.
+# than skipped. The CI job on macos-26 re-tested it on the current
+# runner image / Xcode and the hang is gone: run 45785443966's asan job
+# executed all 14 tests in 35.56 s with no stall, and run 45787227610's
+# asan job went green after the stage's own summary assertion was fixed
+# to accept the macOS ctest format (d3fbebe3). Not yet in the default
+# ci.sh sequence: the checks job on macos-26 runs the plain suite, and
+# this stage stays separately runnable in its dedicated job (joining it
+# would roughly double the checks job's macOS time).
 # Per-test timeout 60 s: the slowest test under ASan on Linux is ~20 s,
 # so 60 s is 3x headroom and a hang becomes a failed test, never a
 # runaway. The stage asserts the suite actually executed: ctest must
