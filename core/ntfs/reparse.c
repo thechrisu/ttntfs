@@ -301,7 +301,12 @@ unsigned int ntfs_reparse_tag_dt_types(struct ntfs_volume *vol, unsigned long mr
 
 	vi = ntfs_iget(vol->sb, mref);
 	if (IS_ERR(vi))
-		return PTR_ERR(vi);
+		/* PORT: upstream 3d3de2aee17d: the return type is
+		 * unsigned int and the caller passes the value
+		 * straight to dir_emit() as d_type, so returning
+		 * PTR_ERR(vi) reported a garbage d_type to
+		 * userspace for a stale/corrupt MFT reference. */
+		return DT_UNKNOWN;
 
 	reparse_attr = (struct reparse_point *)ntfs_attr_readall(NTFS_I(vi),
 			AT_REPARSE_POINT, NULL, 0, &attr_size);

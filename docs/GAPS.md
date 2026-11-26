@@ -883,6 +883,30 @@ Porting progress (one commit per item, in the order above):
   2 failures without it (same-mount and remount gets -ENODATA,
   stripped by line number and verified by diff).
 
+- 2026-11-26: `3d3de2aee17d` (return DT_UNKNOWN on inode lookup
+  failure in readdir) — ported: `ntfs_reparse_tag_dt_types()`
+  returned PTR_ERR(vi) when `ntfs_iget()` failed, but its return
+  type is unsigned int and the caller in dir.c passes the value
+  straight to `dir_emit()` as d_type, so a stale or corrupt MFT
+  reference made readdir report a garbage d_type to userspace.
+  One line, verbatim upstream (`return DT_UNKNOWN;`,
+  core/ntfs/reparse.c). New test
+  `test_reparse_dt_unknown_on_lookup_failure` in
+  `core/tests/test_links.c` calls the function directly: the
+  readdir callback in the harness maps every unknown type to
+  NTFS_ITEM_OTHER, so the garbage is not observable through
+  `ntfs_readdir()`. A record number far past the fixture's $MFT
+  (ntfs_iget fails) returns DT_UNKNOWN; a real symlink's record
+  still returns DT_LNK. 504 checks, 0 failures with the fix;
+  without it exactly 1 failure, the lookup-failure case returning
+  4294967294 (0xFFFFFFFE, -ENOENT as unsigned). The positive
+  control must run first: a failed `ntfs_iget` sets the volume
+  error flag (`NVolSetErrors` in `ntfs_read_locked_inode()`'s
+  err_out path), and later creates on the same mount fail.
+  Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  34 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

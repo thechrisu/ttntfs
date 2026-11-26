@@ -39,6 +39,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
@@ -54,6 +55,13 @@
 #include <asm/byteorder.h>
 #include <linux/math64.h>
 #include "../ntfs/time.h"
+/* ntfs_reparse_tag_dt_types() for the DT_UNKNOWN test (§18): reparse.h
+ * declares only core functions, no conflicting definitions. The two
+ * forward declarations silence "declared inside parameter list"
+ * warnings: the test never dereferences either struct. */
+struct ntfs_inode;
+struct ntfs_volume;
+#include "../ntfs/reparse.h"
 
 /* $EA test hook: the VFS xattr handler table is exported from ea.c
  * (see ea.h); the test drives handlers[0]->set/get directly because
@@ -61,6 +69,16 @@
  * ntfs_set_ea(). Declared here rather than including ea.h, whose
  * internal headers collide with ntfscore.h. */
 extern const struct xattr_handler *const ntfs_xattr_handlers[];
+
+/* The volume handle behind ntfscore.h's ntfs_volume_t (core/vfs/glue.h):
+ * its first two fields are sb and the core struct ntfs_volume *. Declared
+ * here rather than including glue.h, whose identifiers collide with
+ * ntfscore.h (see the top of core/vfs/api.c). Only the layout of those
+ * two fields is relied on. */
+struct ntfs_volume_handle_test {
+	struct super_block *sb;
+	struct ntfs_volume *vol;
+};
 
 /* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
  * some machines and the 16 TiB geometry image needs ~600 MiB while
@@ -3482,6 +3500,62 @@ static void test_ib_sync_write_no_post_fixup(void)
 	unlink(scratch);
 }
 
+/* ---- 18. DT_UNKNOWN on readdir lookup failure (upstream 3d3de2aee17d) --- */
+
+/*
+ * Upstream 3d3de2aee17d: ntfs_reparse_tag_dt_types() returned PTR_ERR(vi)
+ * when ntfs_iget() failed, but its return type is unsigned int and the
+ * caller in dir.c passes the value straight to dir_emit() as d_type, so
+ * a stale or corrupt MFT reference in a directory index made readdir
+ * report a garbage d_type to userspace. The fix returns DT_UNKNOWN.
+ *
+ * The readdir callback in this harness maps every unknown type to
+ * NTFS_ITEM_OTHER, so the garbage is not observable through
+ * ntfs_readdir() -- the function itself is the boundary under test.
+ * Two cases: a record number far past the fixture's $MFT (ntfs_iget
+ * fails) must return DT_UNKNOWN; a real symlink's record must still
+ * return DT_LNK, so the test is not vacuous.
+ */
+static void test_reparse_dt_unknown_on_lookup_failure(void)
+{
+	struct vol v;
+	ntfs_inode_t *l = NULL;
+	unsigned int dt;
+	uint64_t ino;
+
+	printf("test_reparse_dt_unknown_on_lookup_failure\n");
+	if (copy_fixture("dtunknown") != 0) {
+		fprintf(stderr, "SKIP test_reparse_dt_unknown_on_lookup_failure: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_reparse_dt_unknown_on_lookup_failure: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	/* Positive control first: a real symlink still types as DT_LNK.
+	 * (It must come before the bogus-mref call below: a failed
+	 * ntfs_iget leaves the volume error flag set, and later creates
+	 * on the same mount fail.) */
+	CHECK(ntfs_symlink(v.root, "lnk", "t.txt", &l) == 0);
+	if (l) {
+		ino = ntfs_inode_number(l);
+		ntfs_inode_put(l);
+		l = NULL;
+		dt = ntfs_reparse_tag_dt_types(((struct ntfs_volume_handle_test *)v.vol)->vol, ino);
+		CHECK(dt == DT_LNK);
+		if (dt != DT_LNK)
+			fprintf(stderr, "FAIL dt-unknown: real symlink returned %u, expected DT_LNK (%d)\n", dt, DT_LNK);
+	}
+	/* A record number far past the fixture's $MFT: ntfs_iget fails. */
+	dt = ntfs_reparse_tag_dt_types(((struct ntfs_volume_handle_test *)v.vol)->vol, 1000000);
+	CHECK(dt == DT_UNKNOWN);
+	if (dt != DT_UNKNOWN)
+		fprintf(stderr, "FAIL dt-unknown: lookup failure returned %u, expected DT_UNKNOWN (0)\n", dt);
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -3508,6 +3582,7 @@ int main(void)
 	test_readall_error_propagates();
 	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
+	test_reparse_dt_unknown_on_lookup_failure();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
