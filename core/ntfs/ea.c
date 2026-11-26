@@ -250,6 +250,19 @@ create_ea_info:
 			goto out;
 		}
 
+		/* PORT: upstream 650a2751c9ae: check the final $EA size
+		 * before removing the old entry. The old code only checked
+		 * the new entry's size at the end, after the shortened
+		 * stream and $EA_INFORMATION were already committed, so a
+		 * replacement that exceeds the $AttrDef limit destroyed the
+		 * old value instead of failing cleanly. */
+		if (val_size &&
+		    ntfs_attr_size_bounds_check(ni->vol, AT_EA,
+						ea_info_qsize - ea_size + new_ea_size)) {
+			err = -EFBIG;
+			goto out;
+		}
+
 		p_ea = (struct ea_attr *)(ea_buf + ea_off);
 
 		if (val_size &&
@@ -285,6 +298,14 @@ create_ea_info:
 			err = -ENODATA;
 			goto out;
 		}
+
+		/* PORT: upstream 650a2751c9ae: check the final $EA size
+		 * before adding the new entry (same reason as above). */
+		if (ntfs_attr_size_bounds_check(ni->vol, AT_EA,
+						ea_info_qsize + new_ea_size)) {
+			err = -EFBIG;
+			goto out;
+		}
 	}
 	kvfree(ea_buf);
 
@@ -312,8 +333,9 @@ alloc_new_ea:
 	p_ea_info->ea_length = cpu_to_le16(ea_packed);
 	p_ea_info->ea_query_length = cpu_to_le32(ea_info_qsize + new_ea_size);
 
-	if (ea_packed > 0xffff ||
-	    ntfs_attr_size_bounds_check(ni->vol, AT_EA, new_ea_size)) {
+	/* PORT: upstream 650a2751c9ae: the $EA size check moved earlier
+	 * (see above); only the packed-size test remains here. */
+	if (ea_packed > 0xffff) {
 		err = -EFBIG;
 		goto out;
 	}

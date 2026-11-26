@@ -673,6 +673,55 @@ Porting progress (one commit per item, in the order above):
   UBSan ctest 15/15, `run-tests.sh all` 265 passed 0 failed with
   NTFS_REQUIRE_FSCK=1.
   42 port items remain.
+- 2026-11-26: `b8d6c528e9d5` (WARN_ON for resident attribute in
+  ntfs_map_runlist_nolock) — SKIPPED, fix NOT landed. The fix is 3
+  lines (WARN_ON -> -EIO return, verbatim upstream; the sibling
+  branch already does the same) but no failing-without-fix test is
+  reachable through the public harness, and a fix without that
+  evidence does not land. The mount path (upstream's KASAN trigger
+  via ntfs_empty_logfile) is unreachable: a resident $LogFile $DATA
+  fails ntfs_check_logfile's minimum-size gate (40 KiB) before
+  emptying, and the restart-page validation needs a full 4 KiB page
+  that a ~950-byte resident value cannot hold. A white-box call needs
+  struct ntfs_inode *, but the internal headers redefine public
+  symbols and cannot coexist with ntfscore.h in one TU. The read path
+  branches on NInoNonResident before any runlist mapping, so resident
+  compressed files do not reach it either. Landing needs a test
+  harness that can call internal functions (or an ASan fuzz seed
+  reaching the path). Triage row updated with the full reason.
+  42 port items remain (this item still counts as remaining).
+- 2026-11-26: `650a2751c9ae` (validate final EA attribute size) —
+  ported: `ntfs_set_ea()` in `core/ntfs/ea.c` checked only the NEW
+  entry's size against the $AttrDef $EA limit (64 KiB), and only at
+  the end, after a replacement had already removed the old entry and
+  committed the shortened $EA stream and $EA_INFORMATION. The fix
+  checks the FINAL size before mutating: `ea_info_qsize - ea_size +
+  new_ea_size` on replace, `ea_info_qsize + new_ea_size` on add (both
+  -> -EFBIG via `ntfs_attr_size_bounds_check` against the $EA max
+  65536, verified from the fixture's $AttrDef with ntfscat); the
+  trailing check keeps only `ea_packed > 0xffff`. New test
+  `test_ea_final_size_validated` in `core/tests/test_links.c` drives
+  $EA through the VFS xattr handler (`ntfs_xattr_handlers[0]->set/
+  get`) because the public `ntfs_setxattr()` stores xattrs as ADS
+  and never reaches `ntfs_set_ea()`; the handler is the
+  upstream-representative path (and what WSL-inode creation and ACL
+  sets use). Two cases, each on its own fixture copy (the old
+  build's add case sets the volume error flag): add (7 x 8192-value
+  EAs, then an 8040-value EA: final stream 65572 > 65536, final
+  packed 65525 <= 65535) and replace (15 x 4096-value EAs, replace
+  one with 8192: final stream 65896 > 65536, final packed 65776 >
+  65535). The totals account for the three hidden WSL EAs
+  ($LXUID/$LXGID/$LXMOD) `ntfs_create()` writes (+45 packed / +60
+  stream); the packed-vs-stream window matters because the trailing
+  packed check fires in both builds otherwise. Evidence: test_links
+  486 checks 0 failures with the fix; without it exactly 2 failures
+  -- add returns -EIO (-5) instead of -EFBIG (-27) (the $EA resize
+  to 65572 trips the bounds check in the write path and sets the
+  volume error flag), and replace returns -EFBIG in both builds but
+  the old value is gone in the old build (get=-ENODATA) while intact
+  in the new one. Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  41 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

@@ -49,9 +49,17 @@
  * system <time.h> that linux/time64.h needs.
  */
 #include <linux/types.h>
+#include <linux/xattr.h>
 #include <asm/byteorder.h>
 #include <linux/math64.h>
 #include "../ntfs/time.h"
+
+/* $EA test hook: the VFS xattr handler table is exported from ea.c
+ * (see ea.h); the test drives handlers[0]->set/get directly because
+ * the public ntfs_setxattr() stores xattrs as ADS and never reaches
+ * ntfs_set_ea(). Declared here rather than including ea.h, whose
+ * internal headers collide with ntfscore.h. */
+extern const struct xattr_handler *const ntfs_xattr_handlers[];
 
 /* Scratch images go under $TMPDIR when set: /tmp is a 512 MiB tmpfs on
  * some machines and the 16 TiB geometry image needs ~600 MiB while
@@ -2578,6 +2586,177 @@ static void test_nonres_attr_validation(void)
 	}
 }
 
+/*
+ * Upstream 650a2751c9ae: ntfs_set_ea() used to check only the NEW
+ * entry's size against the $AttrDef $EA limit (64 KiB), and only at
+ * the end -- after a replacement had already removed the old entry
+ * and committed the shortened $EA stream and $EA_INFORMATION. A
+ * replacement whose FINAL stream exceeds the limit therefore
+ * destroyed the old value instead of failing cleanly, and an add
+ * whose final stream exceeds the limit was only caught at the
+ * $EA resize in the write path, failing with -EIO and setting the
+ * volume error flag instead of a clean -EFBIG. The fix checks the
+ * FINAL size before mutating: ea_info_qsize - ea_size +
+ * new_ea_size on replace, ea_info_qsize + new_ea_size on add, and the
+ * trailing check keeps only the ea_packed > 0xffff test.
+ *
+ * Entry point: the public ntfs_setxattr() stores xattrs as ADS
+ * (named $DATA), so it never reaches ntfs_set_ea(). $EA is reached
+ * through the VFS xattr handler (ntfs_xattr_handlers[0]), which is
+ * the upstream-representative path (upstream's setxattr handler is
+ * exactly this function) and is also what WSL-inode creation and
+ * ACL sets use internally. The test drives handlers[0]->set/get
+ * directly; the ntfs_inode_t handle IS the struct inode (see VI()
+ * in core/vfs/api.c), so the cast is the glue's own identity.
+ *
+ * The $EA max is 65536 (verified from the fixture's $AttrDef with
+ * ntfscat). ea_packed (5 + name + value per entry) and the stream
+ * size (ALIGN(9 + name + value, 4) per entry) differ by ~4 bytes per
+ * entry, so the totals are chosen so the stream crosses 65536 while
+ * the packed total stays <= 65535 -- otherwise the trailing packed
+ * check fires in BOTH builds and the test is vacuous. Note
+ * ntfs_create() also writes three hidden WSL EAs ($LXUID/$LXGID/
+ * $LXMOD, 6-char name + 4-byte value each: 15 packed / 20 stream),
+ * a fixed +45 packed / +60 stream on top of the test's own EAs:
+ *   add:     7 x 8192-value EAs (stream 8208, packed 8204 each;
+ *            stream 57516, packed 57473 with the $LX* EAs), then
+ *            add an 8040-value EA (stream 8056, packed 8052):
+ *            final stream 65572 > 65536, final packed 65525
+ *            <= 65535. New: -EFBIG before writing. Old: -EIO from
+ *            the $EA resize, plus the volume error flag; the 8th
+ *            EA is absent in both, so the return code
+ *            discriminates.
+ *   replace: 15 x 4096-value EAs (stream 4116, packed 4109 each;
+ *            stream 61800, packed 61680 with the $LX* EAs), then
+ *            replace one with an 8192-value EA (stream 8212,
+ *            packed 8205): final stream 65896 > 65536, final
+ *            packed 65776 > 65535. Both builds return -EFBIG, but
+ *            the new build returns it BEFORE mutating (old value
+ *            intact) while the old build commits the shortened
+ *            stream first (old value gone).
+ * No fixture patcher needed.
+ */
+static int ea_set(ntfs_inode_t *f, const char *name, const void *val,
+		  size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, 0);
+}
+
+static int ea_get(ntfs_inode_t *f, const char *name, void *buf, size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->get(h, NULL, (struct inode *)f, name, buf, size);
+}
+
+static void test_ea_final_size_validated(void)
+{
+	static char val4k[4096], val8k[8192], val8040[8040];
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	char name[16], buf[8192];
+	int err, i;
+
+	printf("test_ea_final_size_validated\n");
+	memset(val4k, 'A', sizeof(val4k));
+	memset(val8k, 'A', sizeof(val8k));
+	memset(val8040, 'A', sizeof(val8040));
+
+	/* Each case runs on its own fixture copy: in the old build the
+	 * add case sets the volume error flag (see below), which would
+	 * poison the replace case on a shared mount. */
+
+	/* Add case: 7 x 8192, then an 8040 that would push the stream
+	 * past 64 KiB. */
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "ea.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	for (i = 0; i < 7; i++) {
+		snprintf(name, sizeof(name), "user.b%d", i);
+		if (ea_set(f, name, val8k, sizeof(val8k)) != 0) {
+			fprintf(stderr, "SKIP test_ea_final_size_validated: setup add %d failed\n", i);
+			ntfs_inode_put(f);
+			vol_down(&v);
+			unlink(scratch);
+			return;
+		}
+	}
+	/* New: hunk 2 rejects the add with -EFBIG before writing.
+	 * Old: the add proceeds, the $EA resize to 65572 trips the
+	 * $AttrDef bounds check in the write path and fails with -EIO
+	 * (and sets the volume error flag). Either way the 8th EA is
+	 * absent; the return code is the discriminator. */
+	err = ea_set(f, "user.b7", val8040, sizeof(val8040));
+	CHECK(err == -EFBIG);
+	if (err != -EFBIG)
+		fprintf(stderr, "FAIL ea add: set returned %d, expected -EFBIG (-27)\n", err);
+	err = ea_get(f, "user.b7", buf, sizeof(buf));
+	CHECK(err < 0);
+	if (err >= 0)
+		fprintf(stderr, "FAIL ea add: over-limit EA present (%d bytes)\n", err);
+	ntfs_inode_put(f);
+	f = NULL;
+	vol_down(&v);
+	unlink(scratch);
+
+	/* Replace case: 15 x 4096, then replace one with 8192. The new
+	 * value differs from the old one, so the identical-value early
+	 * return cannot mask the check. */
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: no fixture (replace)\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: mount failed (replace)\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "ea2.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_ea_final_size_validated: create2 failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	for (i = 0; i < 15; i++) {
+		snprintf(name, sizeof(name), "user.a%02d", i);
+		if (ea_set(f, name, val4k, sizeof(val4k)) != 0) {
+			fprintf(stderr, "SKIP test_ea_final_size_validated: setup replace %d failed\n", i);
+			ntfs_inode_put(f);
+			vol_down(&v);
+			unlink(scratch);
+			return;
+		}
+	}
+	memset(val8k, 'B', sizeof(val8k));
+	err = ea_set(f, "user.a00", val8k, sizeof(val8k));
+	CHECK(err == -EFBIG);
+	if (err != -EFBIG)
+		fprintf(stderr, "FAIL ea replace: set returned %d, expected -EFBIG (-27)\n", err);
+	/* The old value must still be there, intact. */
+	err = ea_get(f, "user.a00", buf, sizeof(buf));
+	CHECK(err == (int)sizeof(val4k));
+	if (err != (int)sizeof(val4k))
+		fprintf(stderr, "FAIL ea replace: old value %s (get=%d, expected 4096)\n",
+			err < 0 ? "gone" : "shortened", err);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -2597,6 +2776,7 @@ int main(void)
 	test_mft_alloc_usa_ofs_validated();
 	test_lookup_err_mref_normalized();
 	test_nonres_attr_validation();
+	test_ea_final_size_validated();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
