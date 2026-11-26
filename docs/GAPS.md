@@ -927,6 +927,36 @@ Porting progress (one commit per item, in the order above):
   failed with NTFS_REQUIRE_FSCK=1.
   33 port items remain.
 
+- 2026-11-26: `0ebe8f625ab0` (fail attrlist updates when the
+  superblock is inactive) — ported verbatim: SB_ACTIVE guard at
+  the top of `ntfs_attrlist_update()` (core/ntfs/attrlist.c),
+  returns -EIO once teardown has cleared SB_ACTIVE so the update
+  never igets the $ATTRIBUTE_LIST fake inode while it is
+  I_FREEING (self-deadlock in find_inode()). New test
+  `test_attrlist_update_inactive_sb` (core/tests/test_links.c):
+  grows an attribute list by hard-linking until the 1024-byte
+  base MFT record overflows (verified on disk with ntfsinfo:
+  $ATTRIBUTE_LIST present, $FILE_NAMEs in extension records),
+  then active update returns 0, inactive returns -EIO,
+  restored returns 0. Test needed two small wrappers
+  (`ntfs_attrlist_update_vfs()` / `ntfs_attrlist_need_vfs()` in
+  attrlist.c): the test TU cannot include inode.h (struct
+  ntfs_attr collides with ntfscore.h), so the handle-to-
+  ntfs_inode conversion lives there. Two fork observations from
+  building the test: (1) ntfs_attrlist_update() segfaults when
+  called on a file with no attribute list (pre-existing upstream
+  behaviour -- its callers only call it when a list exists, and
+  7 x 8192-byte EAs do NOT overflow the record); (2) the
+  in-memory inode from ntfs_create() does not pick up a list the
+  link path grows -- the test unmounts/remounts so the fresh
+  lookup loads $ATTRIBUTE_LIST from disk. Evidence: test_links
+  525 checks, 0 failures with the fix; without it exactly 1
+  failure (inactive update returns 0, line-number strip,
+  diff-verified). Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  32 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

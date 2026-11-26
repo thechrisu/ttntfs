@@ -52,6 +52,7 @@
  */
 #include <linux/types.h>
 #include <linux/xattr.h>
+#include <linux/fs.h>
 #include <asm/byteorder.h>
 #include <linux/math64.h>
 #include "../ntfs/time.h"
@@ -3652,6 +3653,141 @@ static void test_reserved_lxattr_rejected(void)
 	unlink(scratch);
 }
 
+/* ---- 20. Attrlist updates fail when the superblock is inactive
+ * (upstream 0ebe8f625ab0) --- */
+
+/*
+ * Upstream 0ebe8f625ab0: generic_shutdown_super() clears SB_ACTIVE
+ * before evicting cached inodes. An attrlist update during teardown
+ * would iget the $ATTRIBUTE_LIST fake inode while it is I_FREEING
+ * and self-deadlock in find_inode(). The guard returns -EIO once
+ * SB_ACTIVE is clear, so teardown aborts the update instead of
+ * waiting on the inode it is evicting.
+ *
+ * The test drives ntfs_attrlist_update() directly on a file with
+ * an attribute list (grown by hard-linking until the 1024-byte
+ * base MFT record overflows into an extension record): with
+ * SB_ACTIVE set the update rewrites the list and returns 0; with
+ * SB_ACTIVE cleared it must return -EIO without touching the
+ * inode table. The volume's super_block is reached through the
+ * same handle mirror as the DT_UNKNOWN test (§18): the handle's
+ * first field is struct ntfs_volume *, whose first field is sb.
+ *
+ * The _vfs wrappers take the public handle (a struct inode *);
+ * the test TU cannot convert it to struct ntfs_inode * itself
+ * (inode.h is not includable -- struct ntfs_attr collides with
+ * ntfscore.h), so the conversion lives in core/ntfs/attrlist.c.
+ */
+int ntfs_attrlist_update_vfs(struct inode *vi);
+int ntfs_attrlist_need_vfs(struct inode *vi);
+
+struct ntfs_volume_sb_test {
+	struct super_block *sb;
+};
+
+static void test_attrlist_update_inactive_sb(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	struct super_block *sb;
+	int err_active, err_inactive, err_restored;
+
+	printf("test_attrlist_update_inactive_sb\n");
+	if (copy_fixture("alupd") != 0) {
+		fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_create(v.root, "al.bin", 0100644, &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: create failed\n");
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/*
+	 * ntfs_attrlist_update() requires the file to HAVE an
+	 * attribute list (its production callers only call it after
+	 * an attribute moved to an extension record). A plain file
+	 * has none, and calling the update on it segfaults -- so
+	 * grow one first: each hard link adds a $FILE_NAME to the
+	 * 1024-byte base MFT record until it overflows into an
+	 * extension record with an $ATTRIBUTE_LIST.
+	 * ntfs_attrlist_need() is the safe probe: -EINVAL while
+	 * there is no list, >= 0 once there is one.
+	 *
+	 * The in-memory inode from ntfs_create() does not pick up
+	 * the list the link path grew, and the inode table hands
+	 * the same cached struct back on lookup -- so unmount and
+	 * remount: the fresh lookup then loads $ATTRIBUTE_LIST
+	 * from disk (ntfs_read_locked_inode).
+	 */
+	{
+		char name[16];
+		int i, need = -EINVAL, lerr = 0;
+		for (i = 0; i < 20; i++) {
+			snprintf(name, sizeof(name), "al%02d", i);
+			lerr = ntfs_link(f, v.root, name);
+			if (lerr != 0)
+				break;
+		}
+		ntfs_inode_put(f);
+		f = NULL;
+		vol_down(&v);
+		if (vol_up(&v, 022, 022, 501, 20)) {
+			fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: remount failed\n");
+			unlink(scratch);
+			return;
+		}
+		if (ntfs_lookup(v.root, "al.bin", &f) != 0 || !f) {
+			fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: re-lookup failed\n");
+			vol_down(&v);
+			unlink(scratch);
+			return;
+		}
+		need = ntfs_attrlist_need_vfs((struct inode *)f);
+		if (need < 0) {
+			fprintf(stderr, "SKIP test_attrlist_update_inactive_sb: no attribute list after %d links (link err %d, need %d)\n",
+				i, lerr, need);
+			ntfs_inode_put(f);
+			vol_down(&v);
+			unlink(scratch);
+			return;
+		}
+	}
+	/* The super_block belongs to this mount; capture it after
+	 * the remount, not before. */
+	sb = ((struct ntfs_volume_sb_test *)
+	      ((struct ntfs_volume_handle_test *)v.vol)->vol)->sb;
+	/* Active: the guard does not trip; the update rewrites the
+	 * attribute list and returns 0. */
+	err_active = ntfs_attrlist_update_vfs((struct inode *)f);
+	CHECK(err_active == 0);
+	if (err_active != 0)
+		fprintf(stderr, "FAIL al-update: active update returned %d, expected 0\n",
+			err_active);
+	/* Inactive: the guard trips, -EIO, no iget. */
+	sb->s_flags &= ~SB_ACTIVE;
+	err_inactive = ntfs_attrlist_update_vfs((struct inode *)f);
+	CHECK(err_inactive == -EIO);
+	if (err_inactive != -EIO)
+		fprintf(stderr, "FAIL al-update: inactive update returned %d, expected -EIO (-5)\n",
+			err_inactive);
+	/* Restoring the flag restores the update. */
+	sb->s_flags |= SB_ACTIVE;
+	err_restored = ntfs_attrlist_update_vfs((struct inode *)f);
+	CHECK(err_restored == 0);
+	if (err_restored != 0)
+		fprintf(stderr, "FAIL al-update: restored update returned %d, expected 0\n",
+			err_restored);
+	ntfs_inode_put(f);
+	vol_down(&v);
+	unlink(scratch);
+}
+
 int main(void)
 {
 	test_hard_links();
@@ -3680,6 +3816,7 @@ int main(void)
 	test_ib_sync_write_no_post_fixup();
 	test_reparse_dt_unknown_on_lookup_failure();
 	test_reserved_lxattr_rejected();
+	test_attrlist_update_inactive_sb();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

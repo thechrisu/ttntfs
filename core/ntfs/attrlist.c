@@ -51,11 +51,36 @@ int ntfs_attrlist_need(struct ntfs_inode *ni)
 	return 0;
 }
 
+/*
+ * Test hooks: the test TU cannot include inode.h (its struct
+ * ntfs_attr collides with ntfscore.h), so it cannot convert the
+ * public handle (a struct inode *) to struct ntfs_inode * with
+ * NTFS_I(). These wrappers do the conversion here.
+ */
+int ntfs_attrlist_update_vfs(struct inode *vi)
+{
+	return ntfs_attrlist_update(NTFS_I(vi));
+}
+
+int ntfs_attrlist_need_vfs(struct inode *vi)
+{
+	return ntfs_attrlist_need(NTFS_I(vi));
+}
+
 int ntfs_attrlist_update(struct ntfs_inode *base_ni)
 {
 	struct inode *attr_vi;
 	struct ntfs_inode *attr_ni;
 	int err;
+
+	/*
+	 * generic_shutdown_super() clears SB_ACTIVE before evicting cached
+	 * inodes. Do not look up the attribute-list inode after SB_ACTIVE has
+	 * been cleared; it may already be I_FREEING, and waiting on it can
+	 * self-deadlock.
+	 */
+	if (!(VFS_I(base_ni)->i_sb->s_flags & SB_ACTIVE))
+		return -EIO;
 
 	attr_vi = ntfs_attr_iget(VFS_I(base_ni), AT_ATTRIBUTE_LIST, AT_UNNAMED, 0);
 	if (IS_ERR(attr_vi)) {
