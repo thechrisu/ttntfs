@@ -53,10 +53,20 @@ int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
 		if (rl->lcn < 0)
 			continue;
 		err = ntfs_bitmap_clear_run(lcnbmp_vi, rl->lcn, rl->length);
-		if (unlikely(err && (!ret || ret == -ENOMEM) && ret != err))
-			ret = err;
-		else
+		/*
+		 * Upstream be9e89ccb8e5: only count runs whose bitmap
+		 * clear succeeded. The old if/else added a run's length
+		 * to nr_freed whenever the error bookkeeping condition
+		 * was false -- including a second run failing with the
+		 * same errno as an earlier one, or any failure after a
+		 * non-ENOMEM error was already recorded -- even though
+		 * the failed clear rolls back its partial modifications
+		 * and clears no bits, inflating vol->free_clusters.
+		 */
+		if (likely(!err))
 			nr_freed += rl->length;
+		else if (!ret || ret == -ENOMEM)
+			ret = err;
 	}
 	ntfs_inc_free_clusters(vol, nr_freed);
 	ntfs_debug("Done.");
@@ -1049,8 +1059,15 @@ err_out:
 			"Failed to rollback (error %i).  Leaving inconsistent metadata!  Unmount and run chkdsk.",
 			(int)delta);
 		NVolSetErrors(vol);
+	} else {
+		/*
+		 * Upstream 5f2a22b36fe3: skip the decrement when the
+		 * rollback failed. The old code subtracted the negative
+		 * rollback errno, adding bogus clusters to the counter
+		 * on an already-failing volume.
+		 */
+		ntfs_dec_free_clusters(vol, delta);
 	}
-	ntfs_dec_free_clusters(vol, delta);
 	up_write(&vol->lcnbmp_lock);
 	memalloc_nofs_restore(memalloc_flags);
 	ntfs_error(vol->sb, "Aborting (error %i).", err);

@@ -1217,6 +1217,38 @@ Porting progress (one commit per item, in the order above):
   with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (489 s).
   18 port items remain.
 
+- 2026-11-26: `5f2a22b36fe3` + `be9e89ccb8e5` (free-cluster
+  accounting pair) — ported, one commit, both in
+  core/ntfs/lcnalloc.c, verbatim upstream. `5f2a22b36fe3`:
+  `__ntfs_cluster_free()`'s err_out now calls
+  `ntfs_dec_free_clusters(vol, delta)` only when the rollback
+  succeeded (else branch); a failed rollback used to subtract the
+  negative errno, adding bogus clusters to `vol->free_clusters`.
+  `be9e89ccb8e5`: `ntfs_cluster_free_from_rl_nolock()` now only
+  adds a run's length to `nr_freed` when
+  `ntfs_bitmap_clear_run()` succeeded; the old if/else inflated
+  the counter on a second run failing with the same errno as an
+  earlier one, or any failure after a non-ENOMEM error was
+  recorded. NOTE: no discriminating test is possible through the
+  public harness for either half. For `5f2a22b36fe3`, a failing
+  rollback needs a bitmap-set failure on a run whose clear just
+  succeeded (same bits, same folio, identical I/O path) or a
+  runlist-map failure in the recursive call that the first call
+  did not hit — reachable only on a corrupt multi-extent file or
+  failing disk. For `be9e89ccb8e5`, a failing bitmap clear needs a
+  $Bitmap read failure, which a crafted runlist cannot produce:
+  the mapping-pairs decoder validates every run's LCN against
+  `nr_clusters` at map time (core/ntfs/runlist.c:912,939), so an
+  out-of-volume run never reaches the free code, and
+  `__ntfs_bitmap_set_bits_in_run()` has no range check of its own
+  (it succeeds by dirtying a past-EOF folio). The allocation-failure
+  rollback (the only from_rl_nolock caller in lcnalloc.c) cannot
+  fail either: the allocator only hands out in-volume runs. The
+  fixes are 2-3 lines each in error paths, exercised by the
+  existing allocation/free coverage. Same "no new test, port note
+  explains why" precedent as 4e646ecd4475 / 88496c4ac5a6.
+  16 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
