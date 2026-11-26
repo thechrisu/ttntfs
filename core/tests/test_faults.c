@@ -20,7 +20,11 @@
  * required. That is the assertion that matters. Reporting -EIO correctly and
  * leaving a torn index behind is still a lost filesystem, and only the checker
  * can tell the two apart. -n is not optional: ntfsck would otherwise repair the
- * damage it is being asked to measure.
+ * damage it is being asked to measure. The one exception is
+ * write_fail_midtransfer: upstream 0e4c83990541 requires a sync with errors
+ * recorded to leave the volume dirty, so its torn $Volume record must stay
+ * visible to the checker instead of being rewritten clean -- it ends with
+ * check_torn_volume_left_dirty(), which asserts the damage.
  *
  * What this found, all three fixed on 2026-09-14 and now asserted the right way
  * round (docs/UPSTREAM-BUGS.md findings 12-14):
@@ -1150,6 +1154,146 @@ static void test_write_fail_sync(void)
  * the blocks land, the rest do not. This is what tears a metadata structure in
  * half, so the ntfsck afterwards carries the weight here.
  */
+/*
+ * Upstream 0e4c83990541 changed what write_fail_midtransfer must leave
+ * behind, so it does not end with check_image() like the other cases.
+ * The torn transfer is the $Volume record write: the fault writes the
+ * first 512 bytes (new USN) and fails on the second half, so $MFT
+ * record 3 is left with mismatched sector USNs. Before the fix, the
+ * sync rewrote the record while clearing the dirty bit, which repaired
+ * the tear and hid the error, so ntfsck called the image clean. With
+ * the fix the sync must not touch the record, so the volume stays
+ * dirty with the torn record visible, and chkdsk must repair it from
+ * $MFTMirr. Assert exactly that damage: the dirty bit still set, the
+ * torn update sequence, and ntfsck reporting record 3 -- instead of a
+ * clean image. All three fail without the fix (the sync clears the
+ * flag and rewrites the record whole) and pass with it.
+ */
+static int volume_flags_and_torn(uint16_t *flags, bool *torn)
+{
+	struct geom g;
+	uint8_t *rec;
+	uint32_t rs;
+	int fd, o;
+	uint16_t end0, end1;
+
+	if (read_geom(&g) != 0)
+		return -EIO;
+	rs = g.mft_record_size;
+	rec = malloc(rs);
+	if (!rec)
+		return -ENOMEM;
+	fd = open(img, O_RDONLY);
+	if (fd < 0) {
+		free(rec);
+		return -errno;
+	}
+	if (pread(fd, rec, rs, (off_t)(g.mft_off + 3 * rs)) != (ssize_t)rs) {
+		close(fd);
+		free(rec);
+		return -EIO;
+	}
+	close(fd);
+	/* The magic is intact; the tear is in the sector-end USNs. */
+	if (memcmp(rec, "FILE", 4) != 0) {
+		free(rec);
+		return -EINVAL;
+	}
+	/* Sector-end USNs: last two bytes of the first and last sectors. */
+	end0 = rec[510] | (rec[511] << 8);
+	end1 = rec[rs - 2] | (rec[rs - 1] << 8);
+	*torn = (end0 != end1);
+	/*
+	 * $VOLUME_INFORMATION (0x70) value, read raw: the fixup reader
+	 * refuses torn records, so walk the attributes by hand. Only the
+	 * first sector is needed and it is intact.
+	 */
+	o = rec[0x14] | (rec[0x15] << 8);
+	while (o + 8 <= (int)rs) {
+		uint32_t type = rec[o] | (rec[o + 1] << 8) |
+				((uint32_t)rec[o + 2] << 16) |
+				((uint32_t)rec[o + 3] << 24);
+		uint32_t len = rec[o + 4] | (rec[o + 5] << 8) |
+			       ((uint32_t)rec[o + 6] << 16) |
+			       ((uint32_t)rec[o + 7] << 24);
+		if (type == 0xFFFFFFFF)
+			break;
+		if (len < 8 || (uint32_t)o + len > rs) {
+			free(rec);
+			return -EINVAL;
+		}
+		if (type == 0x70) {
+			uint32_t vlen = rec[o + 0x10] | (rec[o + 0x11] << 8) |
+					((uint32_t)rec[o + 0x12] << 16) |
+					((uint32_t)rec[o + 0x13] << 24);
+			uint16_t voff = rec[o + 0x14] | (rec[o + 0x15] << 8);
+			if (voff + 12 > len || vlen < 12) {
+				free(rec);
+				return -EINVAL;
+			}
+			*flags = rec[o + voff + 10] |
+				 (rec[o + voff + 11] << 8);
+			free(rec);
+			return 0;
+		}
+		o += (int)len;
+	}
+	free(rec);
+	return -ENOENT;
+}
+
+static void check_torn_volume_left_dirty(const char *tag)
+{
+	char cmd[2048], out[1024];
+	uint16_t flags = 0;
+	bool torn = false;
+	int rc;
+	FILE *f;
+	char line[512];
+	bool saw_rec3 = false;
+
+	rc = volume_flags_and_torn(&flags, &torn);
+	CHECK(rc == 0);
+	checks++;
+	if (!(flags & 0x0001)) {
+		failures++;
+		fprintf(stderr, "FAIL %s: volume is not dirty after a sync with errors recorded (flags 0x%04x)\n",
+			tag, flags);
+	}
+	checks++;
+	if (!torn) {
+		failures++;
+		fprintf(stderr, "FAIL %s: $MFT record 3 is not torn (both sector USNs agree) -- the sync rewrote it\n",
+			tag);
+	}
+	/* ntfsck -n must report the torn record instead of a clean image. */
+	snprintf(out, sizeof(out), "%s/ttntfs-faults-%d-fsck.txt", scratch_dir(), (int)getpid());
+	snprintf(cmd, sizeof(cmd), "'%s' -n '%s' >'%s' 2>&1",
+		 tool("NTFS_NTFSCK", "tools/.local-plus/sbin/ntfsck"), img, out);
+	rc = system(cmd);
+	checks++;
+	if (rc == 0) {
+		failures++;
+		fprintf(stderr, "FAIL %s: ntfsck calls the torn volume clean\n", tag);
+	} else {
+		f = fopen(out, "r");
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				if (strstr(line, "Record 3 has no FILE magic"))
+					saw_rec3 = true;
+			}
+			fclose(f);
+		}
+		checks++;
+		if (!saw_rec3) {
+			failures++;
+			fprintf(stderr, "FAIL %s: ntfsck failed but did not report record 3 (exit %d)\n",
+				tag, rc);
+		}
+	}
+	unlink(out);
+}
+
 static void test_write_fail_midtransfer(void)
 {
 	struct ntfs_bdev *dev;
@@ -1191,7 +1335,7 @@ out:
 	fault_clear();
 	ntfs_unmount(vol);
 	ntfs_bdev_close(dev);
-	check_image("write_fail_midtransfer");
+	check_torn_volume_left_dirty("write_fail_midtransfer");
 	drop_image();
 	printf("test_write_fail_midtransfer\n");
 }

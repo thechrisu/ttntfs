@@ -1277,7 +1277,39 @@ Porting progress (one commit per item, in the order above):
   disproved by reading the on-disk $MFT/$BITMAP directly with
   python: 266 set bits in the first 311, i.e. the true free count
   45; the in-memory counter was the wrong one.)
+  Evidence (this commit): plain ctest 15/15, UBSan ctest 15/15,
+  ASan ctest PASS (175 s), `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (363 s).
   15 port items remain.
+
+- 2026-11-26: `0e4c83990541` (do not mark the volume clean in
+  sync_fs when errors were recorded) — ported, one line in
+  core/ntfs/super.c: `ntfs_sync_fs()` now clears VOLUME_IS_DIRTY
+  only when `!NVolErrors(vol)`, matching `put_super` and the
+  remount path. Discriminating test: `test_write_fail_midtransfer()`
+  in core/tests/test_faults.c now ends with
+  `check_torn_volume_left_dirty()` instead of `check_image()`. The
+  torn transfer is the $Volume record write (the fault writes the
+  first 512 bytes, new USN, and fails on the second half), so $MFT
+  record 3 is left with mismatched sector USNs; before the fix the
+  sync rewrote the record while clearing the dirty bit, repairing
+  the tear and hiding the error, so ntfsck called the image clean.
+  With the fix the volume stays dirty with the torn record visible,
+  asserted three ways: the dirty bit still set on disk, the torn
+  USA, and ntfsck reporting record 3 — all three fail without the
+  fix. (Proven the hard way: the first full ladder ran against a
+  tree where the fix had been reverted for the negative control and
+  never re-applied — caught by the push dry-run listing only the
+  docs files; the fix was re-applied and the ladder re-run.)
+  Note: the upstream reproducer (a $MFTMirr mismatch leaving a
+  read-write mount with errors set) is NOT the route used — it is
+  unreachable in this port, because the glue forces
+  `errors=remount-ro` on every mount (core/vfs/super_glue.c:146),
+  `ntfs_glue_make_rw()` refuses RW whenever `NVolErrors` is set,
+  and a mirror-mismatch mount fails with `-EROFS` (verified
+  empirically with a python patcher that flips one byte in the
+  mirror's copy of record 1; patcher deleted).
+  14 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

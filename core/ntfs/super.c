@@ -1934,7 +1934,15 @@ static int ntfs_sync_fs(struct super_block *sb, int wait)
 		return 0;
 
 	/* If there are some dirty buffers in the bdev inode */
-	if (ntfs_clear_volume_flags(vol, VOLUME_IS_DIRTY)) {
+	/*
+	 * Upstream 0e4c83990541: do not mark the volume clean when
+	 * errors were recorded -- put_super and the remount path
+	 * already guard the clear on NVolErrors, sync_fs must too,
+	 * or any sync() on a volume that recorded an error marks it
+	 * clean and it never runs recovery.
+	 */
+	if (!NVolErrors(vol) &&
+	    ntfs_clear_volume_flags(vol, VOLUME_IS_DIRTY)) {
 		ntfs_warning(sb, "Failed to clear dirty bit in volume information flags.  Run chkdsk.");
 		err = -EIO;
 	}
