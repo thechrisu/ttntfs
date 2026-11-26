@@ -5520,6 +5520,7 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 	s64 old_data_size;
 	s64 vcn_start, vcn_end, vcn_uninit, vcn, try_alloc_cnt;
 	s64 lcn, alloc_cnt;
+	s64 rl_lcn, rl_length, rl_vcn;
 	int err = 0;
 	struct runlist_element *rl;
 	bool balloc;
@@ -5599,19 +5600,28 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 	while (vcn < vcn_uninit) {
 		down_read(&ni->runlist.lock);
 		rl = ntfs_attr_find_vcn_nolock(ni, vcn, NULL);
-		up_read(&ni->runlist.lock);
 		if (IS_ERR(rl)) {
+			up_read(&ni->runlist.lock);
 			err = PTR_ERR(rl);
 			goto out;
 		}
+		/* PORT: upstream 88496c4ac5a6: rl is only a borrowed
+		 * pointer into ni->runlist.rl, and a writer can replace
+		 * and free that array after the read lock is dropped.
+		 * Copy the needed fields while the lock is still held
+		 * and use only the scalars after unlocking. */
+		rl_lcn = rl->lcn;
+		rl_length = rl->length;
+		rl_vcn = rl->vcn;
+		up_read(&ni->runlist.lock);
 
-		if (rl->lcn > 0) {
-			vcn += rl->length - (vcn - rl->vcn);
-		} else if (rl->lcn == LCN_DELALLOC || rl->lcn == LCN_HOLE) {
-			try_alloc_cnt = min(rl->length - (vcn - rl->vcn),
+		if (rl_lcn > 0) {
+			vcn += rl_length - (vcn - rl_vcn);
+		} else if (rl_lcn == LCN_DELALLOC || rl_lcn == LCN_HOLE) {
+			try_alloc_cnt = min(rl_length - (vcn - rl_vcn),
 					    vcn_uninit - vcn);
 
-			if (rl->lcn == LCN_DELALLOC) {
+			if (rl_lcn == LCN_DELALLOC) {
 				vcn += try_alloc_cnt;
 				continue;
 			}
@@ -5626,17 +5636,20 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 				if (err)
 					goto out;
 
-				err = ntfs_dio_zero_range(VFS_I(ni),
-							  lcn << vol->cluster_size_bits,
-							  alloc_cnt << vol->cluster_size_bits);
-				/* PORT: upstream 607a9478833d: ntfs_dio_zero_range()
-				 * returns 0 or a negative errno, never a positive
-				 * value, so "err > 0" never fired and a failed zero
-				 * was silently ignored (the allocation kept going
-				 * and could succeed leaving stale on-disk data).
-				 * Treat any nonzero return as an error. */
-				if (err)
-					goto out;
+				/* PORT: upstream 88496c4ac5a6: only zero when
+				 * new clusters were allocated -- map_cluster()
+				 * can find the range already mapped (balloc ==
+				 * false) after the snapshot, and zeroing it
+				 * again would be wrong. The if (err) check
+				 * inside is the 607a9478833d port (any nonzero
+				 * zero-range return is an error). */
+				if (balloc) {
+					err = ntfs_dio_zero_range(VFS_I(ni),
+								  lcn << vol->cluster_size_bits,
+								  alloc_cnt << vol->cluster_size_bits);
+					if (err)
+						goto out;
+				}
 
 				if (signal_pending(current))
 					goto signal_out;

@@ -1089,6 +1089,30 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 8/8.
   26 port items remain.
 
+- 2026-11-26: `88496c4ac5a6` (avoid stale runlist element
+  dereference in fallocate) — ported: ntfs_attr_fallocate()
+  (core/ntfs/attrib.c) now snapshots rl->lcn/length/vcn into
+  scalars while the read lock is held and uses only the
+  scalars after unlocking, and only calls ntfs_dio_zero_range()
+  when map_cluster() reports balloc (new clusters allocated;
+  the `if (err)` inside is the 607a9478833d port). NOTE: the
+  race is not reachable in the port -- the upstream trigger
+  needs a concurrent mmap page_mkwrite, which the port has no
+  counterpart for, and every runlist-realloc path in the port
+  runs under the same inode's i_rwsem (writes and fallocate
+  take it exclusively, reads shared), while fallocate holds it
+  exclusively; ntfs_attr_fallocate's only caller is
+  ntfs_allocate_range via ntfs_fallocate. No discriminating
+  test is possible in the single-threaded UBSan harness (the
+  UAF needs a concurrent writer plus ASan to observe), so the
+  fix is applied verbatim for upstream fidelity; the affected
+  loop is exercised by the existing fallocate coverage
+  (test_faults.c test_fallocate_zero_failure, test_compress.c
+  1MB fallocate). Plain ctest 15/15, UBSan ctest 15/15,
+  `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 8/8.
+  25 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
