@@ -159,8 +159,15 @@ static void test_invalidate(struct inode *in)
 	/* invalidate_mapping_pages drops only clean+unreferenced: just 202. */
 	CHECK(invalidate_mapping_pages(m, 200, 202) == 1);
 	CHECK(PTR_ERR(filemap_get_folio(m, 202)) == -ENOENT);
-	CHECK(!IS_ERR(filemap_get_folio(m, 201)));
-	folio_put(filemap_get_folio(m, 201));
+	/*
+	 * ASan (2026-11-26): filemap_get_folio() hands out +1 per call.
+	 * Calling it once inside CHECK() and again inside folio_put()
+	 * leaked the first reference -- folio 201 survived invalidate2
+	 * with refcount 1 and no table entry. Hold the result once.
+	 */
+	struct folio *f201 = filemap_get_folio(m, 201);
+	CHECK(!IS_ERR(f201));
+	folio_put(f201);
 	/* invalidate2 drops everything but reports the referenced one. */
 	CHECK(invalidate_inode_pages2_range(m, 200, 202) == -EBUSY);
 	CHECK(PTR_ERR(filemap_get_folio(m, 201)) == -ENOENT);
@@ -239,8 +246,14 @@ static void test_reclaim(void)
 	}
 	CHECK(m->nrpages <= 64 + 8);
 	CHECK(pin->mapping == m);			/* referenced: kept */
-	CHECK(!IS_ERR(filemap_get_folio(m, 1)));	/* dirty: kept */
-	folio_put(filemap_get_folio(m, 1));
+	/*
+	 * ASan (2026-11-26): same double-call leak as folio 201 above --
+	 * the CHECK() call's reference was never put, so the dirty folio
+	 * survived address_space_destroy() with refcount 1. Hold it once.
+	 */
+	struct folio *f1 = filemap_get_folio(m, 1);
+	CHECK(!IS_ERR(f1));	/* dirty: kept */
+	folio_put(f1);
 	/* Standalone pages come and go (compress.c); the cap must still hold. */
 	for (int i = 0; i < 300; i++) {
 		struct page *p = alloc_page(GFP_KERNEL);
