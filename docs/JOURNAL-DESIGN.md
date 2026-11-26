@@ -233,6 +233,16 @@ let `current_lsn` advance past a torn page. The restart area is the
 one structure whose corruption loses the whole log, so it is updated
 last, after the record pages it describes are durable.
 
+Known wart (noted 2026-11-26, round 18, not fixed): when the tail
+scan stops at its very first page — a torn page the restart area
+points at — `last_lsn` stays at the restart area's value and the
+walk fails `-EINVAL` instead of truncating the log at that page.
+The log is still safe (nothing is replayed from an untrusted tail),
+but the failure mode is a refusal rather than a clean truncation.
+Fix it when it fits the phase work: the scan should treat "first
+page unreadable" as "log ends at the restart area" and let the walk
+and replay proceed from the last good state.
+
 ## 4. Design
 
 ### 4.1 Modules

@@ -307,6 +307,70 @@ int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out);
 int ntfs_log_writer_sync(ntfs_log_writer_t *w);
 void ntfs_log_writer_free(ntfs_log_writer_t *w);
 
+/* ---- Transactions (Phase 2: journal writing, docs/JOURNAL-DESIGN.md) ----
+ *
+ * One user-visible operation (a file creation) as one transaction: the
+ * ntfs_log_txn_*() builders stage NTFS client records in memory — each
+ * describing one sub-mutation with its redo and its undo — and commit()
+ * appends them in order, then a CommitTransaction record, then a
+ * checkpoint (which is what makes the records replayable: replay walks
+ * from the last checkpoint, and the checkpoint's table dumps carry the
+ * transaction state and the dirty pages), then a ForgetTransaction
+ * record. abort() writes nothing at all.
+ *
+ * Crash contract: the records are appended synchronously, one by one,
+ * so a crash mid-commit leaves a transaction with records but no
+ * CommitTransaction record — ACTIVE in the log — and the next replay's
+ * undo pass rolls it back through the undo ops, leaving the volume as
+ * if the operation never happened. A crash after the Commit record
+ * leaves a committed transaction, and replay redoes it. A crash after
+ * the checkpoint leaves the same, reached through the checkpoint's
+ * tables. There is no instant at which a half-applied transaction
+ * survives: every record carries its undo, and the commit point is
+ * the single CommitTransaction record.
+ *
+ * The builders take the on-disk coordinates the replay engine checks
+ * (docs/LOGFILE.md H1): @mft_attr/@bitmap_attr is the open-attribute
+ * table offset of $MFT:$DATA or the bitmap attribute (registered with
+ * ntfs_log_writer_open_attr()), @target_vcn the cluster vcn the
+ * record's bytes live at, @cluster_off the byte offset of the record
+ * inside that cluster in 512-byte units, and @page_lcn the LCN of the
+ * cluster (from the attribute's run list). The builders register the
+ * dirty page in the writer's dirty-page table, so the checkpoint
+ * covers it. Commit and abort free the transaction; on commit failure
+ * the transaction stays ACTIVE in the writer's table when any record
+ * was appended (its records are on the log and will be rolled back by
+ * the next replay), and its entry is freed when nothing was appended.
+ */
+typedef struct ntfs_log_txn ntfs_log_txn_t;
+
+int ntfs_log_txn_begin(ntfs_log_writer_t *w, ntfs_log_txn_t **out);
+int ntfs_log_txn_init_record(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, const void *rec, uint32_t rec_len);
+int ntfs_log_txn_create_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, uint16_t record_off,
+			     const void *attr, uint32_t attr_len);
+int ntfs_log_txn_add_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				uint64_t target_vcn, uint16_t cluster_off,
+				uint64_t page_lcn, uint16_t record_off,
+				uint16_t attr_off, const void *entry,
+				uint32_t entry_len);
+int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
+				 uint64_t target_vcn, uint16_t cluster_off,
+				 uint64_t page_lcn, uint16_t record_off,
+				 uint16_t attr_off, const void *new_val,
+				 uint16_t new_len, const void *old_val,
+				 uint16_t old_len);
+int ntfs_log_txn_set_bitmap(ntfs_log_txn_t *t, uint32_t bitmap_attr,
+			    uint64_t target_vcn, uint16_t cluster_off,
+			    uint64_t page_lcn, uint32_t bit, uint32_t nbits,
+			    bool set);
+int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
+			uint64_t *last_lsn_out);
+int ntfs_log_txn_abort(ntfs_log_txn_t *t);
+
 #ifdef __cplusplus
 }
 #endif

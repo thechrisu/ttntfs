@@ -939,16 +939,29 @@ static int lw_checkpoint_inner(ntfs_log_writer_t *w, uint64_t *lsn_out)
 	w->checkpoint_lsn = rlsn;
 	w->checkpointed = true;
 	w->first_lsn = first_dump ? first_dump : rlsn;
+	/* The restart area's oldest LSN is the oldest record still
+	 * needed. The checkpoint's own dumps are the floor, but a
+	 * transaction's records and a dirty page's records stay needed
+	 * until the transaction is forgotten AND its pages are flushed
+	 * to the volume — the redo pass reads them through
+	 * lfs_read_record, which refuses anything before oldest. The
+	 * earlier form only kept active/prepared transactions, so a
+	 * committed transaction's records (still referenced by its
+	 * dirty pages) fell outside [oldest, last] and replay could
+	 * never redo them. */
 	e = NULL;
 	while ((e = lfs_table_next(&w->trtbl, e))) {
-		uint8_t st = e[TR_STATE];
+		uint64_t fl = lf_get64(e + TR_FIRST_LSN);
 
-		if (st == TRANSACTION_ACTIVE || st == TRANSACTION_PREPARED) {
-			uint64_t fl = lf_get64(e + TR_FIRST_LSN);
+		if (fl && fl < w->first_lsn)
+			w->first_lsn = fl;
+	}
+	e = NULL;
+	while ((e = lfs_table_next(&w->dptbl, e))) {
+		uint64_t ol = lf_get64(e + DP1_OLDEST_LSN);
 
-			if (fl && fl < w->first_lsn)
-				w->first_lsn = fl;
-		}
+		if (ol && ol < w->first_lsn)
+			w->first_lsn = ol;
 	}
 	err = ntfs_log_writer_sync(w);
 	if (err)
@@ -1014,5 +1027,440 @@ int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out)
 	w->closed = true;
 	if (lsn_out)
 		*lsn_out = rlsn;
+	return 0;
+}
+
+/* ---- transactions (Phase 2) -------------------------------------------- */
+
+struct ntfs_log_txn {
+	ntfs_log_writer_t *w;
+	uint32_t tid;
+	uint8_t *stage;		/* staged records: u32 length + bytes each */
+	size_t stage_len, stage_cap;
+	uint32_t nstaged;
+	uint32_t undo_records, undo_bytes;
+	uint64_t first_lsn, last_lsn;
+	bool done;
+};
+
+/*
+ * Build one NTFS client record (the NTFS header + redo/undo payloads),
+ * the production form of the test builder in tests/test_logfile.c.
+ * Redo/undo offsets are 8-aligned, as lfs_check_client_rec requires;
+ * a missing payload leaves its offset at the end and its length 0.
+ */
+static int txn_build_crec(uint16_t redo_op, uint16_t undo_op,
+			  uint32_t target_attr, uint16_t lcns,
+			  uint16_t record_off, uint16_t attr_off,
+			  uint16_t cluster_off, uint64_t target_vcn,
+			  const uint64_t *page_lcns, const void *redo,
+			  uint16_t redo_len, const void *undo, uint16_t undo_len,
+			  uint8_t **out, uint32_t *out_len)
+{
+	uint32_t hdr = NR_HEADER_SIZE + 8u * (lcns ? lcns : 1), o = hdr, i;
+	uint8_t *c;
+
+	if ((redo && !redo_len) || (undo && !undo_len))
+		return -EINVAL;
+	c = malloc(hdr + LF_ALIGN8(redo_len) + LF_ALIGN8(undo_len));
+	if (!c)
+		return -ENOMEM;
+	memset(c, 0, hdr);
+	lf_put16(c + NR_REDO_OP, redo_op);
+	lf_put16(c + NR_UNDO_OP, undo_op);
+	lf_put16(c + NR_TARGET_ATTRIBUTE, (uint16_t)target_attr);
+	lf_put16(c + NR_LCNS_TO_FOLLOW, lcns);
+	lf_put16(c + NR_RECORD_OFFSET, record_off);
+	lf_put16(c + NR_ATTRIBUTE_OFFSET, attr_off);
+	lf_put16(c + NR_CLUSTER_BLOCK_OFFSET, cluster_off);
+	lf_put64(c + NR_TARGET_VCN, target_vcn);
+	for (i = 0; i < lcns; i++)
+		lf_put64(c + NR_PAGE_LCNS + 8 * i, page_lcns[i]);
+	if (redo_len) {
+		lf_put16(c + NR_REDO_OFFSET, (uint16_t)o);
+		lf_put16(c + NR_REDO_LENGTH, redo_len);
+		memcpy(c + o, redo, redo_len);
+		o = LF_ALIGN8(o + redo_len);
+	} else {
+		lf_put16(c + NR_REDO_OFFSET, (uint16_t)o);
+	}
+	if (undo_len) {
+		lf_put16(c + NR_UNDO_OFFSET, (uint16_t)o);
+		lf_put16(c + NR_UNDO_LENGTH, undo_len);
+		memcpy(c + o, undo, undo_len);
+		o = LF_ALIGN8(o + undo_len);
+	} else {
+		lf_put16(c + NR_UNDO_OFFSET, (uint16_t)o);
+	}
+	*out = c;
+	*out_len = o;
+	return 0;
+}
+
+static int txn_stage(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len)
+{
+	size_t need = t->stage_len + 4 + len;
+
+	if (need > t->stage_cap) {
+		size_t cap = t->stage_cap ? t->stage_cap : 1024;
+		uint8_t *nb;
+
+		while (cap < need)
+			cap *= 2;
+		nb = realloc(t->stage, cap);
+		if (!nb)
+			return -ENOMEM;
+		t->stage = nb;
+		t->stage_cap = cap;
+	}
+	lf_put32(t->stage + t->stage_len, len);
+	memcpy(t->stage + t->stage_len + 4, rec, len);
+	t->stage_len = need;
+	t->nstaged++;
+	return 0;
+}
+
+/*
+ * Register the dirty page a record touches in the writer's dirty-page
+ * table, so the checkpoint's dump carries it (oldest_lsn = the first
+ * record that touched the page; page_lcns filled from the record).
+ * The entry covers one log page's worth of clusters
+ * (clst_per_page, the same value the reader uses); a record's vcn
+ * lands at slot (target_vcn - entry vcn).
+ */
+static int txn_dirty_page(ntfs_log_txn_t *t, uint32_t target_attr,
+			  uint64_t target_vcn, const uint64_t *page_lcns,
+			  uint16_t lcns)
+{
+	ntfs_log_writer_t *w = t->w;
+	uint32_t per_page = w->log->clst_per_page;
+	uint64_t vcn = target_vcn & ~((uint64_t)per_page - 1);
+	uint8_t *e = NULL;
+	uint16_t i;
+	int err;
+
+	if (!w->dptbl.buf) {
+		err = lfs_table_init(&w->dptbl,
+				     (uint16_t)(DP1_SIZE + 8 * per_page), 32);
+		if (err)
+			return err;
+	}
+	while ((e = lfs_table_next(&w->dptbl, e))) {
+		if (lf_get32(e + DP1_TARGET_ATTR) == target_attr &&
+		    lf_get64(e + DP1_VCN) == vcn)
+			break;
+	}
+	if (!e) {
+		e = lfs_table_alloc(&w->dptbl);
+		if (!e)
+			return -ENOMEM;
+		lf_put32(e + DP1_TARGET_ATTR, target_attr);
+		lf_put32(e + DP1_TRANSFER_LEN, per_page * w->log->geom.cluster_size);
+		lf_put32(e + DP1_LCNS_FOLLOW, per_page);
+		lf_put64(e + DP1_VCN, vcn);
+		/* oldest_lsn is set by the first record that lands here,
+		 * below, once its lsn is known (at commit); mark it with a
+		 * sentinel the commit pass recognises. */
+		lf_put64(e + DP1_OLDEST_LSN, 0);
+	}
+	for (i = 0; i < lcns; i++) {
+		uint64_t j = target_vcn - vcn + i;
+
+		if (j < per_page)
+			lf_put64(e + DP1_PAGE_LCNS + 8 * j, page_lcns[i]);
+	}
+	return 0;
+}
+
+int ntfs_log_txn_begin(ntfs_log_writer_t *w, ntfs_log_txn_t **out)
+{
+	ntfs_log_txn_t *t;
+	uint8_t *e;
+	int err;
+
+	*out = NULL;
+	if (!w || w->failed || w->closed)
+		return w ? -EIO : -EINVAL;
+	if (!w->trtbl.buf) {
+		err = lfs_table_init(&w->trtbl, TR_SIZE, 8);
+		if (err)
+			return err;
+	}
+	t = calloc(1, sizeof(*t));
+	if (!t)
+		return -ENOMEM;
+	e = lfs_table_alloc(&w->trtbl);
+	if (!e) {
+		free(t);
+		return -ENOMEM;
+	}
+	t->w = w;
+	t->tid = lfs_table_off(&w->trtbl, e);
+	e[TR_STATE] = TRANSACTION_ACTIVE;
+	*out = t;
+	return 0;
+}
+
+static void txn_free(ntfs_log_txn_t *t)
+{
+	free(t->stage);
+	free(t);
+}
+
+/* Stage one record and register its dirty page. */
+static int txn_add(ntfs_log_txn_t *t, uint16_t redo_op, uint16_t undo_op,
+		   uint32_t target_attr, uint16_t lcns, uint16_t record_off,
+		   uint16_t attr_off, uint16_t cluster_off, uint64_t target_vcn,
+		   const uint64_t *page_lcns, const void *redo, uint16_t redo_len,
+		   const void *undo, uint16_t undo_len)
+{
+	uint8_t *c;
+	uint32_t n;
+	int err;
+
+	if (!t || t->done)
+		return -EINVAL;
+	err = txn_build_crec(redo_op, undo_op, target_attr, lcns, record_off,
+			     attr_off, cluster_off, target_vcn, page_lcns,
+			     redo, redo_len, undo, undo_len, &c, &n);
+	if (err)
+		return err;
+	err = txn_stage(t, c, n);
+	free(c);
+	if (err)
+		return err;
+	err = txn_dirty_page(t, target_attr, target_vcn, page_lcns, lcns);
+	if (err)
+		return err;
+	if (undo_len) {
+		t->undo_records++;
+		t->undo_bytes += undo_len;
+	}
+	return 0;
+}
+
+int ntfs_log_txn_init_record(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, const void *rec, uint32_t rec_len)
+{
+	if (!rec || !rec_len || rec_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_InitializeFileRecordSegment,
+		       LOP_DeallocateFileRecordSegment, mft_attr, 1, 0, 0,
+		       cluster_off, target_vcn, &page_lcn, rec,
+		       (uint16_t)rec_len, NULL, 0);
+}
+
+int ntfs_log_txn_create_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, uint16_t record_off,
+			     const void *attr, uint32_t attr_len)
+{
+	if (!attr || !attr_len || attr_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_CreateAttribute, LOP_DeleteAttribute, mft_attr,
+		       1, record_off, 0, cluster_off, target_vcn, &page_lcn,
+		       attr, (uint16_t)attr_len, NULL, 0);
+}
+
+int ntfs_log_txn_add_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				uint64_t target_vcn, uint16_t cluster_off,
+				uint64_t page_lcn, uint16_t record_off,
+				uint16_t attr_off, const void *entry,
+				uint32_t entry_len)
+{
+	if (!entry || !entry_len || entry_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_AddIndexEntryRoot, LOP_DeleteIndexEntryRoot,
+		       mft_attr, 1, record_off, attr_off, cluster_off,
+		       target_vcn, &page_lcn, entry, (uint16_t)entry_len,
+		       NULL, 0);
+}
+
+int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
+				 uint64_t target_vcn, uint16_t cluster_off,
+				 uint64_t page_lcn, uint16_t record_off,
+				 uint16_t attr_off, const void *new_val,
+				 uint16_t new_len, const void *old_val,
+				 uint16_t old_len)
+{
+	if (!new_val || !new_len || !old_val || !old_len)
+		return -EINVAL;
+	return txn_add(t, LOP_UpdateResidentValue, LOP_UpdateResidentValue,
+		       mft_attr, 1, record_off, attr_off, cluster_off,
+		       target_vcn, &page_lcn, new_val, new_len, old_val,
+		       old_len);
+}
+
+int ntfs_log_txn_set_bitmap(ntfs_log_txn_t *t, uint32_t bitmap_attr,
+			    uint64_t target_vcn, uint16_t cluster_off,
+			    uint64_t page_lcn, uint32_t bit, uint32_t nbits,
+			    bool set)
+{
+	uint8_t br[BR_SIZE];
+
+	lf_put32(br + BR_BITMAP_OFF, bit);
+	lf_put32(br + BR_BITS, nbits);
+	return txn_add(t,
+		       set ? LOP_SetBitsInNonresidentBitMap : LOP_ClearBitsInNonresidentBitMap,
+		       set ? LOP_ClearBitsInNonresidentBitMap : LOP_SetBitsInNonresidentBitMap,
+		       bitmap_attr, 1, 0, 0, cluster_off, target_vcn,
+		       &page_lcn, br, BR_SIZE, br, BR_SIZE);
+}
+
+/* Append one staged record; update the transaction-table entry. */
+static int txn_append_one(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len,
+			  uint64_t *lsn_out)
+{
+	ntfs_log_writer_t *w = t->w;
+	uint8_t *e;
+	uint64_t lsn;
+	int err;
+
+	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, t->tid,
+				     t->last_lsn, rec, len, &lsn);
+	if (err)
+		return err;
+	e = w->trtbl.buf + t->tid;
+	lf_put64(e + TR_PREV_LSN, lsn);
+	lf_put64(e + TR_UNDO_NEXT_LSN, lsn);
+	if (!t->first_lsn)
+		t->first_lsn = lsn;
+	t->last_lsn = lsn;
+	lf_put64(e + TR_FIRST_LSN, t->first_lsn);
+	lf_put32(e + TR_UNDO_RECORDS, t->undo_records);
+	lf_put32(e + TR_UNDO_BYTES, t->undo_bytes);
+	/* The dirty-page entry this record touched takes its oldest LSN
+	 * from it when it has none yet (sentinel 0 from txn_dirty_page).
+	 * Only this record's page: stamping every unset entry with the
+	 * first record's LSN would move a later record's page earlier
+	 * than the record that first touched it. */
+	{
+		uint32_t ta = lf_get16(rec + NR_TARGET_ATTRIBUTE);
+		uint64_t tvcn = lf_get64(rec + NR_TARGET_VCN);
+		uint32_t per_page = w->log->clst_per_page;
+		uint64_t vcn = tvcn & ~((uint64_t)per_page - 1);
+		uint8_t *dp = NULL;
+
+		while ((dp = lfs_table_next(&w->dptbl, dp))) {
+			if (lf_get32(dp + DP1_TARGET_ATTR) == ta &&
+			    lf_get64(dp + DP1_VCN) == vcn &&
+			    !lf_get64(dp + DP1_OLDEST_LSN))
+				lf_put64(dp + DP1_OLDEST_LSN, lsn);
+		}
+	}
+	if (lsn_out)
+		*lsn_out = lsn;
+	return 0;
+}
+
+int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
+			uint64_t *last_lsn_out)
+{
+	ntfs_log_writer_t *w;
+	uint8_t *e;
+	size_t pos = 0;
+	uint32_t appended = 0;
+	uint64_t clsn = 0;
+	int err = 0;
+
+	if (!t || t->done)
+		return -EINVAL;
+	w = t->w;
+	t->done = true;
+	if (!t->nstaged) {
+		/* Nothing was ever staged: free the empty entry. */
+		lfs_table_free_idx(&w->trtbl, t->tid);
+		if (first_lsn_out)
+			*first_lsn_out = 0;
+		if (last_lsn_out)
+			*last_lsn_out = 0;
+		txn_free(t);
+		return 0;
+	}
+	while (pos < t->stage_len) {
+		uint32_t len = lf_get32(t->stage + pos);
+		uint64_t lsn;
+
+		err = txn_append_one(t, t->stage + pos + 4, len, &lsn);
+		if (err)
+			break;
+		appended++;
+		pos += 4 + len;
+	}
+	if (!err) {
+		/* Commit point: the single CommitTransaction record. Its
+		 * undo_next points at the last data record, so an undo pass
+		 * that somehow reaches it starts at the right place. */
+		uint32_t n;
+		uint8_t *ce;
+
+		err = txn_build_crec(LOP_CommitTransaction, LOP_Noop, 0, 0,
+				     0, 0, 0, 0, NULL, NULL, 0, NULL, 0,
+				     &ce, &n);
+		if (!err) {
+			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
+						     t->tid, t->last_lsn, ce,
+						     n, &clsn);
+			free(ce);
+		}
+	}
+	if (!err) {
+		e = w->trtbl.buf + t->tid;
+		e[TR_STATE] = TRANSACTION_COMMITTED;
+		lf_put64(e + TR_PREV_LSN, clsn);
+		lf_put64(e + TR_UNDO_NEXT_LSN, t->last_lsn);
+		/* The checkpoint is what makes the records replayable (see
+		 * the header comment): it dumps the transaction state and
+		 * the dirty pages, and replay walks from it. Phase 4 may
+		 * relax this to a periodic checkpoint once the log has one;
+		 * for Phase 2 every commit carries its own, because a
+		 * committed-but-uncheckpointed transaction is invisible to
+		 * replay. */
+		err = ntfs_log_writer_checkpoint(w, NULL);
+	}
+	if (!err) {
+		/* Forget: the entry is freed for future checkpoints. The
+		 * record is walked after the checkpoint, so analysis frees
+		 * its own copy too. */
+		uint32_t n;
+		uint8_t *ce;
+
+		err = txn_build_crec(LOP_ForgetTransaction, LOP_Noop, 0, 0,
+				     0, 0, 0, 0, NULL, NULL, 0, NULL, 0,
+				     &ce, &n);
+		if (!err) {
+			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
+						     t->tid, t->last_lsn, ce,
+						     n, NULL);
+			free(ce);
+		}
+		if (!err)
+			lfs_table_free_idx(&w->trtbl, t->tid);
+	}
+	if (err && !appended)
+		lfs_table_free_idx(&w->trtbl, t->tid);
+	/* On failure with records appended, the transaction stays ACTIVE
+	 * in the writer's table: its records are on the log and the next
+	 * replay rolls them back. The handle is freed either way. */
+	if (first_lsn_out)
+		*first_lsn_out = t->first_lsn;
+	if (last_lsn_out)
+		*last_lsn_out = clsn ? clsn : t->last_lsn;
+	txn_free(t);
+	return err;
+}
+
+int ntfs_log_txn_abort(ntfs_log_txn_t *t)
+{
+	ntfs_log_writer_t *w;
+
+	if (!t || t->done)
+		return -EINVAL;
+	w = t->w;
+	t->done = true;
+	/* Nothing was ever appended: staging was in memory only. */
+	lfs_table_free_idx(&w->trtbl, t->tid);
+	txn_free(t);
 	return 0;
 }

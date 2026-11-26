@@ -393,15 +393,39 @@ static int mem_write(void *ctx, uint64_t off, const void *buf, size_t len)
 	return 0;
 }
 
-static ntfs_logfile_t *open_log(struct memio *m, struct ntfs_log_io *io)
+/* Fault-injecting wrapper around a memio: once the budget is set (>= 0),
+ * each write consumes one unit and the write at budget 0 fails with -EIO,
+ * as if the device died mid-commit. Budget -1 means unlimited. */
+struct fault_memio {
+	struct memio *m;
+	int limit;
+	int writes;
+};
+
+static int fault_mem_read(void *ctx, uint64_t off, void *buf, size_t len)
+{
+	struct fault_memio *f = ctx;
+	return mem_read(f->m, off, buf, len);
+}
+
+static int fault_mem_write(void *ctx, uint64_t off, const void *buf, size_t len)
+{
+	struct fault_memio *f = ctx;
+	if (f->limit == 0)
+		return -EIO;
+	if (f->limit > 0)
+		f->limit--;
+	f->writes++;
+	return mem_write(f->m, off, buf, len);
+}
+
+/* Open @io as already configured (used when the io carries fault
+ * injection; open_log resets it to the plain memio). */
+static ntfs_logfile_t *open_log_keep_io(struct ntfs_log_io *io)
 {
 	struct ntfs_log_geometry g = { 4096, 1024, 512 };
 	ntfs_logfile_t *log = NULL;
-	memset(io, 0, sizeof(*io));
-	io->ctx = m;
-	io->size = m->size;
-	io->read = mem_read;
-	io->write = mem_write;
+
 	CHECK_EQ(ntfs_logfile_open(io, &g, &log), 0);
 	if (log) {
 		struct ntfs_logfile_info info;
@@ -411,6 +435,16 @@ static ntfs_logfile_t *open_log(struct memio *m, struct ntfs_log_io *io)
 			fprintf(stderr, "    open: state %d: %s\n", info.state, ntfs_logfile_last_error(log));
 	}
 	return log;
+}
+
+static ntfs_logfile_t *open_log(struct memio *m, struct ntfs_log_io *io)
+{
+	memset(io, 0, sizeof(*io));
+	io->ctx = m;
+	io->size = m->size;
+	io->read = mem_read;
+	io->write = mem_write;
+	return open_log_keep_io(io);
 }
 
 /* ---- Fake volume -------------------------------------------------------- */
@@ -424,6 +458,10 @@ static ntfs_logfile_t *open_log(struct memio *m, struct ntfs_log_io *io)
  * state finding 19 was about: a cluster allocated but never written, into which
  * a redo record lays down the first INDX header this volume has ever seen. */
 #define INDEX_LCN  44u
+#define MFTBMP_LCN 41u			/* $MFT:$BITMAP lives on its own cluster */
+#define DIR_REC 32u			/* parent directory for the create tests */
+#define NEW_REC 40u			/* record created by the first create txn */
+#define NEW_REC2 41u			/* record created by the second create txn */
 #define VOL_CLUSTERS 64u
 
 struct vol {
@@ -505,7 +543,11 @@ static void build_record(uint8_t *rec, uint64_t no, uint16_t flags, void (*fill)
 	lf_put16(rec + MR_NEXT_ATTR_ID, 4);
 }
 
-static void fill_mft(uint8_t *rec, uint32_t *off) { put_nonres_attr(rec, off, ATTR_TYPE_DATA, MFT_LCN, MFT_CLUSTERS, 1); }
+static void fill_mft(uint8_t *rec, uint32_t *off)
+{
+	put_nonres_attr(rec, off, ATTR_TYPE_DATA, MFT_LCN, MFT_CLUSTERS, 1);
+	put_nonres_attr(rec, off, ATTR_TYPE_BITMAP, MFTBMP_LCN, 1, 2);
+}
 static void fill_bitmap(uint8_t *rec, uint32_t *off) { put_nonres_attr(rec, off, ATTR_TYPE_DATA, BITMAP_LCN, 1, 1); }
 static void fill_index(uint8_t *rec, uint32_t *off)
 {
@@ -516,6 +558,35 @@ static void fill_plain(uint8_t *rec, uint32_t *off)
 {
 	static const uint8_t si[0x30] = { 1, 2, 3 };
 	put_res_attr(rec, off, ATTR_TYPE_STANDARD_INFORMATION, si, sizeof(si), 1);
+}
+
+/* Directory record 32: $STANDARD_INFORMATION with a distinct byte pattern
+ * (value[i] = 0x10 + i, so the parent-mtime undo has a real old value) and
+ * an empty $INDEX_ROOT $I30: root header (type $FILE_NAME, collation
+ * FILE_NAME, 4096-byte blocks), index header (entries at 16, length 32),
+ * one END entry. */
+static void fill_dir(uint8_t *rec, uint32_t *off)
+{
+	uint8_t si[0x30];
+	uint8_t ir[48];
+	int i;
+
+	for (i = 0; i < 0x30; i++)
+		si[i] = (uint8_t)(0x10 + i);
+	put_res_attr(rec, off, ATTR_TYPE_STANDARD_INFORMATION, si, sizeof(si), 0);
+	memset(ir, 0, sizeof(ir));
+	lf_put32(ir + 0, ATTR_TYPE_FILE_NAME);	/* index root: attribute type */
+	lf_put32(ir + 4, 1);			/* collation rule FILE_NAME */
+	lf_put32(ir + 8, 4096);			/* index block size */
+	lf_put32(ir + 12, 1);			/* clusters per index block */
+	lf_put32(ir + 16, 16);			/* index header: entries offset */
+	lf_put32(ir + 20, 32);			/* index length */
+	lf_put32(ir + 24, 32);			/* index allocated size */
+	lf_put32(ir + 28, 0);			/* flags */
+	lf_put16(ir + 32, 16);			/* END entry: length */
+	lf_put16(ir + 34, 0);			/* key length */
+	lf_put16(ir + 36, 2);			/* flags: INDEX_ENTRY_END */
+	put_res_attr(rec, off, ATTR_TYPE_INDEX_ROOT, ir, sizeof(ir), 1);
 }
 
 static void vol_put_record(struct vol *v, uint64_t no, const uint8_t *deprot)
@@ -539,6 +610,9 @@ static void vol_init(struct vol *v)
 	vol_put_record(v, 30, rec);
 	build_record(rec, 31, MFT_RECORD_IN_USE, fill_index);
 	vol_put_record(v, 31, rec);
+	build_record(rec, DIR_REC, MFT_RECORD_IN_USE | MFT_RECORD_IS_DIRECTORY,
+		     fill_dir);
+	vol_put_record(v, DIR_REC, rec);
 }
 
 static int v_read_mft(void *ctx, uint64_t no, void *buf)
@@ -2722,6 +2796,651 @@ static void test_writer_torn_tail(void)
 	free(buf);
 }
 
+/* ---- Journal create-transaction tests (§1.2 Phase 2) -------------------- */
+
+/* $FILE_NAME value: parent ref, 4 timestamps, sizes, flags, ea size,
+ * name length, name type, UTF-16LE name. */
+static uint32_t build_fn_value(uint8_t *out, uint64_t parent, const char *name)
+{
+	size_t nlen = strlen(name);
+	uint32_t vlen = 66 + (uint32_t)nlen * 2;
+	size_t i;
+
+	memset(out, 0, vlen);
+	lf_put64(out + 0, parent);
+	lf_put32(out + 56, 0x20);		/* flags: ARCHIVE */
+	out[64] = (uint8_t)nlen;
+	out[65] = 1;				/* WIN32 name type */
+	for (i = 0; i < nlen; i++) {
+		out[66 + i * 2] = (uint8_t)name[i];
+		out[67 + i * 2] = 0;
+	}
+	return vlen;
+}
+
+/* Index entry: 16-byte header + $FILE_NAME key, 8-aligned. */
+static uint32_t build_index_entry(uint8_t *out, uint64_t mref, const uint8_t *fn,
+				  uint32_t fn_len)
+{
+	uint32_t total = LF_ALIGN8(16 + fn_len);
+
+	memset(out, 0, total);
+	lf_put64(out + 0, mref);
+	lf_put16(out + 8, (uint16_t)total);
+	lf_put16(out + 10, (uint16_t)fn_len);
+	lf_put16(out + 12, 0);			/* flags */
+	memcpy(out + 16, fn, fn_len);
+	return total;
+}
+
+static void fill_init_si(uint8_t *rec, uint32_t *off)
+{
+	uint8_t si[0x30];
+	int i;
+
+	for (i = 0; i < 0x30; i++)
+		si[i] = (uint8_t)(0x40 + i);
+	put_res_attr(rec, off, ATTR_TYPE_STANDARD_INFORMATION, si, sizeof(si), 0);
+}
+
+/* A fresh record header + $STANDARD_INFORMATION, link count 0, next
+ * attribute id 1: what InitializeFileRecordSegment redoes. */
+static uint32_t build_init_record(uint8_t *rec, uint64_t no)
+{
+	/* IN_USE from the start: the record is in use the moment it is
+	 * initialized (the $MFT:$BITMAP bit mirrors it, and the undo —
+	 * Deallocate — clears it). A flags-0 image would fail the replay's
+	 * check_file_record on the very next record of the transaction. */
+	build_record(rec, no, MFT_RECORD_IN_USE, fill_init_si);
+	lf_put16(rec + MR_LINK_COUNT, 0);
+	lf_put16(rec + MR_NEXT_ATTR_ID, 1);
+	return lf_get32(rec + MR_BYTES_IN_USE);
+}
+
+/* Stage the seven records of a regular-file create into @t:
+ * Initialize (link 0), Create $SECURITY_DESCRIPTOR, Create $DATA (empty),
+ * Create $FILE_NAME (indexed), AddIndexEntryRoot into the parent, update the
+ * parent's $STANDARD_INFORMATION mtime fields, SetBits in $MFT:$BITMAP.
+ * @init_vcn_override is (uint64_t)-1 for the correct vcn, or a wrong one
+ * (negative control: replay must refuse the log). Returns the first error. */
+static int stage_create(ntfs_log_txn_t *t, uint32_t mft_attr, uint32_t bmp_attr,
+			uint64_t recno, const char *name, uint64_t parent,
+			uint64_t init_vcn_override)
+{
+	uint8_t init_rec[VRS], sd_attr[64], data_attr[32], fn_attr[256];
+	uint8_t fn_val[128], entry[256], new_si[24], old_si[24];
+	uint32_t init_len, sd_len, data_len, fn_len, fn_vlen, entry_len;
+	uint32_t sd_off, data_off, fn_off;
+	uint64_t vcn = recno * VRS / VCS;
+	uint32_t cluster_off = (uint32_t)((recno * VRS % VCS) / 512);
+	uint64_t page_lcn = MFT_LCN + vcn;
+	uint64_t init_vcn = init_vcn_override == (uint64_t)-1 ? vcn :
+			    init_vcn_override;
+	uint64_t pvcn = DIR_REC * VRS / VCS;	/* 8 */
+	uint64_t ppage_lcn = MFT_LCN + pvcn;	/* 24 */
+	uint16_t dir_ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+	uint16_t dir_si_off = 0x38;
+	static const uint8_t sd_val[16] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+	};
+	static const uint8_t empty_val[1] = { 0 };
+	int i, err;
+
+	init_len = build_init_record(init_rec, recno);
+	{
+		uint32_t off = 0;
+		put_res_attr(sd_attr, &off, ATTR_TYPE_SECURITY_DESCRIPTOR,
+			     sd_val, sizeof(sd_val), 1);
+		sd_len = off;
+		off = 0;
+		put_res_attr(data_attr, &off, ATTR_TYPE_DATA, empty_val, 0, 2);
+		data_len = off;
+	}
+	fn_vlen = build_fn_value(fn_val, parent, name);
+	{
+		uint32_t off = 0;
+		put_res_attr(fn_attr, &off, ATTR_TYPE_FILE_NAME, fn_val, fn_vlen, 3);
+		fn_attr[AT_RES_FLAGS] |= ATTR_RES_FLAG_INDEXED;
+		fn_len = off;
+	}
+	entry_len = build_index_entry(entry, recno | (1ULL << 48), fn_val, fn_vlen);
+	for (i = 0; i < 24; i++) {
+		new_si[i] = 0x77;
+		old_si[i] = (uint8_t)(0x10 + 8 + i);	/* parent $SI value[8..32) */
+	}
+	/* A CreateAttribute inserts at the END marker, not after it:
+	 * the first attribute goes at init_len - 8. */
+	sd_off = init_len - 8;
+	data_off = sd_off + sd_len;
+	fn_off = data_off + data_len;
+
+	err = ntfs_log_txn_init_record(t, mft_attr, init_vcn, cluster_off,
+				       page_lcn, init_rec, init_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_create_attr(t, mft_attr, vcn, cluster_off,
+				       page_lcn, sd_off, sd_attr, sd_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_create_attr(t, mft_attr, vcn, cluster_off,
+				       page_lcn, data_off, data_attr, data_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_create_attr(t, mft_attr, vcn, cluster_off,
+				       page_lcn, fn_off, fn_attr, fn_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_add_index_root(t, mft_attr, pvcn, 0, ppage_lcn,
+					  dir_ir_off, 56, entry, entry_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_update_resident(t, mft_attr, pvcn, 0, ppage_lcn,
+					   dir_si_off, AT_RESIDENT_SIZE + 8,
+					   new_si, sizeof(new_si), old_si,
+					   sizeof(old_si));
+	if (err)
+		return err;
+	return ntfs_log_txn_set_bitmap(t, bmp_attr, 0, 0, MFTBMP_LCN,
+				       (uint32_t)recno, 1, true);
+}
+
+/* Walk collector: keeps (lsn, redo_op, target_attr, target_vcn, record_off)
+ * per client record. */
+struct rec_seen {
+	uint64_t lsn[64];
+	uint16_t redo_op[64];
+	uint32_t target_attr[64];
+	uint64_t target_vcn[64];
+	uint16_t record_off[64];
+	int n;
+};
+
+static int collect_rec(const struct ntfs_log_record *r, void *ctx)
+{
+	struct rec_seen *s = ctx;
+
+	if (r->record_type != LFS_RECORD_TYPE_CLIENT || s->n >= 64)
+		return 0;
+	s->lsn[s->n] = r->lsn;
+	s->redo_op[s->n] = r->redo_op;
+	s->target_attr[s->n] = r->target_attr;
+	s->target_vcn[s->n] = r->target_vcn;
+	s->record_off[s->n] = r->record_off;
+	s->n++;
+	return 0;
+}
+
+/* Set up a fresh formatted log with a writer and the two open attributes
+ * the create transaction needs ($MFT:$DATA at 0x18, $MFT:$BITMAP at 0x40).
+ * The caller owns @log/@w; @io is filled in. */
+static int journal_setup(struct memio *m, struct ntfs_log_io *io,
+			 ntfs_logfile_t **log, ntfs_log_writer_t **w)
+{
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	int err;
+
+	memset(m->buf, 0xff, LSIZE);
+	m->size = LSIZE;
+	m->writes = 0;
+	memset(io, 0, sizeof(*io));
+	io->ctx = m;
+	io->size = LSIZE;
+	io->read = mem_read;
+	io->write = mem_write;
+	err = ntfs_log_writer_format(io, &g, LSIZE);
+	if (err)
+		return err;
+	*log = open_log(m, io);
+	if (!*log)
+		return -EIO;
+	err = ntfs_log_writer_open(*log, w);
+	if (err)
+		return err;
+	err = ntfs_log_writer_open_attr(*w, ATTR_TYPE_DATA, 0, 0, NULL, 0, NULL);
+	if (err)
+		return err;
+	return ntfs_log_writer_open_attr(*w, ATTR_TYPE_BITMAP, 0, 0, NULL, 0,
+					 NULL);
+}
+
+/* The full create transaction, committed and replayed: the log carries the
+ * seven records plus Commit, checkpoint and Forget; replay redoes exactly
+ * those seven, the new record is byte-exact (including the MR_LSN the
+ * replay stamps from the last touching record), the parent gains the index
+ * entry and the new mtime, bit 40 of $MFT:$BITMAP is set, and a second
+ * replay redoes nothing. */
+static void test_journal_create_commit(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct rec_seen s;
+	uint64_t first_lsn, lsn_fn = 0, lsn_upd = 0;
+	uint8_t expect40[VRS], expect32[VRS];
+	uint8_t got[VRS];
+	int i, err;
+
+	printf("test_journal_create_commit\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Walk the log from the first record: 7 data + Commit + 3 table
+	 * dumps + Forget (the restart record is CLIENT_RESTART, which the
+	 * collector skips). */
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
+	CHECK_EQ(s.n, 12);
+	if (s.n == 12) {
+		static const uint16_t want_op[7] = {
+			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
+			LOP_SetBitsInNonresidentBitMap,
+		};
+		for (i = 0; i < 7; i++) {
+			CHECK_EQ(s.redo_op[i], want_op[i]);
+			CHECK_EQ(s.target_attr[i], i < 6 ? 0x18u : 0x40u);
+		}
+		CHECK_EQ(s.redo_op[7], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[8], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[11], LOP_ForgetTransaction);
+		for (i = 0; i < s.n; i++) {
+			if (s.redo_op[i] == LOP_CreateAttribute &&
+			    s.target_vcn[i] == NEW_REC * VRS / VCS &&
+			    s.record_off[i] == 192)
+				lsn_fn = s.lsn[i];
+			if (s.redo_op[i] == LOP_UpdateResidentValue)
+				lsn_upd = s.lsn[i];
+		}
+		CHECK(lsn_fn != 0);
+		CHECK(lsn_upd != 0);
+	}
+	ntfs_logfile_close(log);
+
+	/* Dry run: exactly the 7 records redo, 1 transaction committed. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	CHECK_EQ(res.records_redone, 7);
+	/* The transaction was committed and then forgotten, so no COMMITTED
+	 * entry survives the walk; the count is of entries still in the
+	 * table, not of transactions that ever committed. The 7 records
+	 * still redo because the dirty-page table references them. */
+	CHECK_EQ(res.transactions_committed, 0);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK_EQ(res.plan_len, 7);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Real run: 2 MFT records + 1 bitmap cluster written. */
+	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 7);
+	CHECK_EQ(res.mft_records_written, 2);
+	CHECK_EQ(res.clusters_written, 1);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Record 40 byte-exact: init + $SD + $DATA + $FILE_NAME (indexed),
+	 * link 1, next attr id 4, MR_LSN from the $FILE_NAME create. */
+	{
+		uint8_t fn_val[128], fn_attr[256];
+		uint32_t fn_vlen, off = 0;
+		static const uint8_t sd_val[16] = {
+			0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+			0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		};
+		static const uint8_t empty_val[1] = { 0 };
+
+		build_record(expect40, NEW_REC, MFT_RECORD_IN_USE, fill_init_si);
+		lf_put16(expect40 + MR_LINK_COUNT, 1);
+		lf_put16(expect40 + MR_NEXT_ATTR_ID, 4);
+		off = lf_get32(expect40 + MR_BYTES_IN_USE) - 8;
+		put_res_attr(expect40, &off, ATTR_TYPE_SECURITY_DESCRIPTOR,
+			     sd_val, sizeof(sd_val), 1);
+		put_res_attr(expect40, &off, ATTR_TYPE_DATA, empty_val, 0, 2);
+		fn_vlen = build_fn_value(fn_val, DIR_REC, "t.txt");
+		put_res_attr(expect40, &off, ATTR_TYPE_FILE_NAME, fn_val, fn_vlen, 3);
+		expect40[off - LF_ALIGN8(AT_RESIDENT_SIZE + fn_vlen) + AT_RES_FLAGS] |=
+			ATTR_RES_FLAG_INDEXED;
+		lf_put32(expect40 + off, ATTR_TYPE_END);
+		off += 8;
+		lf_put32(expect40 + MR_BYTES_IN_USE, off);
+		lf_put64(expect40 + MR_LSN, lsn_fn);
+	}
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	/* Compare deprotected, with the fixup USN normalised: the USN is
+	 * a write counter, not content, and the replayed record went
+	 * through a different number of protect cycles than a freshly
+	 * built one. */
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	lf_put16(got + MR_FIXUP_OFFSET_3, 0x0001);
+	CHECK(memcmp(got, expect40, VRS) == 0);
+
+	/* Record 32 byte-exact: the "t.txt" entry inserted before the END
+	 * entry, $SI value[8..32) replaced with 0x77, MR_LSN from the
+	 * mtime update. */
+	{
+		uint8_t fn_val[128], entry[256];
+		uint32_t fn_vlen, entry_len, used;
+		uint16_t ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+
+		build_record(expect32, DIR_REC,
+			     MFT_RECORD_IN_USE | MFT_RECORD_IS_DIRECTORY, fill_dir);
+		used = lf_get32(expect32 + MR_BYTES_IN_USE);
+		fn_vlen = build_fn_value(fn_val, DIR_REC, "t.txt");
+		entry_len = build_index_entry(entry, NEW_REC | (1ULL << 48),
+					      fn_val, fn_vlen);
+		/* Insert the entry at attr offset 56 (over the END entry),
+		 * move the END entry after it, grow the record. */
+		memmove(expect32 + ir_off + 56 + entry_len,
+			expect32 + ir_off + 56, used - (ir_off + 56));
+		memcpy(expect32 + ir_off + 56, entry, entry_len);
+		used += entry_len;
+		lf_put32(expect32 + MR_BYTES_IN_USE, used);
+		/* The $INDEX_ROOT attr grows by the entry: length, value
+		 * length, index length and index allocated size all grow. */
+		lf_put32(expect32 + ir_off + AT_LENGTH,
+			 lf_get32(expect32 + ir_off + AT_LENGTH) + entry_len);
+		lf_put32(expect32 + ir_off + AT_VALUE_LENGTH,
+			 lf_get32(expect32 + ir_off + AT_VALUE_LENGTH) + entry_len);
+		lf_put32(expect32 + ir_off + AT_RESIDENT_SIZE + 16 + 4,
+			 lf_get32(expect32 + ir_off + AT_RESIDENT_SIZE + 16 + 4) +
+			 entry_len);
+		lf_put32(expect32 + ir_off + AT_RESIDENT_SIZE + 16 + 8,
+			 lf_get32(expect32 + ir_off + AT_RESIDENT_SIZE + 16 + 8) +
+			 entry_len);
+		/* $SI mtime fields: value[8..32) = 0x77. */
+		memset(expect32 + 0x38 + AT_RESIDENT_SIZE + 8, 0x77, 24);
+		lf_put64(expect32 + MR_LSN, lsn_upd);
+	}
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	lf_put16(got + MR_FIXUP_OFFSET_3, 0x0001);
+	CHECK(memcmp(got, expect32, VRS) == 0);
+
+	/* Bitmap cluster: bit 40 set, nothing else. */
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x01);
+	for (i = 0; i < (int)VCS; i++) {
+		if (i == 5)
+			continue;
+		CHECK_EQ(v.disk[MFTBMP_LCN * VCS + i], 0);
+	}
+
+	/* Second replay: the MFT ops are skipped (the records already carry
+	 * a later MR_LSN), but the SetBits op re-applies — clusters carry
+	 * no LSN to skip on, and setting an already-set bit is a no-op in
+	 * effect. The volume is unchanged by it. */
+	err = ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res);
+	CHECK_EQ(err, 0);
+	CHECK_EQ(res.records_redone, 1);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 1);
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	lf_put16(got + MR_FIXUP_OFFSET_3, 0x0001);
+	CHECK(memcmp(got, expect40, VRS) == 0);
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x01);
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
+/* Abort writes nothing: the volume is byte-identical and replay sees no
+ * transaction at all. */
+static void test_journal_create_abort(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v, v2;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+
+	printf("test_journal_create_abort\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_abort(t), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_init(&v2);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.records_analyzed, 0);
+	CHECK_EQ(res.records_redone, 0);
+	CHECK_EQ(res.transactions_committed, 0);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(!res.needs_chkdsk);
+	CHECK(memcmp(v.disk, v2.disk, VOL_CLUSTERS * VCS) == 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(v2.disk);
+	free(buf);
+}
+
+/* A commit that dies mid-append (the device fails writes) leaves an ACTIVE
+ * transaction, and replay undoes it: the second file never appears, bit 41
+ * stays clear, the first file survives. The fault budget allows exactly the
+ * first record's append (tail copy + page rewrite); the non-vacuity guard
+ * is records_undone >= 1 — if no record had landed there would be nothing
+ * to undo. */
+/* Build the two-transaction log with the second commit faulted after
+ * @budget writes. Returns the commit error; *@landed receives the number
+ * of second-transaction records durable on the log (everything after the
+ * Forget record in the walk from the checkpoint). */
+static int build_uncommitted_log(uint8_t *buf, int budget, int *landed)
+{
+	struct memio m;
+	struct fault_memio f;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	struct rec_seen s;
+	int err, i, nforget = -1;
+
+	*landed = 0;
+	m.buf = buf;
+	memset(buf, 0xff, LSIZE);
+	m.size = LSIZE;
+	m.writes = 0;
+	f.m = &m;
+	f.limit = -1;
+	f.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &f;
+	io.size = LSIZE;
+	io.read = fault_mem_read;
+	io.write = fault_mem_write;
+	err = ntfs_log_writer_format(&io, &g, LSIZE);
+	if (err)
+		return err;
+	log = open_log_keep_io(&io);
+	err = ntfs_log_writer_open(log, &w);
+	if (err)
+		return err;
+	err = ntfs_log_writer_open_attr(w, ATTR_TYPE_DATA, 0, 0, NULL, 0, NULL);
+	if (err)
+		return err;
+	err = ntfs_log_writer_open_attr(w, ATTR_TYPE_BITMAP, 0, 0, NULL, 0, NULL);
+	if (err)
+		return err;
+	/* First transaction commits cleanly: the log now has a checkpoint,
+	 * so the faulted second transaction is inside replay's window. */
+	err = ntfs_log_txn_begin(w, &t);
+	if (err)
+		return err;
+	err = stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			   (uint64_t)-1);
+	if (err)
+		return err;
+	err = ntfs_log_txn_commit(t, NULL, NULL);
+	if (err)
+		return err;
+	err = ntfs_log_txn_begin(w, &t);
+	if (err)
+		return err;
+	err = stage_create(t, 0x18, 0x40, NEW_REC2, "u.txt", DIR_REC,
+			   (uint64_t)-1);
+	if (err)
+		return err;
+	f.limit = budget;
+	err = ntfs_log_txn_commit(t, NULL, NULL);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+	if (err != -EIO)
+		return err;
+	/* Count the second transaction's durable records. */
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m;
+	io.size = LSIZE;
+	io.read = mem_read;
+	io.write = mem_write;
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	if (ntfs_logfile_walk(log, 0, collect_rec, &s) != 0) {
+		ntfs_logfile_close(log);
+		return -EIO;
+	}
+	ntfs_logfile_close(log);
+	for (i = 0; i < s.n; i++) {
+		if (s.redo_op[i] == LOP_ForgetTransaction)
+			nforget = i;
+	}
+	*landed = nforget < 0 ? 0 : s.n - nforget - 1;
+	return -EIO;
+}
+
+/* A commit that dies mid-append leaves an ACTIVE transaction, and replay
+ * undoes it: the second file never appears, bit 41 stays clear, the first
+ * file survives. The fault budget is found adaptively: how many writes one
+ * append costs depends on tail copies and page spanning, so budgets are
+ * tried in order until one leaves at least one second-transaction record
+ * durable (a torn spanning record leaves nothing to undo, which is also
+ * correct — but it would make this test vacuous, so the loop skips it). */
+static void test_journal_create_uncommitted(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t got[VRS];
+	int landed = 0, budget, err = 0;
+
+	printf("test_journal_create_uncommitted\n");
+	m.buf = buf;
+	m.size = LSIZE;
+	m.writes = 0;
+	for (budget = 1; budget <= 16; budget++) {
+		err = build_uncommitted_log(buf, budget, &landed);
+		if (err == -EIO && landed >= 1)
+			break;
+	}
+	CHECK_EQ(err, -EIO);
+	CHECK(landed >= 1);
+
+	/* Replay redoes the first transaction's 7 records plus the landed
+	 * second-transaction records, then undoes exactly the landed ones. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m;
+	io.size = LSIZE;
+	io.read = mem_read;
+	io.write = mem_write;
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.transactions_committed, 0);	/* first txn forgotten */
+	CHECK_EQ(res.transactions_active, 1);
+	CHECK_EQ(res.records_redone, 7 + (uint32_t)landed);
+	CHECK_EQ(res.records_undone, (uint32_t)landed);
+	CHECK(!res.needs_chkdsk);
+	/* First file present, second file rolled back. */
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	CHECK_EQ(v_read_mft(&v, NEW_REC2, got), 0);
+	CHECK(!(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE));
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5] & 0x02, 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(buf);
+}
+
+/* Negative control: a create whose Initialize record names the wrong $MFT
+ * vcn (11, carrying the page LCN for vcn 10) commits fine — the writer does
+ * not validate — but replay refuses the whole log (H1) and writes nothing. */
+static void test_journal_create_bad_vcn(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v, v2;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	int err;
+
+	printf("test_journal_create_bad_vcn\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC, 11), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, NULL, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_init(&v2);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	err = ntfs_logfile_replay(log, &ap, false, &res);
+	CHECK_EQ(err, -EINVAL);
+	CHECK(res.needs_chkdsk);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(memcmp(v.disk, v2.disk, VOL_CLUSTERS * VCS) == 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(v2.disk);
+	free(buf);
+}
+
 int main(void)
 {
 	test_states();
@@ -2745,6 +3464,10 @@ int main(void)
 	test_writer_checkpoint_reserve();
 	test_writer_wrap_readback();
 	test_writer_clean_close();
+	test_journal_create_commit();
+	test_journal_create_abort();
+	test_journal_create_uncommitted();
+	test_journal_create_bad_vcn();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

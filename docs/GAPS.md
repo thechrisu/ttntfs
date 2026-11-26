@@ -234,6 +234,84 @@ yet — the driver still retires the journal on mount and writes
 metadata unjournaled, so the crash story is unchanged until
 Phase 2.
 
+Phase 2, step 1 landed 2026-11-26 (commit, this round): the
+transaction API — `ntfs_log_txn_begin/commit/abort` plus builders
+`init_record` (redo Initialize / undo Deallocate),
+`create_attr` (Create / Delete), `add_index_root` (Add / Delete
+IndexEntryRoot), `update_resident` (UpdateResidentValue both
+ways), `set_bitmap` (SetBits / ClearBits), in
+`core/logfile/logfile_write.c` + `core/logfile/ntfs_logfile.h`.
+Records are staged in memory (length-prefixed) and appended at
+commit in order with the undo chain (`LR_CLIENT_UNDO_NEXT_LSN`
+= previous record's LSN), then a CommitTransaction record, then
+a checkpoint (per-commit policy for Phase 2 — replay needs a
+checkpoint to see the transaction; Phase 4 may relax this to
+periodic), then a ForgetTransaction record with the in-memory
+entry freed. Abort writes nothing. The commit also populates
+the dirty-page table (target attribute, page-aligned VCN,
+`page_lcns`, oldest LSN = first touching record's LSN) and the
+open attributes are registered through the existing
+`ntfs_log_writer_open_attr` (`$MFT:$DATA` → 0x18,
+`$MFT:$BITMAP` → 0x40). Crash contract, per commit: crash
+before the first data record → transaction absent, volume
+unchanged; crash mid-append → the durable prefix is an ACTIVE
+transaction and the next replay undoes it (redo-then-undo: the
+redo pass applies the prefix first, so an undo always sees the
+post-redo state); crash after the Commit record but before the
+checkpoint → transaction committed, redo applies it; crash
+after the checkpoint → same, via the checkpoint's tables. A
+torn spanning record at the tail is simply absent (its tail
+never landed), so the transaction never happened — also a good
+state. A log-write failure fails the writer (volume-error
+semantics) and the transaction stays ACTIVE when any record
+was appended.
+Bug fixed en route (found by the new commit test, Phase 1
+checkpoint code): `lw_checkpoint_inner()` advanced the restart
+area's oldest LSN to the first dump's LSN, but the checkpoint's
+own dirty-page table still referenced the pre-checkpoint data
+records, so replay's redo pass could not read them
+(`lfs_lsn_in_file` refused) and the whole log failed `-EINVAL`.
+Oldest is now the minimum of the first dump, every transaction
+table entry's first LSN (any state — a committed transaction's
+records are still needed for redo until its pages flush), and
+every dirty-page entry's oldest LSN. With no live transactions
+or dirty pages the old behaviour is unchanged (pre-checkpoint
+records stay outside `[oldest, last]`, as
+`test_writer_checkpoint_basic` pins). Three facts the tests
+established about record construction: a CreateAttribute
+inserts at the END marker (`init_len - 8`), not after it
+(`check_if_attr` requires an attribute boundary); the
+Initialize redo image carries `MFT_RECORD_IN_USE` from the
+start (the replay's `check_file_record` requires it for the
+next record; Deallocate clears it on undo); and the SetBits
+op re-applies on a second replay (clusters carry no LSN to
+skip on — setting an already-set bit is a no-op in effect),
+so the second replay redoes 1 record and writes 1 cluster
+while the volume is unchanged.
+Tests: `test_journal_create_commit` (full 7-record create
+transaction: walk shows 7 data + Commit + 3 dumps + Forget in
+order; dry-run redoes exactly 7 with 1 committed; real run
+writes 2 MFT records + 1 bitmap cluster; record 40 and record
+32 byte-exact including the `MR_LSN` the replay stamps from
+the last touching record; bitmap bit 40 set and nothing else),
+`test_journal_create_abort` (nothing written, volume
+byte-identical), `test_journal_create_uncommitted`
+(fault-injected mid-commit: the budget is found adaptively,
+1–16 writes, because per-append cost depends on tail copies
+and page spanning — the first budget leaving ≥1 record durable
+is used, so the test can never pass vacuously; here budget 3
+lands exactly 1 record, the spanning Initialize, and replay
+redoes 7 + 1 then undoes exactly that 1, first file present,
+second file rolled back, bit 41 clear),
+`test_journal_create_bad_vcn` (negative control: Initialize
+naming the wrong `$MFT` vcn commits fine but replay refuses
+the whole log, H1, and writes nothing). Logfile suite now
+4900 checks, 0 failures.
+Still to do in Phase 2: step 2 (create-path wiring in
+`core/vfs/namei.c` + WAL gate in `pagecache.c` + mount
+lifecycle + `MR_LSN` stamping at the metadata flush) and step
+3 (crash tests in `core/tests/test_crash.c`).
+
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
 gate for any later performance work that touches the write path.
