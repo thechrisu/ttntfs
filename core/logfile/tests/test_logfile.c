@@ -1877,6 +1877,401 @@ static void test_first_write_into_fresh_cluster_is_protected(void)
 }
 
 
+/* ---- $LogFile writer (Phase 1, docs/JOURNAL-DESIGN.md) ------------------ */
+
+struct wseen {
+	uint64_t lsn[16];
+	uint64_t prev[16];
+	uint32_t type[16];
+	uint32_t tid[16];
+	uint8_t *data[16];
+	uint32_t len[16];
+	int n;
+};
+
+static int wcollect(const struct ntfs_log_record *r, void *ctx)
+{
+	struct wseen *s = ctx;
+
+	if (s->n < 16) {
+		int i = s->n;
+
+		s->lsn[i] = r->lsn;
+		s->prev[i] = r->client_prev_lsn;
+		s->type[i] = r->record_type;
+		s->tid[i] = r->transaction_id;
+		s->len[i] = r->data_len;
+		s->data[i] = malloc(r->data_len ? r->data_len : 1);
+		if (s->data[i] && r->data_len)
+			memcpy(s->data[i], r->raw, r->data_len);
+	}
+	s->n++;
+	return 0;
+}
+
+static void wseen_free(struct wseen *s)
+{
+	int i;
+
+	for (i = 0; i < s->n && i < 16; i++)
+		free(s->data[i]);
+}
+
+/* io whose writes fail after @budget successful ones (reads unaffected). */
+struct faultio {
+	struct memio *m;
+	int budget;
+	int writes;
+};
+
+static int fault_read(void *ctx, uint64_t off, void *buf, size_t len)
+{
+	return mem_read(((struct faultio *)ctx)->m, off, buf, len);
+}
+
+static int fault_write(void *ctx, uint64_t off, const void *buf, size_t len)
+{
+	struct faultio *f = ctx;
+
+	f->writes++;
+	if (f->budget >= 0 && f->writes > f->budget)
+		return -EIO;
+	return mem_write(f->m, off, buf, len);
+}
+
+static ntfs_logfile_t *open_with_io(struct ntfs_log_io *io)
+{
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log = NULL;
+
+	CHECK_EQ(ntfs_logfile_open(io, &g, &log), 0);
+	if (log)
+		ntfs_logfile_set_logger(log, logger, NULL);
+	return log;
+}
+
+/* Build a Noop client record carrying @plen bytes of pattern @pat. */
+static uint32_t build_noop(uint8_t *out, const uint8_t *pat, uint32_t plen)
+{
+	struct crec c;
+
+	memset(&c, 0, sizeof(c));
+	c.redo_op = LOP_Noop;
+	c.undo_op = LOP_Noop;
+	c.redo = pat;
+	c.redo_len = (uint16_t)plen;
+	return build_crec(&c, out);
+}
+
+static void test_writer_roundtrip(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], p2[6000], p3[40], c1[512], c2[8192], c3[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct wseen s;
+	uint32_t n1, n2, n3;
+	uint64_t lsn1, lsn2, lsn3;
+	int i;
+
+	printf("test_writer_roundtrip\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 6000; i++)
+		p2[i] = (uint8_t)(0xA5 ^ (i & 0xff));
+	for (i = 0; i < 40; i++)
+		p3[i] = (uint8_t)(0x5A + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+	n3 = build_noop(c3, p3, sizeof(p3));
+
+	/* Format refuses a log that already has restart pages. */
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), -EEXIST);
+
+	log = open_log(&m, &io);
+	CHECK(log != NULL);
+	if (!log) {
+		free(buf);
+		return;
+	}
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	/* 6 KiB payload: spans two pages, so this is the multi-page path. */
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x40, 0, c3, n3, &lsn3), 0);
+	CHECK(lsn1 < lsn2 && lsn2 < lsn3);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Reopen: the reader is the oracle for what the writer wrote. */
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.state, NTFS_LOG_DIRTY);
+	CHECK_EQ(info.current_lsn, lsn3);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsn1, wcollect, &s), 0);
+	CHECK_EQ(s.n, 3);
+	if (s.n == 3) {
+		CHECK_EQ(s.lsn[0], lsn1);
+		CHECK_EQ(s.lsn[1], lsn2);
+		CHECK_EQ(s.lsn[2], lsn3);
+		CHECK_EQ(s.prev[0], 0);
+		CHECK_EQ(s.prev[1], lsn1);
+		CHECK_EQ(s.prev[2], lsn2);
+		CHECK_EQ(s.tid[0], 0x18);
+		CHECK_EQ(s.tid[1], 0x18);
+		CHECK_EQ(s.tid[2], 0x40);
+		CHECK_EQ(s.type[0], LFS_RECORD_TYPE_CLIENT);
+		CHECK_EQ(s.len[0], n1);
+		CHECK_EQ(s.len[1], n2);
+		CHECK_EQ(s.len[2], n3);
+		CHECK(memcmp(s.data[0], c1, n1) == 0);
+		CHECK(memcmp(s.data[1], c2, n2) == 0);
+		CHECK(memcmp(s.data[2], c3, n3) == 0);
+	}
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
+static void test_writer_reopen_append(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], p2[40], c1[512], c2[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct wseen s;
+	uint32_t n1, n2;
+	uint64_t lsn1, lsn2;
+	int i;
+
+	printf("test_writer_reopen_append\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 40; i++)
+		p2[i] = (uint8_t)(0x5A + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	/* format 2 + first-record page 1 + first-record restart 2 + sync 2 */
+	CHECK_EQ(m.writes, 7);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Second session appends to the same partial page. */
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	/* + tail copy 1 + page 1 + sync 2 */
+	CHECK_EQ(m.writes, 11);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsn1, wcollect, &s), 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.lsn[0], lsn1);
+		CHECK_EQ(s.lsn[1], lsn2);
+		CHECK_EQ(s.prev[1], lsn1);
+		CHECK(memcmp(s.data[0], c1, n1) == 0);
+		CHECK(memcmp(s.data[1], c2, n2) == 0);
+	}
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
+/*
+ * Crash between the tail copy and the in-place page write: the record
+ * must still be there, recovered from the tail copy. Refusing the tail
+ * copy itself must leave only the earlier record.
+ *
+ * Write budget counts: format 2, append A page 3 + first-record restart
+ * 4-5, append B tail copy 6 + page 7.
+ */
+static void test_writer_tail_copy_crash(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], p2[40], c1[512], c2[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct faultio f;
+	struct ntfs_log_io fio;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct wseen s;
+	uint32_t n1, n2;
+	uint64_t lsn1, lsn2;
+	int i;
+
+	printf("test_writer_tail_copy_crash\n");
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 40; i++)
+		p2[i] = (uint8_t)(0x5A + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+
+	/* Case 1: the in-place page write is refused, the tail copy landed. */
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	f.m = &m; f.budget = 6; f.writes = 0;
+	memset(&fio, 0, sizeof(fio));
+	fio.ctx = &f; fio.size = LSIZE; fio.read = fault_read; fio.write = fault_write;
+	CHECK_EQ(ntfs_log_writer_format(&fio, &g, LSIZE), 0);
+	log = open_with_io(&fio);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(f.writes, 5);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), -EIO);
+	CHECK_EQ(f.writes, 7);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsn1, wcollect, &s), 0);
+	/* The tail scan runs lazily on the first walk; only then does the
+	 * info reflect the override. B's lsn is computed, not read back:
+	 * the failed append never assigned lsn2. */
+	{
+		uint64_t exp_b = mk_lsn(FIRST_PAGE + DATA_OFF + LF_ALIGN8(LR_HEADER_SIZE + n1), 1);
+
+		ntfs_logfile_get_info(log, &info);
+		CHECK_EQ(info.tail_overrides, 1);
+		CHECK_EQ(info.last_lsn, exp_b);
+		CHECK_EQ(s.n, 2);
+		if (s.n == 2) {
+			CHECK_EQ(s.lsn[1], exp_b);
+			CHECK(memcmp(s.data[1], c2, n2) == 0);
+		}
+	}
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+
+	/* Case 2 (negative control): the tail copy itself is refused. */
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	f.m = &m; f.budget = 5; f.writes = 0;
+	CHECK_EQ(ntfs_log_writer_format(&fio, &g, LSIZE), 0);
+	log = open_with_io(&fio);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), -EIO);
+	CHECK_EQ(f.writes, 6);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsn1, wcollect, &s), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.tail_overrides, 0);
+	CHECK_EQ(info.last_lsn, lsn1);
+	CHECK_EQ(s.n, 1);
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
+/*
+ * Torn last page: the log ends at the previous record. The restart area
+ * lags the torn record (no sync after it), so the scan walks forward
+ * from the last synced record and truncates — the walk must return the
+ * earlier records, never garbage.
+ */
+static void test_writer_torn_tail(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t pbig[3700], p1[64], p2[40], cbig[4096], c1[512], c2[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct wseen s;
+	uint32_t nbig, n1, n2;
+	uint64_t lsbig, lsn1, lsn2;
+	int i;
+
+	printf("test_writer_torn_tail\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 3700; i++)
+		pbig[i] = (uint8_t)(i & 0xff);
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 40; i++)
+		p2[i] = (uint8_t)(0x5A + i);
+	nbig = build_noop(cbig, pbig, sizeof(pbig));
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	/* Big record ends at 0xF10, A ends on the same page at 0xFA8. */
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, cbig, nbig, &lsbig), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	/* B starts on page 4 and ends on page 5; no sync after it. */
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Tear page 5: flip a byte in its first sector's tail. */
+	buf[5 * PS + 512 - 2] ^= 0xff;
+	(void)lsn2;
+
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, lsbig, wcollect, &s), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.last_lsn, lsn1);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.lsn[0], lsbig);
+		CHECK_EQ(s.lsn[1], lsn1);
+		CHECK(memcmp(s.data[0], cbig, nbig) == 0);
+		CHECK(memcmp(s.data[1], c1, n1) == 0);
+	}
+	wseen_free(&s);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
 int main(void)
 {
 	test_states();
@@ -1891,6 +2286,10 @@ int main(void)
 	test_flush_failure_is_not_a_partial_write();
 	test_replay_cut_points();
 	test_first_write_into_fresh_cluster_is_protected();
+	test_writer_roundtrip();
+	test_writer_reopen_append();
+	test_writer_tail_copy_crash();
+	test_writer_torn_tail();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

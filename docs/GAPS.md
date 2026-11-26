@@ -126,6 +126,33 @@ with an empty journal and nothing to replay. This implementation is
 what replaces that policy; until it lands the gap is open and
 recorded as such. See docs/JOURNAL-DESIGN.md §0.
 
+Phase 1, step 1 landed 2026-11-26 (commit, this round): the LFS
+writer core — `core/logfile/logfile_write.c` (`format`, `open`,
+`append`, `sync`): v1.1 records, LSN allocation, page sequencing
+with fixups, tail-copy-before-rewrite, single-page I/O, restart-area
+maintenance, first-record restart flush (the scan derives its
+expected sequence from the restart area, so a log with records but a
+never-flushed restart area is unreadable — proven by negative
+control: without the flush the walk fails `-EINVAL`). Crash contract,
+per append: crash before the tail copy → record absent; after the
+tail copy, before the in-place page → record present via the scan's
+override; during the in-place page → torn page, log ends at the
+previous record. A log-write failure fails the writer (volume-error
+semantics). Wrap is refused (`-ENOSPC`) until a checkpoint exists.
+Tests: `test_writer_roundtrip` (incl. a 6 KiB multi-page record,
+byte-exact read-back through the reader), `test_writer_reopen_append`
+(write counts pinned: 7 then 11), `test_writer_tail_copy_crash`
+(crash between copy and page → record present; refuse the copy →
+only the earlier record), `test_writer_torn_tail` (torn last page →
+log ends at the previous record). Negative controls: no tail copy →
+crash test fails 4 checks; no first-record flush → walk fails
+`-EINVAL`. Still to do in Phase 1: checkpoint emission (NTFS_RESTART
++ four table dumps, round-tripped through `load_checkpoint`), log
+wrap with checkpoint-first, and the writer-owned clean close.
+No integration with the mutation paths yet — the driver still
+retires the journal on mount and writes metadata unjournaled, so
+the crash story is unchanged until Phase 2.
+
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
 gate for any later performance work that touches the write path.

@@ -271,6 +271,36 @@ int ntfs_logfile_replay(ntfs_logfile_t *log, const struct ntfs_log_apply *apply,
  */
 int ntfs_logfile_mark_clean(ntfs_logfile_t *log);
 
+/* ---- Writing (Phase 1: LFS writer infrastructure, docs/JOURNAL-DESIGN.md) ----
+ *
+ * The mirror image of the reader above: appends LFS records (v1.1 only)
+ * to a $LogFile. A writer attaches to an opened log with
+ * ntfs_log_writer_open(); append() writes a record's pages synchronously
+ * (tail copy first when the page already holds durable content — see
+ * logfile_write.c for the crash contract); sync() flushes the restart
+ * area, which append() deliberately does not do per record (the tail
+ * scan recovers the true end when it lags). The writer refuses to wrap
+ * the circular area until a checkpoint exists (checkpoint emission is a
+ * later commit in this phase) and enters a failed state on any io->write
+ * error — further appends then return -EIO.
+ *
+ * ntfs_log_writer_format() lays two open v1.1 restart pages over an
+ * all-0xff $LogFile (refuses one that already has a restart page);
+ * a fresh log is then opened with ntfs_logfile_open() and written.
+ * A clean (closed) log is reopened by writer_open(), which puts the
+ * NTFS client back in use and clears the clean flag before any record.
+ */
+typedef struct ntfs_log_writer ntfs_log_writer_t;
+
+int ntfs_log_writer_format(const struct ntfs_log_io *io,
+			   const struct ntfs_log_geometry *geom, uint64_t size);
+int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out);
+int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type,
+			   uint32_t transaction_id, uint64_t undo_next_lsn,
+			   const void *data, uint32_t data_len, uint64_t *lsn_out);
+int ntfs_log_writer_sync(ntfs_log_writer_t *w);
+void ntfs_log_writer_free(ntfs_log_writer_t *w);
+
 #ifdef __cplusplus
 }
 #endif

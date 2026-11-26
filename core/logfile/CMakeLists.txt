@@ -31,7 +31,8 @@ set(NTFS_LOGFILE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/logfile_pages.c
 	${CMAKE_CURRENT_SOURCE_DIR}/logfile_records.c
 	${CMAKE_CURRENT_SOURCE_DIR}/logfile_tables.c
-	${CMAKE_CURRENT_SOURCE_DIR}/logfile_replay.c)
+	${CMAKE_CURRENT_SOURCE_DIR}/logfile_replay.c
+	${CMAKE_CURRENT_SOURCE_DIR}/logfile_write.c)
 
 add_library(ntfslogfile STATIC ${NTFS_LOGFILE_SOURCES})
 target_include_directories(ntfslogfile PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
