@@ -1629,6 +1629,50 @@ Porting progress (one commit per item, in the order above):
   (266 s).
   6 port items remain.
 
+- 2026-11-26: `523307b8516f` (preserve RECALL_ON_OPEN on WSL
+  special-file reparse points) — ported, verbatim. In
+  `__ntfs_create()` (core/vfs/namei.c:663) the reload
+  `ni->flags = fn->file_attributes` dropped the
+  FILE_ATTRIBUTE_RECALL_ON_OPEN set just before for WSL special
+  files, because the $FILE_NAME copy had been overwritten with
+  FILE_ATTR_SYSTEM: on-disk file_attributes came out 0x00000404
+  instead of 0x00040404, and after a remount
+  `valid_reparse_data()` rejected the reparse point while fsck
+  reported "$REPARSE_POINT data is corrupted". Now
+  `ni->flags = fn->file_attributes | (ni->flags &
+  FILE_ATTRIBUTE_RECALL_ON_OPEN)`. New discriminating test
+  `test_wsl_special_file_survives_remount()` (core/tests/
+  test_links.c): a fifo and a socket, created via a new public
+  `ntfs_mknod()` wrapper (core/vfs/api.c, core/include/ntfscore.h
+  — `ntfs_create()` forces S_IFREG, so the WSL path was
+  unreachable from the public API), must keep S_IFIFO/S_IFSOCK
+  and the RECALL_ON_OPEN bit across a remount. Negative control
+  (fix only reverted): test_links 620 checks / 5 failures —
+  on-disk file_attributes 0x404 instead of 0x40404 at create, the
+  fifo back as the invalid mode 0110644 (S_IFREG OR'd onto
+  S_IFIFO) after remount, file_attributes 0x4; with the fix 620 / 0.
+  Notes: the socket's mode check alone cannot discriminate
+  (S_IFSOCK already contains the S_IFREG bit, so the load
+  fallback leaves it looking like a socket even when validation
+  failed); the socket is discriminated by its file_attributes
+  check. The `vi->i_mode |= S_IFREG` fallback in inode.c produces
+  the invalid two-type-bits mode on a genuinely corrupt reparse
+  point — a pre-existing load-path quirk, out of scope for this
+  port, recorded here so it is not re-discovered.
+  Crash/disconnect at the worst instant: this commit touches inode
+  creation, so per the standing rule — a crash between the reparse
+  write and the $FILE_NAME write leaves a file whose reparse point
+  is either fully present or absent; either way the volume mounts
+  and the file is readable as a regular file, never as a torn
+  reparse point presented as good data. The fix itself only
+  preserves one attribute bit across an in-memory reload; it does
+  not change what is written to the device or the write order.
+  Evidence (this commit): test_links 620 checks, 0 failures;
+  plain ctest 15/15 (68 s), UBSan ctest 15/15 (68 s), ASan ctest
+  15/15 (201 s), `run-tests.sh all` 265 passed 0 failed with
+  NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (542 s).
+  5 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

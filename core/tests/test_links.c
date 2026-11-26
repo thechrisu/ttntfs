@@ -1635,6 +1635,123 @@ static void test_symlinks(void)
 	printf("test_symlinks\n");
 }
 
+/* ---- 4b. WSL special files ------------------------------------------ */
+
+/*
+ * Upstream 523307b8516f: a WSL special file (fifo, socket, device)
+ * is a reparse point whose $STANDARD_INFORMATION must carry
+ * FILE_ATTRIBUTE_RECALL_ON_OPEN (0x00040000, core/ntfs/layout.h:913)
+ * — valid_reparse_data() requires it for these tags
+ * (core/ntfs/reparse.c:127). __ntfs_create() set it on ni->flags,
+ * but the reload `ni->flags = fn->file_attributes` dropped it: the
+ * $FILE_NAME copy had been overwritten with FILE_ATTR_SYSTEM, so the
+ * on-disk file_attributes came out 0x00000404 instead of
+ * 0x00040404, and after a remount the reparse point was rejected —
+ * the fifo came back as a regular file — while fsck reported
+ * "$REPARSE_POINT data is corrupted".
+ *
+ * The discriminating check is the remount: the mode must still be
+ * S_IFIFO / S_IFSOCK with the RECALL_ON_OPEN bit on disk, not
+ * S_IFREG. Note the socket's mode check alone cannot discriminate:
+ * S_IFSOCK (0140000) already contains the S_IFREG bit (0100000),
+ * so the load path's `vi->i_mode |= S_IFREG` fallback leaves it
+ * looking like a socket even when the reparse validation failed —
+ * the socket is discriminated by its file_attributes check instead
+ * (0x4 without the fix, 0x40004 with it). The fifo's mode check
+ * does discriminate: S_IFIFO | S_IFREG is the invalid 0110644,
+ * which is what the negative control produced. That OR-instead-of-
+ * assign fallback is a pre-existing load-path quirk (a genuinely
+ * corrupt reparse point loads with two type bits set); out of scope
+ * for this port, noted here so it is not re-discovered.
+ */
+static void test_wsl_special_file_survives_remount(void)
+{
+	struct vol v;
+	ntfs_inode_t *f = NULL;
+	struct ntfs_attr at;
+
+	if (copy_fixture("symlinks") != 0) {
+		fprintf(stderr, "SKIP test_wsl_special_file_survives_remount: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_wsl_special_file_survives_remount: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+
+	CHECK(ntfs_mknod(v.root, "pipe", 0010644, &f) == 0);
+	if (f) {
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFIFO,
+			  "fifo mode %o is not S_IFIFO", at.mode);
+		CHECK_MSG(at.file_attributes & 0x00040000,
+			  "fifo file_attributes %#x lack RECALL_ON_OPEN",
+			  at.file_attributes);
+		CHECK_MSG(at.reparse_tag != 0, "fifo has no reparse tag");
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	CHECK(ntfs_mknod(v.root, "sock", 0140644, &f) == 0);
+	if (f) {
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFSOCK,
+			  "socket mode %o is not S_IFSOCK", at.mode);
+		CHECK_MSG(at.file_attributes & 0x00040000,
+			  "socket file_attributes %#x lack RECALL_ON_OPEN",
+			  at.file_attributes);
+		CHECK_MSG(at.reparse_tag != 0, "socket has no reparse tag");
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+
+	vol_down(&v);
+	fsck_clean("WSL special files");
+
+	/* Remount: the mode comes from ntfs_make_symlink() decoding the
+	 * reparse attribute, so this proves the flag is on the disk
+	 * rather than in the cache. Without the fix the flag is gone,
+	 * valid_reparse_data() rejects the point, and both files come
+	 * back S_IFREG. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_wsl_special_file_survives_remount: remount failed\n");
+		failures++; checks++;
+		unlink(scratch);
+		return;
+	}
+	CHECK(ntfs_lookup(v.root, "pipe", &f) == 0);
+	if (f) {
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFIFO,
+			  "fifo came back as mode %o after a remount, not S_IFIFO",
+			  at.mode);
+		CHECK_MSG(at.file_attributes & 0x00040000,
+			  "fifo file_attributes %#x lack RECALL_ON_OPEN after a remount",
+			  at.file_attributes);
+		CHECK_MSG(at.reparse_tag != 0, "fifo has no reparse tag after a remount");
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+	CHECK(ntfs_lookup(v.root, "sock", &f) == 0);
+	if (f) {
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFSOCK,
+			  "socket came back as mode %o after a remount, not S_IFSOCK",
+			  at.mode);
+		CHECK_MSG(at.file_attributes & 0x00040000,
+			  "socket file_attributes %#x lack RECALL_ON_OPEN after a remount",
+			  at.file_attributes);
+		CHECK_MSG(at.reparse_tag != 0, "socket has no reparse tag after a remount");
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+
+	vol_down(&v);
+	fsck_clean("WSL special files after remount");
+	unlink(scratch);
+	printf("test_wsl_special_file_survives_remount\n");
+}
+
 /* ---- 5. timestamps -------------------------------------------------- */
 
 /*
@@ -4447,6 +4564,7 @@ int main(void)
 	test_hard_link_refusals();
 	test_many_links();
 	test_symlinks();
+	test_wsl_special_file_survives_remount();
 	test_symlink_filename_union_is_the_tag();
 	test_symlink_tag_choice();
 	test_reparse_index_failure_propagates();

@@ -449,6 +449,11 @@ int ntfs_create(ntfs_inode_t *dir, const char *name, uint32_t mode, ntfs_inode_t
 	return do_create(dir, name, S_IFREG | (mode & 0777), NULL, out);
 }
 
+int ntfs_mknod(ntfs_inode_t *dir, const char *name, uint32_t mode, ntfs_inode_t **out)
+{
+	return do_create(dir, name, mode, NULL, out);
+}
+
 int ntfs_mkdir(ntfs_inode_t *dir, const char *name, uint32_t mode, ntfs_inode_t **out)
 {
 	return do_create(dir, name, S_IFDIR | (mode & 0777), NULL, out);

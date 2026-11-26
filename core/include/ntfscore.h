@@ -199,6 +199,12 @@ int ntfs_setattr(ntfs_inode_t *ni, const struct ntfs_attr *attr, uint32_t valid)
 int ntfs_lookup(ntfs_inode_t *dir, const char *name, ntfs_inode_t **out);
 int ntfs_create(ntfs_inode_t *dir, const char *name, uint32_t mode,
 		ntfs_inode_t **out);
+/* Create a special file (fifo, socket; device nodes need an rdev the
+ * wrapper does not take). Unlike ntfs_create(), the mode's type bits
+ * are passed through: a fifo/socket is written as a WSL reparse
+ * point, a regular file is not what this is for. */
+int ntfs_mknod(ntfs_inode_t *dir, const char *name, uint32_t mode,
+	       ntfs_inode_t **out);
 int ntfs_mkdir(ntfs_inode_t *dir, const char *name, uint32_t mode,
 	       ntfs_inode_t **out);
 int ntfs_symlink(ntfs_inode_t *dir, const char *name, const char *target,
