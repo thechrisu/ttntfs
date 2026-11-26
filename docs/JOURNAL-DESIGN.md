@@ -5,6 +5,55 @@ writer must do, why it is the largest item in the gap list, and the
 phased plan. No code lands from this round; the next round starts at
 Phase 0/1 below.
 
+## 0. Hard constraint — crash or disconnect at any instant leaves a good state
+
+Set 2026-11-26 by the owner. This is a hard design constraint, not a
+test to run at the end, and it has implications for the design — for
+example the cache that is chosen. If the computer crashes or any
+component fails, including the drive suddenly being disconnected,
+the volume must always be left in a good state.
+
+Stated plainly: **the current design does not meet this constraint.**
+Today metadata is write-back, flushed within 1 s (background writer
+tick 200 ms, folios dirty longer than 1000 ms flushed; §1 step 2
+below), and journal writing is deferred. A crash or disconnect inside
+that window loses up to a second of metadata writes with an empty
+journal and nothing to replay — the volume is left dirty and recovery
+is `chkdsk`, not the journal. That is not a good state. The journal
+implementation in this document is what replaces that policy; until
+it lands, the gap is open and recorded as such, not papered over.
+
+What the constraint demands of every durability decision in this
+document and in the code:
+
+- **Cache policy must be justified against it**: what is cached,
+  write-through vs write-back, write ordering, and exactly what can
+  be lost on a sudden disconnect. A write-back cache is only
+  acceptable where the journal makes the loss recoverable — i.e. the
+  log record is on the device (synchronous log flush) before the
+  cached metadata it describes is eligible for writeback (WAL,
+  §3.5/§4). Anything cached without that ordering is data the driver
+  has promised and cannot keep.
+- **Flush ordering is part of correctness, not performance**: log
+  before metadata, MFT-last, sync on commit — the orderings in §3.5
+  exist because a crash between two flushes must still leave a
+  replayable state. If an ordering cannot be enforced on the actual
+  flush path (page cache, FSKit, device), the design does not ship
+  as-is.
+- **Replay behaviour must leave a good state too**: a torn or
+  half-written log record is detected (checksums, LSN chain) and
+  either replayed or cleanly rejected — never silently applied, never
+  silently skipped (see §3.6/§3.7). A dirty volume mounts read-only
+  until replay proves the state, or is refused; it is never mounted
+  read-write on an unproven state.
+- **Speed second**: if a design cannot prove crash/disconnect safety,
+  it does not ship, however fast it is. Performance work on the write
+  path is gated by §1.3 and by this constraint, not the other way
+  round.
+- **Commit-message rule**: any commit that touches caching, flushing,
+  journaling or replay must state in its message what happens on a
+  crash/disconnect at the worst instant.
+
 ## 1. Where we are
 
 The driver replays `$LogFile` but never writes it. That is not an

@@ -46,6 +46,22 @@ is not; and no performance optimisation may trade away a safety
 margin — a perf change touching the write path needs the same
 crash-consistency evidence as a correctness fix.
 
+Hard design constraint, set 2026-11-26 by the owner and standing
+for all future work: **if the computer crashes or any component
+fails, including the drive suddenly being disconnected, the volume
+must always be left in a good state.** This is a design constraint,
+not a test to run at the end — it decides the cache that is chosen
+(what is cached, write-through vs write-back, write ordering, and
+exactly what can be lost on a sudden disconnect). Every design
+decision that touches durability — cache policy, flush ordering,
+$LogFile record layout, replay behaviour, dirty-volume handling —
+is evaluated against "crash or disconnect at any instant leaves a
+good state" first, speed second. If a design cannot prove that, it
+does not ship. Standing rule: any commit that touches caching,
+flushing, journaling or replay must state in its message what
+happens on a crash/disconnect at the worst instant. See
+docs/JOURNAL-DESIGN.md §0 for the full statement.
+
 ## 1. Data safety — fix first, these can eat data
 
 ### 1.1 Compressed-file creation corrupts files — done (2026-11-25)
@@ -101,7 +117,14 @@ class end-to-end (file creation, 2–3 weeks), Phase 3 class by class
 Phase 5 Windows round-trip per class. Top of the post-port-queue
 work since 2026-11-26 (owner's data-safety-first direction): the
 port queue finishes first, then §1.2 starts at Phase 0/1, ahead of
-§2.2/§4.4 and ahead of all performance work.
+§2.2/§4.4 and ahead of all performance work. Stated explicitly
+(2026-11-26 hard constraint): the current metadata write policy —
+write-back, flushed within 1 s, journal writing deferred — does
+NOT meet "crash or disconnect at any instant leaves a good state".
+A crash inside the flush window loses up to a second of metadata
+with an empty journal and nothing to replay. This implementation is
+what replaces that policy; until it lands the gap is open and
+recorded as such. See docs/JOURNAL-DESIGN.md §0.
 
 ### 1.3 Replay atomicity unproven — open
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
@@ -1517,6 +1540,31 @@ Porting progress (one commit per item, in the order above):
   — an isolated `ci.sh --quick` re-run passed all three Linux
   stages, and the full re-run went 9/9).
   9 port items remain.
+
+- 2026-11-26: `98716c9fce21` (fix off-by-one page overflow in
+  ntfs_decompress()) — ported. One character verbatim:
+  `dp_addr > dp_sb_end` to `dp_addr >= dp_sb_end` in the token-loop
+  range check in `ntfs_decompress()` (core/ntfs/compress.c:356);
+  the pre-tag check at :343 keeps `>` exactly as upstream. When a
+  sub-block decompresses to exactly 4096 bytes with tags remaining,
+  the old code parsed one more token and wrote past the sub-block
+  end. No new test, honestly: `ntfs_decompress()` is static,
+  reachable only through the full read path, and the boundary needs
+  a byte-exact hand-crafted LZ77 stream — no compressed-stream
+  fixture helper exists in the repo. Ported for upstream fidelity,
+  same "no new test, port note explains why" precedent as
+  71feaa7686fb.
+  Evidence (this commit): plain ctest 15/15 (116 s), UBSan ctest
+  15/15 (122 s), ASan ctest 15/15 (141 s, re-run — the first run
+  hung 12:33 in `test_links` under ASan: the forked child of
+  `test_ib_sync_write_no_post_fixup` sat in a futex wait with 0 CPU,
+  i.e. blocked from the start, not looping; `test_links` alone under
+  ASan then passed 827 checks / 0 failures in 44 s and the full
+  suite re-ran 15/15, so it was a one-off ASan+fork flake, not this
+  one-character change — the child never touches compressed data),
+  `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1,
+  pre-push 9/9 PASS (379 s).
+  8 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
