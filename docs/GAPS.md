@@ -202,11 +202,37 @@ tail-copy-before-rewrite protocol still applies, so a crash
 mid-wrap leaves the old page or its tail copy; a stale tail copy
 cannot supersede the new page (older sequence, earlier end LSN).
 Negative control: reverting the `PG_FLAGS` fix fails the new test
-(walk `-EINVAL`, 1 record instead of 57). Still to do in Phase 1:
-the writer-owned clean close. No integration with the mutation
-paths yet — the driver still retires the journal on mount and
-writes metadata unjournaled, so the crash story is unchanged
-until Phase 2.
+(walk `-EINVAL`, 1 record instead of 57).
+
+Phase 1, step 4 landed 2026-11-26 (commit, this round): the
+writer-owned clean close — `ntfs_log_writer_close()` emits a
+final checkpoint, then marks the volume clean
+(`RESTART_VOLUME_IS_CLEAN`) and frees the NTFS client in the
+restart area, and syncs. Appends, checkpoints and open-attribute
+registrations after the close return `-EINVAL`, as does a second
+close; reopening the writer on the closed log starts a new
+(dirty) session. Reader fixes this close exposed
+(`core/logfile/logfile_open.c`): the open-time client lookup
+walked only the in-use list, so a cleanly closed log's checkpoint
+was invisible (`load_checkpoint` `-ENOENT`) — it now falls back
+to the free list; and the oldest-LSN bound was the last record
+when no client was in use, which put the checkpoint's own dump
+records outside `[oldest, last]` — the NTFS client's own
+`CR_OLDEST_LSN` now counts in the minimum. Crash contract: the
+checkpoint lands first, so a crash before or during the close
+leaves a dirty log whose latest checkpoint is durable; a crash
+during the final sync leaves one restart page clean-closed and
+one dirty, either a good state. Tests: `test_writer_clean_close`
+(clean reopen with tables loading, post-close appends refused,
+writer reopen goes dirty again). Negative controls: dropping the
+reader free-list fallback fails the new test (4 checks); stubbing
+`close()` fails it (8 checks).
+
+Phase 1 is now complete: writer core, checkpoint emission, wrap
+read-back, clean close. No integration with the mutation paths
+yet — the driver still retires the journal on mount and writes
+metadata unjournaled, so the crash story is unchanged until
+Phase 2.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

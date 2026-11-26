@@ -105,6 +105,7 @@ struct ntfs_log_writer {
 	bool failed;
 	bool checkpointed;
 	bool in_checkpoint;		/* checkpoint appends: reserve-exempt */
+	bool closed;			/* clean close done: no more records */
 
 	/* Restart tables, maintained in memory and dumped by checkpoint().
 	 * Phase 1: only the open-attribute table is populated (by
@@ -627,6 +628,8 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 
 	if (w->failed)
 		return -EIO;
+	if (w->closed)
+		return -EINVAL;	/* clean close done: reopen to write more */
 	if (record_type != LFS_RECORD_TYPE_CLIENT && record_type != LFS_RECORD_TYPE_CLIENT_RESTART)
 		return -EINVAL;
 	if (!data && data_len)
@@ -772,6 +775,8 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 
 	if (w->failed)
 		return -EIO;
+	if (w->closed)
+		return -EINVAL;
 	if (!w->oatbl.buf) {
 		err = lfs_table_init(&w->oatbl, OA1_SIZE, 16);
 		if (err)
@@ -959,8 +964,55 @@ int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out)
 
 	if (w->failed)
 		return -EIO;
+	if (w->closed)
+		return -EINVAL;
 	w->in_checkpoint = true;
 	err = lw_checkpoint_inner(w, lsn_out);
 	w->in_checkpoint = false;
 	return err;
+}
+
+/* ---- clean close ------------------------------------------------------- */
+
+/*
+ * Close the log cleanly: emit a final checkpoint, then mark the volume
+ * clean and free the NTFS client in the restart area, and sync. The
+ * reader judges a log clean when no client is in use or the
+ * RESTART_VOLUME_IS_CLEAN flag is set; the close sets both, matching
+ * what format() writes for a fresh log.
+ *
+ * Crash contract: the checkpoint lands first, so a crash before or
+ * during the close leaves a dirty log whose latest checkpoint is
+ * durable — replayable, a good state, just not clean. A crash during
+ * the final sync leaves one restart page clean-closed and one dirty;
+ * either is a good state (same LSN; the reader replays from the
+ * checkpoint or skips it). A second close returns -EINVAL, as do
+ * appends, checkpoints and open-attribute registrations after the
+ * close; reopening the writer on the closed log starts a new
+ * session (the clean flag is cleared and the client put back in
+ * use by writer_open()).
+ */
+int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out)
+{
+	uint64_t rlsn;
+	int err;
+
+	if (w->failed)
+		return -EIO;
+	if (w->closed)
+		return -EINVAL;
+	err = ntfs_log_writer_checkpoint(w, &rlsn);
+	if (err)
+		return err;
+	lf_put16(w->ra + RA_FLAGS,
+		 lf_get16(w->ra + RA_FLAGS) | RESTART_VOLUME_IS_CLEAN);
+	lf_put16(w->ra + RA_CLIENT_IN_USE_LIST, LFS_NO_CLIENT);
+	lf_put16(w->ra + RA_CLIENT_FREE_LIST, w->client_idx);
+	err = ntfs_log_writer_sync(w);
+	if (err)
+		return err;
+	w->closed = true;
+	if (lsn_out)
+		*lsn_out = rlsn;
+	return 0;
 }

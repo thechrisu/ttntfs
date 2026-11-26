@@ -353,6 +353,27 @@ static int setup_geometry(ntfs_logfile_t *log)
 			break;
 		}
 	}
+	/*
+	 * A cleanly closed log has no client in use: the NTFS client sits
+	 * on the free list instead. Without this fallback its checkpoint
+	 * (and its tables) are invisible after a clean close, and
+	 * load_checkpoint() reports -ENOENT on a log that has one.
+	 */
+	if (log->client_idx == LFS_NO_CLIENT) {
+		for (idx = lf_get16(ra + RA_CLIENT_FREE_LIST); idx != LFS_NO_CLIENT && idx < nr;
+		     idx = lf_get16(ca + (size_t)idx * CR_SIZE + CR_NEXT_CLIENT)) {
+			const uint8_t *cr = ca + (size_t)idx * CR_SIZE;
+			if (lf_get32(cr + CR_CLIENT_NAME_LENGTH) == 8 &&
+			    lf_get16(cr + CR_CLIENT_NAME + 0) == 'N' && lf_get16(cr + CR_CLIENT_NAME + 2) == 'T' &&
+			    lf_get16(cr + CR_CLIENT_NAME + 4) == 'F' && lf_get16(cr + CR_CLIENT_NAME + 6) == 'S') {
+				log->client_idx = idx;
+				log->client_seq = lf_get16(cr + CR_SEQ_NUMBER);
+				log->client_oldest_lsn = lf_get64(cr + CR_OLDEST_LSN);
+				log->client_restart_lsn = lf_get64(cr + CR_CLIENT_RESTART_LSN);
+				break;
+			}
+		}
+	}
 
 	/* Oldest lsn: minimum over active clients, starting from last lsn. */
 	log->oldest_lsn = log->current_lsn;
@@ -362,6 +383,16 @@ static int setup_geometry(ntfs_logfile_t *log)
 		if (l && l < log->oldest_lsn)
 			log->oldest_lsn = l;
 	}
+	/*
+	 * The NTFS client's own oldest counts too: on a cleanly closed
+	 * log no client is in use, so without it the oldest would be the
+	 * last record and the checkpoint's own dump records — which sit
+	 * before the restart record — would fall outside [oldest, last]
+	 * and be unreadable. (On a dirty log the client is in use and
+	 * already covered by the loop above.)
+	 */
+	if (log->client_oldest_lsn && log->client_oldest_lsn < log->oldest_lsn)
+		log->oldest_lsn = log->client_oldest_lsn;
 	if (lfs_lsn_to_vbo(log, log->oldest_lsn) < log->first_page)
 		log->oldest_lsn = 0;	/* pseudo lsn: no oldest */
 

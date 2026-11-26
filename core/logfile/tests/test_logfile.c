@@ -2577,6 +2577,88 @@ static void test_writer_wrap_readback(void)
 	free(buf);
 }
 
+
+/* Clean close: the log reopens clean, the checkpoint tables load, and
+ * a reopened writer starts a new (dirty) session on the same log. */
+static void test_writer_clean_close(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	uint8_t p1[64], p2[40], c1[512], c2[512];
+	struct memio m;
+	struct ntfs_log_io io;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	struct ntfs_logfile_info info;
+	struct ckpt_oa oa;
+	struct ntfs_log_table_cbs cbs;
+	static const uint16_t nm[] = { 'D', 'A', 'T', 'A' };
+	uint32_t n1, n2;
+	uint64_t lsn1, lsn2, rlsn, rlsn2;
+	int i;
+
+	printf("test_writer_clean_close\n");
+	memset(buf, 0xff, LSIZE);
+	m.buf = buf; m.size = LSIZE; m.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m; io.size = LSIZE; io.read = mem_read; io.write = mem_write;
+	for (i = 0; i < 64; i++)
+		p1[i] = (uint8_t)(0x11 + i);
+	for (i = 0; i < 40; i++)
+		p2[i] = (uint8_t)(0x5A + i);
+	n1 = build_noop(c1, p1, sizeof(p1));
+	n2 = build_noop(c2, p2, sizeof(p2));
+
+	CHECK_EQ(ntfs_log_writer_format(&io, &g, LSIZE), 0);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c1, n1, &lsn1), 0);
+	CHECK_EQ(ntfs_log_writer_open_attr(w, ATTR_TYPE_DATA, 6, 1, nm, 4, NULL), 0);
+	CHECK_EQ(ntfs_log_writer_close(w, &rlsn), 0);
+	/* No more records after a clean close; a second close refuses. */
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), -EINVAL);
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, &rlsn2), -EINVAL);
+	CHECK_EQ(ntfs_log_writer_close(w, &rlsn2), -EINVAL);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Reopen as a reader: clean, checkpoint referenced, tables load. */
+	log = open_log(&m, &io);
+	CHECK(ntfs_logfile_is_clean(log));
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.state, NTFS_LOG_CLEAN);
+	CHECK(info.volume_is_clean_flag);
+	CHECK_EQ(info.client_restart_lsn, rlsn);
+	CHECK_EQ(ntfs_logfile_load_checkpoint(log), 0);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.table_open_attrs, 1);
+	memset(&oa, 0, sizeof(oa));
+	memset(&cbs, 0, sizeof(cbs));
+	cbs.open_attr = ckpt_oa_cb;
+	CHECK_EQ(ntfs_logfile_tables(log, &cbs, &oa), 0);
+	CHECK_EQ(oa.n, 1);
+	if (oa.n == 1)
+		CHECK_EQ(oa.mft_no, 6);
+	ntfs_logfile_close(log);
+
+	/* Reopen as a writer: the clean flag clears, the client comes
+	 * back in use, and the log is dirty again after an append. */
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c2, n2, &lsn2), 0);
+	CHECK_EQ(ntfs_log_writer_sync(w), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	CHECK(!ntfs_logfile_is_clean(log));
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.state, NTFS_LOG_DIRTY);
+	CHECK_EQ(info.current_lsn, lsn2);
+	ntfs_logfile_close(log);
+	free(buf);
+}
+
 static void test_writer_torn_tail(void)
 {
 	uint8_t *buf = malloc(LSIZE);
@@ -2662,6 +2744,7 @@ int main(void)
 	test_writer_checkpoint_reopen();
 	test_writer_checkpoint_reserve();
 	test_writer_wrap_readback();
+	test_writer_clean_close();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
