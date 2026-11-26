@@ -120,9 +120,16 @@ stage_ubsan() {
 # Per-test timeout 60 s: the slowest test under ASan on Linux is ~20 s,
 # so 60 s is 3x headroom and a hang becomes a failed test, never a
 # runaway. The stage asserts the suite actually executed: ctest must
-# report 100% passed over at least one test. That is the 2026-09-14
-# failure mode -- a run that executes nothing must fail loudly, never
-# read green.
+# report 100% passed over at least one test, and at least one test must
+# have a Passed line. That is the 2026-09-14 failure mode -- a run that
+# executes nothing must fail loudly, never read green. The summary line
+# differs by platform: Linux ctest prints "100% tests passed, 0 tests
+# failed out of N", macOS ctest prints "100% tests passed out of N"
+# (no ", 0 tests failed" clause) -- the macos-26 asan job of run
+# 45785443966 failed on exactly this: 14 tests passed in 35.56 s, the
+# hang gone, but the old pattern only accepted the Linux form. Accept
+# both forms; the Passed-line check is what rules out a suite that ran
+# nothing but still printed 100%.
 stage_asan() {
 	cmake -S . -B build-asan -DNTFS_ASAN=ON -DNTFS_LOGFILE_ASAN=ON >/dev/null || return 1
 	cmake --build build-asan -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null || return 1
@@ -131,8 +138,12 @@ stage_asan() {
 	rc=$?
 	printf '%s\n' "$out"
 	[ $rc -eq 0 ] || return 1
-	printf '%s\n' "$out" | grep -Eq '100% tests passed, 0 tests failed out of [1-9][0-9]*' || {
+	printf '%s\n' "$out" | grep -Eq '100% tests passed(, 0 tests failed)? out of [1-9][0-9]*' || {
 		echo "ASan stage: ctest exited 0 but the suite did not execute its tests -- failing loudly (see the 2026-09-14 note above)."
+		return 1
+	}
+	printf '%s\n' "$out" | grep -Eq ' +Passed +[0-9]+\.[0-9]+ sec' || {
+		echo "ASan stage: ctest reported 100% passed but no test has a Passed line -- failing loudly (see the 2026-09-14 note above)."
 		return 1
 	}
 	return 0
