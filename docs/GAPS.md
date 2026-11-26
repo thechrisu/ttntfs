@@ -448,7 +448,27 @@ Porting progress (one commit per item, in the order above):
   Evidence: failed_rewrite 25 checks 0 failures with the fix, 1
   failure without it; plain ctest 15/15, UBSan ctest 15/15,
   `run-tests.sh all` 265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
-  54 port items remain.
+- 2026-11-25: `9692b1b4fc00` (reparse-index insertion failure
+  swallowed, symlink creation falsely succeeds) — ported:
+  `update_reparse_data()` now keeps `set_reparse_index()`'s return
+  in `err` and propagates it, so the failure is reported even when
+  there was no previous reparse data (`oldsize == 0` — the case that
+  bit symlink creation; the old code only entered the cleanup branch
+  when `oldsize > 0`, discarding the error entirely otherwise).
+  Regression test `test_reparse_index_failure_propagates` in
+  `core/tests/test_links.c` with new fixture patcher
+  `tools/mkfixtures/patch_stale_reparse.py`: it plants a stale `$R`
+  entry (native tag, the file's (tag, file_id) key) for the record the
+  next created file will take — the number is learned at runtime from
+  a sacrificial file via `ntfs_inode_number()`, since allocation is
+  sequential from the fixture's highest used record (294). The
+  planted entry makes `ntfs_ie_add()` refuse with -EEXIST, the exact
+  failure upstream's fix propagates. Evidence: test_links 657 checks
+  0 failures with the fix, 2 failures without it (the create returns
+  0 and leaves a half-created link with reparse data but no index
+  entry); plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all`
+  265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  53 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants

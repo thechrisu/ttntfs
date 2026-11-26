@@ -1282,6 +1282,107 @@ static void test_symlink_tag_choice(void)
 	}
 }
 
+/*
+ * Upstream 9692b1b4fc00: update_reparse_data() ignored set_reparse_index()'s
+ * return value, so a symlink whose $R index insert failed -- here, because
+ * the index already holds an entry for the file's (tag, file_id) key, which
+ * ntfs_ie_add() refuses with -EEXIST -- still reported success, while no
+ * reparse data existed on disk. Without the fix ntfs_symlink() returns 0
+ * and the link exists with reparse data but no index entry; with it the
+ * create fails with -EEXIST and __ntfs_create's err_out frees the MFT
+ * record, so no half-created file is left behind.
+ *
+ * The stale entry cannot arise from the driver: the $R entry is removed
+ * when the file goes away. tools/mkfixtures/patch_stale_reparse.py plants
+ * it by hand for the record the symlink will take. Which record that is
+ * is learned at runtime: the first file created on a fresh basic-4k.img
+ * copy takes the record after the fixture's highest (294), and allocation
+ * is strictly sequential, so a sacrificial file first, read back through
+ * ntfs_inode_number(), tells the patcher the next record. The entry is
+ * planted for the native tag: the target "target.txt" is windows-safe, so
+ * the driver takes the native tag, not the WSL fallback.
+ */
+static void test_reparse_index_failure_propagates(void)
+{
+	const char *py = getenv("NTFS_PATCH_STALE_REPARSE");
+	struct vol v;
+	ntfs_inode_t *sac = NULL, *l = NULL, *f = NULL;
+	char cmd[2048];
+	uint64_t sac_no;
+	int err, rc;
+
+	printf("test_reparse_index_failure_propagates\n");
+
+	if (copy_fixture("stale-reparse") != 0) {
+		fprintf(stderr, "SKIP test_reparse_index_failure_propagates: no fixture\n");
+		return;
+	}
+	if (!py || !*py) {
+		fprintf(stderr, "SKIP test_reparse_index_failure_propagates: NTFS_PATCH_STALE_REPARSE not set\n");
+		unlink(scratch);
+		return;
+	}
+
+	/* Phase 1: learn the next record number from a sacrificial file. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_reparse_index_failure_propagates: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	err = ntfs_create(v.root, "sacrifice.txt", 0100644, &sac);
+	CHECK_MSG(err == 0, "sacrificial create failed: %d", err);
+	if (err) {
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	sac_no = ntfs_inode_number(sac);
+	ntfs_inode_put(sac);
+	sac = NULL;
+	CHECK(ntfs_volume_sync(v.vol) == 0);
+	vol_down(&v);
+
+	/* Phase 2: plant the stale $R entry for the next record, then the
+	 * symlink that would take it. */
+	snprintf(cmd, sizeof(cmd), "python3 %s %s %llu 1 >/dev/null 2>&1",
+		 py, scratch, (unsigned long long)(sac_no + 1));
+	rc = system(cmd);
+	CHECK_MSG(rc == 0, "patch_stale_reparse.py failed (rc %d)", rc);
+	if (rc != 0) {
+		unlink(scratch);
+		return;
+	}
+
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_reparse_index_failure_propagates: remount failed\n");
+		failures++;
+		checks++;
+		unlink(scratch);
+		return;
+	}
+	err = ntfs_symlink(v.root, "dup.lnk", "target.txt", &l);
+	CHECK_MSG(err == -EEXIST,
+		  "symlink with a stale $R entry returned %d, expected -EEXIST (-17); "
+		  "without upstream 9692b1b4fc00 the failure is swallowed and the create "
+		  "reports success", err);
+	if (l) {
+		ntfs_inode_put(l);
+		l = NULL;
+	}
+
+	/* No half-created file: the failed create frees its MFT record. */
+	CHECK_MSG(ntfs_lookup(v.root, "dup.lnk", &f) != 0,
+		  "the failed symlink create left a file behind");
+	if (f) {
+		ntfs_inode_put(f);
+		f = NULL;
+	}
+
+	vol_down(&v);
+	fsck_clean("stale reparse index");
+	unlink(scratch);
+}
+
 static void test_symlinks(void)
 {
 	struct vol v;
@@ -2092,6 +2193,7 @@ int main(void)
 	test_symlinks();
 	test_symlink_filename_union_is_the_tag();
 	test_symlink_tag_choice();
+	test_reparse_index_failure_propagates();
 	test_windows_dir_links();
 	test_interix_symlinks();
 	test_symlink_ea_migration();
