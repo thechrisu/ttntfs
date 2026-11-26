@@ -1673,6 +1673,43 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (542 s).
   5 port items remain.
 
+- 2026-11-26: `b8d6c528e9d5` (fix WARN_ON for resident attribute
+  in ntfs_map_runlist_nolock()) — ported, verbatim. The
+  WARN_ON(!ctx->attr->non_resident) in the ctx_needs_reset
+  re-lookup of `ntfs_map_runlist_nolock()` (core/ntfs/attrib.c:177)
+  is now `if (unlikely(!ctx->attr->non_resident)) { err = -EIO;
+  goto err_out; }`, matching the sibling branch at :120 that
+  already returns -EIO the same way. No new test, honestly (this
+  supersedes the earlier BLOCKED call in the triage row, which
+  held the fix back for want of a test — the coordinator rule is
+  to land with the reason stated): no failing-without-fix test is
+  reachable through the public harness. The mount path
+  (upstream's KASAN trigger via ntfs_empty_logfile) is
+  unreachable: a resident $LogFile $DATA fails
+  ntfs_check_logfile's minimum-size gate (40 KiB) before emptying,
+  and the restart-page validation needs a full 4 KiB page that a
+  ~950-byte resident value cannot hold. A white-box call needs
+  struct ntfs_inode *, but the internal headers redefine public
+  symbols and cannot coexist with ntfscore.h in one TU. The read
+  path branches on NInoNonResident before any runlist mapping.
+  The path needs an $ATTRIBUTE_LIST whose re-lookup lands on a
+  resident extent — a candidate for an ASan fuzz seed in the §5.2
+  follow-up. In this port WARN_ON only logs and continues, so
+  without the fix a crafted image would read garbage mapping
+  pairs from the resident attr's union after the warning.
+  Crash/disconnect at the worst instant: this commit touches only
+  an error return in runlist mapping — a crafted or torn image
+  that hits it now fails the mount/read with -EIO instead of
+  proceeding on garbage runlist data, so a torn volume is
+  detected, never silently papered over.
+  Evidence (this commit): plain ctest 15/15 (62 s), UBSan ctest
+  15/15 (163 s), ASan ctest 15/15 (201 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (211 s; the first pre-push run was interrupted by a VM restart
+  mid-run with its log lost — the re-run after the restart, with
+  clang 18.1.3 restored by the os-intent replay, went 9/9).
+  4 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
