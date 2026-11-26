@@ -92,6 +92,9 @@
 #include "ntfs_image.h"
 #include "ntfs_logfile.h"
 #include "../ntfs/ea.h"
+#include "../ntfs/runlist.h"
+#include <linux/err.h>
+#include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/xattr.h>
 
@@ -1945,6 +1948,65 @@ static void test_empty_mapping_pairs(void)
 	unlink(scratch);
 }
 
+/*
+ * test_rl_realloc_overflow - upstream 8bed376124ab: ntfs_rl_realloc()
+ * used to multiply the element count by sizeof(*rl) in int and store
+ * the product back into an int, so a negative count wrapped to a huge
+ * size_t and the memcpy that follows used the wrapped size. The shared
+ * helper now rejects negative counts with -EINVAL before allocating
+ * anything, and checks the multiply for overflow.
+ *
+ * The overflow check itself cannot be tripped through this interface
+ * on a 64-bit size_t (an int count x 24 bytes always fits -- verified
+ * with a scratch program: __builtin_mul_overflow(INT_MAX, 24, &size_t)
+ * reports no overflow), so the discriminating cases are the negative
+ * counts: without the fix ntfs_rl_realloc(NULL, 0, -1) fails with
+ * -ENOMEM (kvzalloc of the wrapped huge size) and
+ * ntfs_rl_realloc(NULL, -1, 0) succeeds (kvzalloc(0)); with it both
+ * return -EINVAL. A negative old_size with a live runlist is the
+ * dangerous case -- the old code would memcpy the wrapped size -- so
+ * it is covered by the same check (same helper, same first lines),
+ * not by crashing the test binary. No fixture needed: this calls
+ * ntfs_rl_realloc() directly.
+ */
+static void test_rl_realloc_overflow(void)
+{
+	struct runlist_element *rl, *r2;
+
+	printf("test_rl_realloc_overflow\n");
+	/* Positive control: a normal realloc preserves contents. */
+	rl = ntfs_rl_realloc(NULL, 0, 4);
+	CHECK(rl != NULL && !IS_ERR(rl));
+	if (!rl || IS_ERR(rl))
+		return;
+	rl[0].vcn = 11; rl[0].lcn = 22; rl[0].length = 33;
+	rl[1].vcn = 44; rl[1].lcn = 55; rl[1].length = 66;
+	/* Same size returns the original pointer. */
+	CHECK_EQ(ntfs_rl_realloc(rl, 4, 4), rl, "same-size realloc");
+	r2 = ntfs_rl_realloc(rl, 4, 8);
+	CHECK(r2 != NULL && !IS_ERR(r2));
+	if (r2 && !IS_ERR(r2)) {
+		CHECK_EQ(r2[0].vcn, 11, "preserved vcn[0]");
+		CHECK_EQ(r2[0].lcn, 22, "preserved lcn[0]");
+		CHECK_EQ(r2[0].length, 33, "preserved length[0]");
+		CHECK_EQ(r2[1].vcn, 44, "preserved vcn[1]");
+		CHECK_EQ(r2[1].lcn, 55, "preserved lcn[1]");
+		CHECK_EQ(r2[1].length, 66, "preserved length[1]");
+		kvfree(r2);
+	} else {
+		kvfree(rl);
+	}
+	/* Negative counts: -EINVAL with the fix. */
+	r2 = ntfs_rl_realloc(NULL, 0, -1);
+	CHECK(IS_ERR(r2));
+	if (IS_ERR(r2))
+		CHECK_EQ(PTR_ERR(r2), -EINVAL, "negative new_size");
+	r2 = ntfs_rl_realloc(NULL, -1, 0);
+	CHECK(IS_ERR(r2));
+	if (IS_ERR(r2))
+		CHECK_EQ(PTR_ERR(r2), -EINVAL, "negative old_size");
+}
+
 int main(void)
 {
 	static const struct { void (*fn)(void); const char *name; } groups[] = {
@@ -1964,6 +2026,7 @@ int main(void)
 					 "failed_rewrite" },
 		{ test_mapping_pairs_bounds,	 "mapping_pairs_bounds" },
 		{ test_empty_mapping_pairs,	 "empty_mapping_pairs" },
+		{ test_rl_realloc_overflow,	 "rl_realloc_overflow" },
 	};
 
 	/* Per-group counts, so a group that silently stopped checking anything

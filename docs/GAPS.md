@@ -625,6 +625,35 @@ Porting progress (one commit per item, in the order above):
   corrupt. Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all`
   265 passed 0 failed with NTFS_REQUIRE_FSCK=1.
   44 port items remain.
+- 2026-11-26: `8bed376124ab` (harden runlist realloc size
+  calculations) — ported: `ntfs_rl_realloc()` and
+  `ntfs_rl_realloc_nofail()` in `core/ntfs/runlist.c` multiplied the
+  element counts by sizeof(*rl) in int and stored the product back
+  into an int, so a negative count wrapped to a huge size_t and the
+  memcpy that follows used the wrapped size. Both now go through a
+  shared static inline `ntfs_rl_realloc_gfp()` helper that rejects
+  negative counts with -EINVAL before allocating anything and checks
+  both multiplies with check_mul_overflow (already in the port's
+  overflow.h, already used by the mapping-pairs decoder). New test
+  `test_rl_realloc_overflow` in `core/tests/test_compress.c` calls
+  `ntfs_rl_realloc()` directly (no fixture): positive control (4 -> 8
+  elements preserves contents, same-size returns the original
+  pointer) plus the discriminating negative counts.
+  Note: the overflow check itself cannot be tripped through this
+  interface on a 64-bit size_t -- an int count x 24 bytes always fits,
+  verified with a scratch program (__builtin_mul_overflow(INT_MAX, 24,
+  &size_t) reports no overflow) -- so no INT_MAX case: in the new code
+  it would attempt kvzalloc(51 GiB), and in the old code it returns
+  -ENOMEM either way. The dangerous case is a negative old_size with
+  a live runlist (old code memcpys the wrapped size); it is covered
+  by the same check (same helper, same first lines), not by crashing
+  the test binary. Evidence: test_compress 491 checks 0 failures with
+  the fix (rl_realloc_overflow 13 checks); without it exactly 2
+  failures -- negative new_size returns -ENOMEM (-12) instead of
+  -EINVAL (-22), and negative old_size succeeds (kvzalloc(0)).
+  Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265 passed
+  0 failed with NTFS_REQUIRE_FSCK=1.
+  43 port items remain.
 
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
