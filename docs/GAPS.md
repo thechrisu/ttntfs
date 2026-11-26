@@ -1601,6 +1601,34 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (697 s, slow under load).
   7 port items remain.
 
+- 2026-11-26: `3e497af63725` (propagate compression context
+  allocation errors) — ported, verbatim. `ntfs_compress_block()`
+  returned `unsigned int`, so its `return -ENOMEM` on kvzalloc
+  failure truncated to a huge positive size, and the caller
+  (`ntfs_write_cb()`, core/ntfs/compress.c) only tested `!sz` — a
+  real allocation failure under memory pressure would have been
+  read as a successful giant compression and fed into the size
+  math. Now the function returns `int` (doc: "A negative error code
+  if an error has been met"), the caller declares `int sz;` and
+  returns `err = sz; goto out;` when `sz < 0`. No new test,
+  honestly: the error path needs kvzalloc() to fail inside
+  `ntfs_compress_block()`, and the harness has no
+  allocation-failure injection (test_faults.c injects device I/O
+  faults only); the function is static with a single caller, so
+  nothing reachable can force the path.
+  Crash/disconnect at the worst instant: on allocation failure the
+  write now fails cleanly with -ENOMEM instead of writing garbage
+  sized by a truncated error code; a crash mid-write still leaves
+  either the old block or nothing new (the old block is not punched
+  out until the new block is safe — upstream eb67671cd814 ordering,
+  already in the tree), so no torn mixture is ever presented as
+  good data.
+  Evidence (this commit): plain ctest 15/15 (70 s), UBSan ctest
+  15/15 (65 s), ASan ctest 15/15 (68 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (266 s).
+  6 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
