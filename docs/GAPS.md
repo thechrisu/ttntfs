@@ -1346,6 +1346,29 @@ Porting progress (one commit per item, in the order above):
   before the ladder, and the dry-run file list before pushing).
   13 port items remain.
 
+- 2026-11-26: `71feaa7686fb` (apply Windows name checks only
+  with windows_names) — ported, upstream's reorder verbatim in
+  `ntfs_check_bad_windows_name()` (core/vfs/namei.c): the
+  `NVolCheckWindowsNames` early return now precedes
+  `ntfs_check_bad_char()`, so `:` etc. are no longer rejected on
+  a mount without `windows_names`. No new test: no discriminating
+  test is possible through the public harness — the only caller
+  is `ntfs_vfs_validate_uname()`, which already returns 0 when
+  the flag is clear (core/vfs/namei.c:1091), so the upstream bug
+  was already masked at every reachable path, and the function
+  takes the internal `struct ntfs_volume *`, which tests cannot
+  construct (opaque handle). Verified empirically both ways:
+  test_names 471 checks, 0 failures with the fix and with the
+  fix reverted; the existing `test_windows_illegal_allowed`
+  coverage (`co:lon.txt` created on an allowillegal mount) passes
+  on old code too. Applied for upstream fidelity, same "no new
+  test, port note explains why" precedent as 4e646ecd4475 /
+  88496c4ac5a6.
+  Evidence (this commit): plain ctest 15/15, UBSan ctest 15/15,
+  ASan ctest PASS (120 s), `run-tests.sh all` 265 passed 0 failed
+  with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS (367 s).
+  12 port items remain.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
