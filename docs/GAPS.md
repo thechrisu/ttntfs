@@ -1784,6 +1784,51 @@ Porting progress (one commit per item, in the order above):
   (203 s).
   2 port items remain.
 
+- 2026-11-26: `8cd2bf1d7af9` (reuse compression output
+  workspace across write units) — ported. `ntfs_write_cb()`
+  allocated output pages and created input and output vmaps for
+  every compression unit. Now one output workspace (output pages
+  + one vmap) is allocated per write request, input sub-blocks
+  are read straight from their folios via kmap_local_page(), and
+  the incompressible path copies the unit into the workspace with
+  `ntfs_copy_cb()`; the bdev write always writes ws->outbuf.
+  Port adaptations (upstream's version is bio-based, the port
+  writes via ntfs_bdev_write): no page_offset in the port, so
+  ntfs_copy_cb takes no offset and the input offset is just p;
+  the port's vmap is a copy, so the old code paid a full 64 KiB
+  copy-in per unit plus a copy-back on vunmap — the new code
+  avoids both, which is why the gain here is larger than
+  upstream's. The workspace is freed in ntfs_compress_write()'s
+  out:, never by ntfs_write_cb; the all-zeroes punch-hole path is
+  untouched.
+  Measured, not asserted: same scratch benchmark (256 MiB image,
+  16 MiB writes, 5 reps each, fresh image per rep) —
+  incompressible (random data, exercises ntfs_copy_cb) old median
+  664 ms (664.4 / 706.4 / 791.2 / 610.2 / 569.4), new median
+  358 ms (357.5 / 389.9 / 350.7 / 346.4 / 452.6), ~1.9x faster,
+  ranges do not overlap; compressible old median 110 ms (102.9 /
+  112.0 / 110.2 / 124.0 / 105.5), new median 73 ms (94.1 / 71.7 /
+  72.6 / 74.5 / 70.8), ~1.5x on medians — with the caveat that
+  this shared box's load swings ±15% between windows, so the
+  compressible figure is stated with that caveat (an interleaved
+  A/B run in a loaded window still favoured the new code 2 of 3
+  pairs). The benchmark verifies byte-exact read-back after a
+  remount on every rep, both modes.
+  Crash/disconnect at the worst instant: the write order and
+  on-disk layout are unchanged — the same bytes are written to
+  the same clusters in the same order; only where the bytes sit
+  in memory before the write changed (workspace buffer instead
+  of two per-unit vmaps). A crash mid-write still leaves either
+  the old block or nothing new (the old block is not punched out
+  until the new block is safe). A workspace allocation failure
+  fails the whole write request with -ENOMEM before any unit is
+  touched.
+  Evidence (this commit): plain ctest 15/15 (60 s), UBSan ctest
+  15/15 (61 s), ASan ctest 15/15 (70 s), `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1, pre-push 9/9 PASS
+  (196 s).
+  1 port item remains.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo
