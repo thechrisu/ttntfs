@@ -772,6 +772,45 @@ Porting progress (one commit per item, in the order above):
   NTFS_REQUIRE_FSCK=1.
   39 port items remain.
 
+- 2026-11-26: `8efe00b098b5` + `ba1b61ddaa76` (error codes collapsed
+  to -EIO / literal -1) — ported: `ntfs_resident_attr_record_add()`
+  returned -EIO for every failure at its put_err_out label, which
+  defeated the -ENOSPC resident-to-non-resident fallback in
+  `ntfs_attr_add()` — a big EA set on a file with no $EA could never
+  convert to non-resident and always failed -EIO; and
+  `ntfs_non_resident_attr_record_add()` returned the literal -1,
+  propagated as -EPERM to userspace. Both now return err (one line
+  each, verbatim upstream). New test `test_attr_add_enospc_fallback`
+  in `core/tests/test_links.c`: sets an 8 KiB EA on /files/sz/0 in
+  basic-4k.img, a fixture file with no $EA, so `ntfs_set_ea()` takes
+  the `ntfs_attr_add()` path and the ~8.2 KiB resident record fits in
+  no record — the fallback must convert it. Evidence: test_links 701
+  checks 0 failures with the fix; without it exactly 2 failures, the
+  set returning -EIO (-5). The non-resident hunk has no behavioural
+  test (its put_err_out is unreachable through the public API: the
+  non-resident record is ~80 bytes and `ntfs_attr_add()` only calls
+  it on a record it already checked has room); proven by the verbatim
+  diff. Plain ctest 15/15, UBSan ctest 15/15, `run-tests.sh all` 265
+  passed 0 failed with NTFS_REQUIRE_FSCK=1.
+  37 port items remain.
+
+- 2026-11-26: **Found during porting** (not in the upstream drift —
+  present in upstream v7.1, no fix in the v7.1→v7.3 drift):
+  `ntfs_set_ea()` clears the HasEA flag when creating the first $EA
+  on a file that has none. The local `ea_info_qsize` is never updated
+  on the create path (only `p_ea_info->ea_query_length` is), so the
+  out: label sees 0 and calls NInoClearHasEA even though the $EA was
+  just created; a same-mount getxattr then returns -ENODATA until
+  remount (the inode reload sets HasEA from the on-disk $EA). Found
+  while writing `test_attr_add_enospc_fallback`: the set returns 0
+  and the remount read-back is correct, but the same-mount get fails
+  -ENODATA. The fix is one line (`ea_info_qsize += new_ea_size;`
+  after the ea_query_length update in core/ntfs/ea.c); it is a
+  separate commit after this port, not part of it. Related but
+  different: `ac727d86fb84` (still in the queue) guards the flag
+  update with `if (!err)` on failure paths; it does not fix this
+  create-path staleness.
+
 ### 5.4 Homebrew cask not in homebrew-cask proper — open, needs stars
 The cask lives in the maintainer's tap; homebrew-cask proper wants
 ~75 stars (notability bar). Nothing to code — it clears when the repo

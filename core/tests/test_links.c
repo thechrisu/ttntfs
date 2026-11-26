@@ -2893,6 +2893,131 @@ static void test_readall_error_propagates(void)
 }
 
 /*
+ * Upstream 8efe00b098b5 + ba1b61ddaa76: ntfs_resident_attr_record_add()
+ * collapsed every failure to -EIO at its put_err_out label, and
+ * ntfs_non_resident_attr_record_add() returned the literal -1
+ * (propagated as -EPERM to userspace). Both now return err.
+ *
+ * The resident collapse defeated the resident-to-non-resident
+ * fallback in ntfs_attr_add(), which relies on seeing -ENOSPC to
+ * convert the attribute when the MFT record has no room. The
+ * trigger is a first EA on a file with no $EA at all: ntfs_set_ea()
+ * calls ntfs_attr_add(AT_EA, ..., new_ea_size) with the value, and
+ * for an 8 KiB value the resident record (~8.2 KiB) fits in no
+ * record -- not even a fresh extent -- so the resident add fails
+ * -ENOSPC and the fallback must convert it to non-resident.
+ * Without the fix the set fails with -EIO; with it, it succeeds
+ * and the EA reads back byte-for-byte after a remount (same-mount
+ * read-back is broken by a separate HasEA bug, see below).
+ *
+ * The file must come from the fixture, not ntfs_create(): driver-
+ * created files already carry the three hidden WSL EAs, so their
+ * $EA exists and the set goes through ntfs_write_ea() instead.
+ * /files/sz/0 in basic-4k.img was created by mkfixtures/libntfs-3g
+ * and has no $EA (the get returns -ENODATA before the set).
+ * No fsck_clean: the image is driver-modified scratch, and the
+ * remount read-back is the assertion that matters.
+ *
+ * The non-resident hunk (ba1b61ddaa76) has no behavioural test:
+ * the non-resident record is ~80 bytes and ntfs_attr_add only
+ * calls it on a record it already checked has room, so its
+ * put_err_out is unreachable through the public API; it is proven
+ * by the verbatim one-line diff, per the round-8 precedent.
+ */
+static void test_attr_add_enospc_fallback(void)
+{
+	static char val8k[8192];
+	struct vol v;
+	ntfs_inode_t *files = NULL, *sz = NULL, *f = NULL;
+	char buf[8192];
+	int err;
+
+	printf("test_attr_add_enospc_fallback\n");
+	memset(val8k, 'B', sizeof(val8k));
+	if (copy_fixture("attr-add-fallback") != 0) {
+		fprintf(stderr, "SKIP test_attr_add_enospc_fallback: no fixture\n");
+		return;
+	}
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_attr_add_enospc_fallback: mount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "SKIP test_attr_add_enospc_fallback: lookup failed\n");
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* Sanity: the fixture file has no $EA yet. */
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	CHECK(err == -ENODATA);
+	if (err != -ENODATA) {
+		fprintf(stderr, "SKIP test_attr_add_enospc_fallback: fixture file already has an EA (get=%d)\n", err);
+		ntfs_inode_put(f);
+		ntfs_inode_put(sz);
+		ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	/* New: the resident add fails -ENOSPC and the fallback converts
+	 * the $EA to non-resident. Old: the collapse turns it into -EIO
+	 * and the set fails. */
+	err = ea_set(f, "user.big", val8k, sizeof(val8k));
+	CHECK(err == 0);
+	if (err != 0)
+		fprintf(stderr, "FAIL ea set with 8 KiB value: returned %d, expected 0\n", err);
+	/* No same-mount get here: it is broken by a separate bug
+	 * (ntfs_set_ea() clears HasEA when creating the first $EA --
+	 * the local ea_info_qsize is never updated on the create path,
+	 * so the out: label clears the flag even though the $EA was
+	 * just created; the get then returns -ENODATA until remount).
+	 * Recorded in GAPS.md §5.3 as a porting-found item; the
+	 * remount read-back below is the assertion that matters. */
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	f = sz = files = NULL;
+	vol_down(&v);
+
+	/* Remount: the non-resident $EA has to parse back. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "SKIP test_attr_add_enospc_fallback: remount failed\n");
+		unlink(scratch);
+		return;
+	}
+	if (ntfs_lookup(v.root, "files", &files) != 0 || !files ||
+	    ntfs_lookup(files, "sz", &sz) != 0 || !sz ||
+	    ntfs_lookup(sz, "0", &f) != 0 || !f) {
+		fprintf(stderr, "FAIL test_attr_add_enospc_fallback: lookup after remount failed\n");
+		failures++; checks++;
+		if (f) ntfs_inode_put(f);
+		if (sz) ntfs_inode_put(sz);
+		if (files) ntfs_inode_put(files);
+		vol_down(&v);
+		unlink(scratch);
+		return;
+	}
+	err = ea_get(f, "user.big", buf, sizeof(buf));
+	CHECK(err == 8192);
+	if (err == 8192)
+		CHECK(memcmp(buf, val8k, sizeof(val8k)) == 0);
+	if (err != 8192)
+		fprintf(stderr, "FAIL ea get after remount: returned %d, expected 8192\n", err);
+	ntfs_inode_put(f);
+	ntfs_inode_put(sz);
+	ntfs_inode_put(files);
+	vol_down(&v);
+	unlink(scratch);
+}
+
+/*
  * Upstream 5b6eedd7cc29: ntfs_icx_ib_sync_write() called
  * post_write_mst_fixup() when ntfs_ib_write() returned an error,
  * intending to restore the buffer after a failed write. But
@@ -3023,6 +3148,7 @@ int main(void)
 	test_nonres_attr_validation();
 	test_ea_final_size_validated();
 	test_readall_error_propagates();
+	test_attr_add_enospc_fallback();
 	test_ib_sync_write_no_post_fixup();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
