@@ -182,8 +182,17 @@ stage_swift() {
 stage_build_app() {
 	command -v xcodebuild >/dev/null 2>&1 || { echo "no xcodebuild"; return 1; }
 	local dd="${DERIVED_DATA:-/tmp/ttntfs-ci-dd}"
+	# ARCHS is explicit on the command line, not just in
+	# fskit/Config/Shared.xcconfig: the macos-26-arm64 runner image
+	# update 20261117 -> 20261123 (2026-11-26/27) started producing
+	# arm64-only app binaries (BUILD SUCCEEDED, then the universal
+	# check failed `missing x86_64 slice`, three runs in a row) with
+	# identical project settings. Command-line settings override any
+	# image-default arch resolution; the xcconfig stays the single
+	# source of truth for the project itself.
 	xcodebuild -project fskit/NTFS.xcodeproj -scheme NTFS -configuration Debug \
 		-derivedDataPath "$dd" \
+		ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
 		CODE_SIGNING_ALLOWED=NO build \
 		2>&1 | grep -E '^\*\* BUILD|error:' | tail -4
 	[ "${PIPESTATUS[0]}" -eq 0 ] || return 1

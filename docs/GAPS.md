@@ -523,6 +523,21 @@ asm in the tree is the arch-neutral `barrier()` memory clobber, and
 `tools/check-darwin.sh` already preprocesses the whole C tree for
 x86_64-apple-darwin.
 
+Runner-image regression (2026-11-27): the macos-26-arm64 image
+update 20261117.0526.1 -> 20261123.0526.1 started producing
+arm64-only app binaries — `** BUILD SUCCEEDED **` then the
+universal check failed `missing x86_64 slice`, three runs in a
+row (push attempts 1–3 of ff859eab, plus the mount-test dispatch
+run), with identical project settings and the same Xcode 26.6.
+All test stages stayed green in every run (fixtures 265/0/0,
+Swift 0 failures, ASan green), so this is a CI-environment
+break, not a code break. Fix (this commit): `ARCHS="arm64
+x86_64" ONLY_ACTIVE_ARCH=NO` is now also explicit on the
+`stage_build_app` xcodebuild command line in `tools/ci.sh` —
+command-line settings override any image-default arch
+resolution; the xcconfig stays the single source of truth for
+the project itself. Validated only by CI (no macOS here).
+
 Still open: nothing has ever *run* on Intel hardware — the universal
 build is verified by compilation and `lipo` on the arm64 runner only.
 Reopened as active work by the owner's industry-leading bar (2026-11-26):
