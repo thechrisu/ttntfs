@@ -1085,7 +1085,20 @@ failed-set negative control; walk counts + op sequence, $EA stream
 redo/undo whole values, $EA_INFORMATION ea_query_length agreeing
 with the stream lengths, replay redoes only the idempotent
 records; values correct after replay + mount; `ntfsck` clean).
-Crash tests in the follow-up commit. Follow-ups, not this class:
+Crash tests landed in the follow-up commit (this round): six
+cut-point sweeps in core/tests/test_crash.c, one per EA op shape —
+create, replace-grow, replace-shrink and remove on a file, plus
+create and teardown on the root directory (the only inode that
+exercises the CreateAttribute ×2 / DeleteAttribute ×2 paths, since
+a driver-made file already carries $LX*). Per cut: pre-replay
+ntfsck + allocation coverage, replay, post-replay ntfsck +
+coverage + remount EA read + second replay no-op. The sweeps
+found no bug. Evidence: `test_crash` 7641 checks, 0 failures (was
+5791): 229 cut points, 12 inconsistent before replay, 0 still bad
+after it; EA all-old 48 times, all-new 181 times. The $LXMOD entry
+is asserted present after every replay on the file sweeps — the
+whole $EA stream redoes/undoes as one value, so a torn stream
+would lose it. Follow-ups, not this class:
 the xattr class's $SI snapshot comes from the mapped record, a
 latent one-step-too-far undo on $SI ctime/flags when two xattr
 transactions run without a sync between them; the handler's flags

@@ -63,6 +63,7 @@
 #include "ntfscore.h"
 #include "ntfsport/bdev.h"
 #include "ntfs_image.h"
+#include <linux/xattr.h>
 
 static int failures, checks;
 #define CHECK(cond) do {						\
@@ -4322,6 +4323,609 @@ static void test_journaled_symlink_dir_cut_points(void)
 	sweep_symlink_cut_points(SYMLINK_DIR);
 }
 
+/* ---- EA ------------------------------------------------------------ */
+
+/* The EA handler (ntfs_xattr_handlers[0]) is the $EA path; the public
+ * ntfs_setxattr() stores xattrs as ADS and never reaches
+ * ntfs_set_ea(). Drive the handler directly, the test_links.c /
+ * test_journal.c pattern. ea_remove passes XATTR_REPLACE with a NULL
+ * value, the handler's remove path. */
+extern const struct xattr_handler *const ntfs_xattr_handlers[];
+
+static int ea_crash_set(ntfs_inode_t *f, const char *name, const void *val,
+			size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, 0);
+}
+
+static int ea_crash_remove(ntfs_inode_t *f, const char *name)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, NULL, 0,
+		      XATTR_REPLACE);
+}
+
+static int ea_crash_get(ntfs_inode_t *f, const char *name, void *buf,
+			size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->get(h, NULL, (struct inode *)f, name, buf, size);
+}
+
+enum ea_op {
+	EA_CREATE,         /* set user.a = "abc" on d/j.txt (pair exists: $LX*) */
+	EA_REPLACE_GROW,   /* user.a "abc" -> "abcdef" on d/j.txt */
+	EA_REPLACE_SHRINK, /* user.a "abcdef" -> "abc" on d/j.txt */
+	EA_REMOVE,         /* remove user.a from d/j.txt (pair stays: $LX*) */
+	EA_CREATE_ROOT,    /* set user.a = "abc" on the root (pair created) */
+	EA_REMOVE_ROOT,    /* remove user.a from the root (pair torn down) */
+};
+
+static const char *ea_op_tag(enum ea_op op)
+{
+	switch (op) {
+	case EA_CREATE:         return "ea-create";
+	case EA_REPLACE_GROW:   return "ea-replace-grow";
+	case EA_REPLACE_SHRINK: return "ea-replace-shrink";
+	case EA_REMOVE:         return "ea-remove";
+	case EA_CREATE_ROOT:    return "ea-create-root";
+	case EA_REMOVE_ROOT:    return "ea-remove-root";
+	}
+	return "ea-unknown";
+}
+
+static bool ea_is_root(enum ea_op op)
+{
+	return op == EA_CREATE_ROOT || op == EA_REMOVE_ROOT;
+}
+
+/* The base for a create op carries no user EA; a replace/remove op
+ * carries the old value, flushed cleanly at base creation so the
+ * all-old outcome has known content. */
+static int ea_base_ea(enum ea_op op, const void **val, size_t *len)
+{
+	switch (op) {
+	case EA_CREATE:
+	case EA_CREATE_ROOT:
+		*val = NULL;
+		*len = 0;
+		return 0;
+	case EA_REPLACE_GROW:
+	case EA_REMOVE:
+	case EA_REMOVE_ROOT:
+		*val = "abc";
+		*len = 3;
+		return 0;
+	case EA_REPLACE_SHRINK:
+		*val = "abcdef";
+		*len = 6;
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int make_ea_base(const char *path, enum ea_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *d, *f;
+	const void *xval = NULL;
+	size_t xlen = 0;
+	u8 *buf;
+	int err;
+
+	if (ea_base_ea(op, &xval, &xlen) != 0)
+		return -EINVAL;
+	if (make_image(path) != 0)
+		return -EIO;
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) { ntfs_bdev_close(dev); return err; }
+	err = ntfs_volume_root(vol, &root);
+	if (!err) {
+		if (ea_is_root(op)) {
+			/* The root is the inode under test; a
+			 * driver-made volume guarantees it has no $EA
+			 * pair, so the create/teardown cases live here. */
+			if (xval)
+				err = ea_crash_set(root, "user.a", xval,
+						   xlen);
+		} else {
+			err = ntfs_mkdir(root, "d", 0100755, &d);
+			if (!err) {
+				err = ntfs_create(d, "j.txt", 0100644, &f);
+				if (!err) {
+					buf = malloc(256 * 1024);
+					if (!buf) {
+						err = -ENOMEM;
+					} else {
+						memset(buf, 'z', 256 * 1024);
+						if (ntfs_write(f, buf,
+							       256 * 1024, 0) !=
+						    256 * 1024)
+							err = -EIO;
+						free(buf);
+					}
+					/* ntfs_create wrote the three $LX*
+					 * entries; the base EA sits beside
+					 * them in the same stream. */
+					if (!err && xval)
+						err = ea_crash_set(f, "user.a",
+								   xval, xlen);
+					ntfs_inode_put(f);
+				}
+				ntfs_inode_put(d);
+			}
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+static int ea_run_op(ntfs_inode_t *f, enum ea_op op)
+{
+	switch (op) {
+	case EA_CREATE:
+	case EA_CREATE_ROOT:
+		return ea_crash_set(f, "user.a", "abc", 3);
+	case EA_REPLACE_GROW:
+		return ea_crash_set(f, "user.a", "abcdef", 6);
+	case EA_REPLACE_SHRINK:
+		return ea_crash_set(f, "user.a", "abc", 3);
+	case EA_REMOVE:
+	case EA_REMOVE_ROOT:
+		return ea_crash_remove(f, "user.a");
+	}
+	return -EINVAL;
+}
+
+/* The EA run: mount the base, do the one EA op, sync, unmount. The
+ * write budget caps the run at @limit writes, so a cut point is a
+ * crash after exactly that many writes. */
+static long crash_run_ea_journaled(const char *path, long limit,
+				   enum ea_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ea_is_root(op)) {
+			ea_run_op(root, op);
+		} else if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "j.txt", &f) == 0) {
+				ea_run_op(f, op);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+struct ea_aftermath {
+	bool mounts;
+	bool present;
+	size_t len;
+	/* A file's $LXMOD must survive: the whole $EA stream redoes /
+	 * undoes as one value, so a torn stream would lose it. The
+	 * root carries no $LX* entries, so this is false there. */
+	bool lxmod_present;
+};
+
+/* Read the EA off a (read-only) remount. A missing EA is -ENODATA,
+ * reported as present = false. */
+static struct ea_aftermath ea_remount(const char *path, enum ea_op op,
+				      void *buf, size_t bufsz)
+{
+	struct ea_aftermath a = { 0 };
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	size_t len = 0;
+	char lxbuf[8];
+	int err;
+
+	dev = ntfs_bdev_open_path(path, true);
+	if (!dev)
+		return a;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return a;
+	}
+	a.mounts = true;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ea_is_root(op)) {
+			f = root;
+		} else if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "j.txt", &f) != 0)
+				f = NULL;
+		}
+		if (f) {
+			err = ea_crash_get(f, "user.a", buf, bufsz);
+			if (err >= 0) {
+				a.present = true;
+				a.len = (size_t)err;
+			}
+			/* $LXMOD is read through the same handler;
+			 * the root has none, so this is file-only. */
+			if (!ea_is_root(op)) {
+				err = ea_crash_get(f, "$LXMOD", lxbuf,
+						   sizeof(lxbuf));
+				if (err >= 0)
+					a.lxmod_present = true;
+			}
+		}
+		if (d)
+			ntfs_inode_put(d);
+		ntfs_inode_put(root);
+	}
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	(void)len;
+	return a;
+}
+
+/* Classify a probed EA as the all-old or the all-new outcome. The
+ * $EA value is resident, so it redoes whole — all-old or all-new,
+ * never a half-written stream — and its content is asserted both
+ * ways. */
+static void ea_classify(enum ea_op op, struct ea_aftermath *a,
+			const void *buf, bool *is_old, bool *is_new)
+{
+	*is_old = false;
+	*is_new = false;
+	switch (op) {
+	case EA_CREATE:
+	case EA_CREATE_ROOT:
+		*is_old = !a->present;
+		*is_new = a->present && a->len == 3 &&
+			  memcmp(buf, "abc", 3) == 0;
+		break;
+	case EA_REPLACE_GROW:
+		*is_old = a->present && a->len == 3 &&
+			  memcmp(buf, "abc", 3) == 0;
+		*is_new = a->present && a->len == 6 &&
+			  memcmp(buf, "abcdef", 6) == 0;
+		break;
+	case EA_REPLACE_SHRINK:
+		*is_old = a->present && a->len == 6 &&
+			  memcmp(buf, "abcdef", 6) == 0;
+		*is_new = a->present && a->len == 3 &&
+			  memcmp(buf, "abc", 3) == 0;
+		break;
+	case EA_REMOVE:
+	case EA_REMOVE_ROOT:
+		*is_old = a->present && a->len == 3 &&
+			  memcmp(buf, "abc", 3) == 0;
+		*is_new = !a->present;
+		break;
+	}
+}
+
+/* The EA sweep. Same shape as the xattr sweep, but the operation is
+ * one journaled EA set/remove through the VFS handler: a cut before
+ * the commit must replay to the old EA (or absence), a cut after it
+ * to the new one — either way ntfsck-clean, and the EA after replay
+ * is all-old or all-new, never a mix (the $SI and the $EA pair are
+ * one transaction). */
+static void sweep_ea_cut_points(enum ea_op op)
+{
+	char base[1024], work[1024], probe[1024];
+	const char *tag = ea_op_tag(op);
+	struct ea_aftermath old_a;
+	static char probe_buf[256];
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+
+	scratch_path(base, sizeof(base), "ea-base");
+	scratch_path(work, sizeof(work), "ea-work");
+	scratch_path(probe, sizeof(probe), "ea-probe");
+	if (make_ea_base(base, op) != 0) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"mkntfs unavailable\n", tag);
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"ntfsck unavailable at '%s'\n", tag, ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	/* The old EA state, read off a probe copy so the base stays
+	 * untouched. */
+	if (copy_file(base, probe) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	old_a = ea_remount(probe, op, probe_buf, sizeof(probe_buf));
+	unlink(probe);
+	if (!old_a.mounts) { FAILF("the base does not mount\n"); unlink(base); return; }
+	{
+		bool is_old, is_new;
+
+		ea_classify(op, &old_a, probe_buf, &is_old, &is_new);
+		if (!is_old) {
+			failures++;
+			fprintf(stderr, "FAIL: the base EA is not in the old "
+					"state (present %d len %zu)\n",
+				(int)old_a.present, old_a.len);
+			unlink(base);
+			return;
+		}
+		/* A file base must carry its $LX* entries; the op
+		 * under test never touches them, so they must still
+		 * be there after every replay. */
+		if (!ea_is_root(op) && !old_a.lxmod_present) {
+			failures++;
+			fprintf(stderr, "FAIL: the base file has no $LXMOD "
+					"— ntfs_create did not write $LX*\n");
+			unlink(base);
+			return;
+		}
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_ea_journaled(work, LONG_MAX, op);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-%s-uncrashed.img", tmpdir, tag);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled EA op made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  EA present/len\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct ea_aftermath a;
+		struct geometry g;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		bool pre_bad, post_bad, is_old, is_new;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_ea_journaled(work, cut, op);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-cut-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-replayed-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = ea_remount(work, op, probe_buf, sizeof(probe_buf));
+		ea_classify(op, &a, probe_buf, &is_old, &is_new);
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s/%zu\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.present ? "present" : "absent", a.len);
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+				tag, cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+				tag, cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+				tag, cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+				tag, cut, (unsigned long long)bad_ino,
+				(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the "
+					"volume no longer mounts after replay\n",
+				tag, cut);
+		}
+		checks++;
+		if (a.mounts && !is_old && !is_new) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the EA "
+					"is present %d len %zu after replay — neither "
+					"all-old nor all-new\n",
+				tag, cut, (int)a.present, a.len);
+		}
+		checks++;
+		if (!ea_is_root(op) && a.mounts && !a.lxmod_present) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: $LXMOD "
+					"is gone after replay — the $EA stream "
+					"did not redo/undo whole\n",
+				tag, cut);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+				tag, cut, err_rep2, an2.records_redone,
+				an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; EA all-old %d times, all-new %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_%s_cut_points\n", tag);
+}
+
+static void test_journaled_ea_create_cut_points(void)
+{
+	sweep_ea_cut_points(EA_CREATE);
+}
+
+static void test_journaled_ea_replace_grow_cut_points(void)
+{
+	sweep_ea_cut_points(EA_REPLACE_GROW);
+}
+
+static void test_journaled_ea_replace_shrink_cut_points(void)
+{
+	sweep_ea_cut_points(EA_REPLACE_SHRINK);
+}
+
+static void test_journaled_ea_remove_cut_points(void)
+{
+	sweep_ea_cut_points(EA_REMOVE);
+}
+
+static void test_journaled_ea_create_root_cut_points(void)
+{
+	sweep_ea_cut_points(EA_CREATE_ROOT);
+}
+
+static void test_journaled_ea_remove_root_cut_points(void)
+{
+	sweep_ea_cut_points(EA_REMOVE_ROOT);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -4345,6 +4949,12 @@ int main(void)
 	test_journaled_symlink_win_cut_points();
 	test_journaled_symlink_wsl_cut_points();
 	test_journaled_symlink_dir_cut_points();
+	test_journaled_ea_create_cut_points();
+	test_journaled_ea_replace_grow_cut_points();
+	test_journaled_ea_replace_shrink_cut_points();
+	test_journaled_ea_remove_cut_points();
+	test_journaled_ea_create_root_cut_points();
+	test_journaled_ea_remove_root_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
