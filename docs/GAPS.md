@@ -513,16 +513,31 @@ fails `-EINVAL` on the undecodable pairs. Driver test
 `test_journal.c` updated to 16 records with sizes assertions (95
 checks, 0 failures), including that the logged total is 0, not
 the pairs bytes. Crash sweep after fix 2: 379 checks, 2 failures
-— only cut 46 remains (see below). Still to do in step 3: fix 3
-(analysis counts a phantom active transaction when a close
-checkpoint's table dumps re-allocate the just-freed
-transaction-table entry — benign for state, wrong accounting),
-fix 4 (cut 46: the unmount clears the dirty flag in `$MFT`
-record 3 and its mirror sync is a separate bio, so a crash
-between them leaves `$MFTMirr` stale by one flag bit and the
-replay never heals it — the replay must sync the mirror for
-records 0–3 it did not itself touch), then the crash sweep
-itself, which lands when it goes green.
+— only cut 46 remains (see below). Fix 3, landed 2026-11-27 (commit, this round): the analysis pass
+skips transaction-table upkeep for table dumps. The dumps carry the
+last transaction's tid by construction (`lw_dump_table` appends with
+0x18) but they are snapshots of the tables, not transaction
+activity; a dump that lands after its transaction was forgotten —
+the close checkpoint's dumps, when the crash cut the close before
+its restart record — re-allocated the freed entry as ACTIVE and
+reported a phantom active transaction with nothing to undo
+(`transactions_active=1`, `records_undone=0` at cuts 43–49). New
+helper `op_is_table_dump` in `core/logfile/logfile_replay.c`; the
+upkeep block is skipped for the four dump ops (the dumps hit the
+switch's default case and are handled by the checkpoint-load path,
+so they need no upkeep). New unit test
+`test_journal_create_close_dumps_no_phantom` (logfile suite 4989
+checks, 0 failures): a dump appended after the Forget with the
+transaction's tid, no checkpoint after it — the crash-mid-close
+state — replays with `transactions_active=0`, `records_undone=0`;
+negative control (guard forced true) fails with
+`transactions_active=1`. The crash sweep's cuts 43–49 now report
+`active 0`. Still to do in step 3: fix 4 (cut 46: the unmount
+clears the dirty flag in `$MFT` record 3 and its mirror sync is a
+separate bio, so a crash between them leaves `$MFTMirr` stale by
+one flag bit and the replay never heals it — the replay must sync
+the mirror for records 0–3 it did not itself touch), then the crash
+sweep itself, which lands when it goes green.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

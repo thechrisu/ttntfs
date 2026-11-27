@@ -925,6 +925,22 @@ static bool op_is_attr(uint16_t op)
 	}
 }
 
+/* The four table dumps (LOGFILE.md §3 step 4): snapshots of the
+ * restart tables, appended by the writer with the last
+ * transaction's tid. They are not transaction activity. */
+static bool op_is_table_dump(uint16_t op)
+{
+	switch (op) {
+	case LOP_OpenAttributeTableDump:
+	case LOP_AttributeNamesDump:
+	case LOP_DirtyPageTableDump:
+	case LOP_TransactionTableDump:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static bool can_skip_action(uint16_t op)
 {
 	switch (op) {
@@ -1524,21 +1540,35 @@ static int analysis_pass(struct replay *r, uint64_t *rlsn_out)
 		tid = lf_get32(rec.hdr + LR_TRANSACTION_ID);
 		redo_op = lf_get16(lr + NR_REDO_OP);
 
-		/* Transaction table upkeep. */
-		if (!lfs_table_entry_ok(&log->trtbl, tid)) {
-			tr = lfs_table_alloc_at(&log->trtbl, tid);
-			if (!tr) {
-				lfs_free_record(&rec);
-				return lfs_seterr(log, -EINVAL, "analysis: bad transaction id 0x%x", tid);
+		/* Transaction table upkeep. Table dumps are not
+		 * transaction activity: they carry the last
+		 * transaction's tid by construction (lw_dump_table
+		 * appends with 0x18) but they are snapshots of the
+		 * tables, and a dump that lands after its transaction
+		 * was forgotten — the close checkpoint's dumps, when
+		 * the crash cut the close before its restart record —
+		 * would otherwise re-allocate the freed entry as
+		 * ACTIVE and report a phantom active transaction with
+		 * nothing to undo. The dumps are handled by the
+		 * checkpoint-load path (and hit the switch's default
+		 * case here), so they need no upkeep at all. */
+		tr = NULL;
+		if (!op_is_table_dump(redo_op)) {
+			if (!lfs_table_entry_ok(&log->trtbl, tid)) {
+				tr = lfs_table_alloc_at(&log->trtbl, tid);
+				if (!tr) {
+					lfs_free_record(&rec);
+					return lfs_seterr(log, -EINVAL, "analysis: bad transaction id 0x%x", tid);
+				}
+				tr[TR_STATE] = TRANSACTION_ACTIVE;
+				lf_put64(tr + TR_FIRST_LSN, lsn);
 			}
-			tr[TR_STATE] = TRANSACTION_ACTIVE;
-			lf_put64(tr + TR_FIRST_LSN, lsn);
+			tr = log->trtbl.buf + tid;
+			lf_put64(tr + TR_PREV_LSN, lsn);
+			lf_put64(tr + TR_UNDO_NEXT_LSN, lsn);
+			if (lf_get16(lr + NR_UNDO_OP) == LOP_CompensationLogRecord)
+				lf_put64(tr + TR_UNDO_NEXT_LSN, lf_get64(rec.hdr + LR_CLIENT_UNDO_NEXT_LSN));
 		}
-		tr = log->trtbl.buf + tid;
-		lf_put64(tr + TR_PREV_LSN, lsn);
-		lf_put64(tr + TR_UNDO_NEXT_LSN, lsn);
-		if (lf_get16(lr + NR_UNDO_OP) == LOP_CompensationLogRecord)
-			lf_put64(tr + TR_UNDO_NEXT_LSN, lf_get64(rec.hdr + LR_CLIENT_UNDO_NEXT_LSN));
 
 		if (op_is_mft(redo_op) || op_is_attr(redo_op)) {
 			uint16_t ta = lf_get16(lr + NR_TARGET_ATTRIBUTE);

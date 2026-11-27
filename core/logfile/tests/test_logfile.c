@@ -3331,6 +3331,71 @@ static void test_journal_create_mft_sizes(void)
 	free(buf);
 }
 
+/* A table dump that lands after its transaction was forgotten must
+ * not resurrect it: the dumps carry the transaction's tid (0x18, by
+ * construction in lw_dump_table) but they are table snapshots, not
+ * transaction activity. This is the state a crash mid-close leaves —
+ * the close's dumps landed, its restart record did not — and without
+ * the fix the analysis re-allocates the freed entry as ACTIVE and
+ * reports a phantom active transaction with nothing to undo
+ * (active > 0 with undone == 0). */
+static void test_journal_create_close_dumps_no_phantom(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint64_t first_lsn;
+	int err;
+
+	printf("test_journal_create_close_dumps_no_phantom\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	/* One dump after the Forget, with the transaction's tid and no
+	 * checkpoint record after it — the crash-mid-close state. */
+	{
+		uint8_t dump[NR_HEADER_SIZE + 8];
+		uint64_t lsn;
+		memset(dump, 0, sizeof(dump));
+		lf_put16(dump + NR_REDO_OP, LOP_DirtyPageTableDump);
+		lf_put16(dump + NR_UNDO_OP, LOP_Noop);
+		lf_put16(dump + NR_REDO_OFFSET, NR_HEADER_SIZE + 8);
+		lf_put16(dump + NR_REDO_LENGTH, 0);
+		lf_put16(dump + NR_UNDO_OFFSET, NR_HEADER_SIZE + 8);
+		lf_put16(dump + NR_UNDO_LENGTH, 0);
+		CHECK_EQ(ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
+						 0x18, 0, dump, sizeof(dump),
+						 &lsn), 0);
+	}
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Replay: the file lands, no transaction is active, nothing is
+	 * undone. The invariant: active > 0 implies undone > 0. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	err = ntfs_logfile_replay(log, &ap, false, &res);
+	CHECK_EQ(err, 0);
+	CHECK_EQ(res.transactions_active, 0u);
+	CHECK_EQ(res.records_undone, 0u);
+	CHECK_EQ(res.transactions_committed, 0u);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
 /* Abort writes nothing: the volume is byte-identical and replay sees no
  * transaction at all. */
 static void test_journal_create_abort(void)
@@ -3746,6 +3811,7 @@ int main(void)
 	test_writer_clean_close();
 	test_journal_create_commit();
 	test_journal_create_mft_sizes();
+	test_journal_create_close_dumps_no_phantom();
 	test_journal_create_abort();
 	test_journal_create_uncommitted();
 	test_journal_create_first_txn_uncommitted();
