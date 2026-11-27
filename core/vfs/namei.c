@@ -601,6 +601,10 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			if (err)
 				goto err_out;
 			rollback_reparse = true;
+			err = journal_stage(jt ? ntfs_journal_create_reparse(jt, vol, ni, ni_mrec) : 0,
+					    &jt);
+			if (err)
+				goto err_out;
 		}
 	} else {
 		/* Add DATA attribute to inode. */
@@ -639,6 +643,10 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 				err = ntfs_reparse_set_wsl_symlink(ni, target, target_len);
 			if (!err)
 				rollback_reparse = true;
+			if (!err) {
+				err = journal_stage(jt ? ntfs_journal_create_reparse(jt, vol, ni, ni_mrec) : 0,
+						    &jt);
+			}
 		} else if (S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode) ||
 			   S_ISFIFO(mode)) {
 			si->file_attributes = FILE_ATTRIBUTE_RECALL_ON_OPEN;

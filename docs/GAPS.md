@@ -1021,7 +1021,45 @@ remove-big 40), 0 still bad after replay; `test_crash.c` 4366 checks,
 class: the `$EA` class reuses the resident-replace pattern proven
 here; `$FILE_NAME` times never update on setattr/xattr (live-driver
 bug); extending writes during writeback (still unjournaled).
-Next: the symlink class.
+Phase 3, symlink — glue landed 2026-11-27 (commit, this round):
+one transaction per `ntfs_symlink`, reusing the create transaction.
+`ntfs_journal_create_begin` now begins for S_ISLNK as well as
+S_ISREG/S_ISDIR (devices still never begin — mknod is a separate
+class). `__ntfs_create` stages, in both branches right after the
+reparse set, via one new `ntfs_journal_create_reparse`: a
+CreateAttribute for $REPARSE_POINT (the value as it stands after
+the reparse set), an AddIndexEntryRoot for the $R entry in $Reparse
+(found by (tag, file_id), the create_index pattern with a different
+key), and a 4-byte UpdateResidentValue for the $SI flags (old = the
+as-added flags from the mapped $SI, which the WAL gate holds
+un-synced; new = ni->flags with FILE_ATTR_REPARSE_POINT).
+$FILE_NAME is staged after the reparse set and already carries the
+tag; $DATA staged empty is correct; no $EA on symlinks. The commit
+stamps MR_LSN into $Reparse's record too (the txn carries its
+mft_no) — without it the replay would duplicate the $R entry,
+because AddIndexEntryRoot inserts unconditionally. Bug fixed en
+route: the new txn field `reparse_mft_no` was not initialized at
+begin (kmalloc does not zero) — garbage made the commit iget a
+wrong record on every create, corrupting the volume and remounting
+it read-only (the first pre-push run failed 5 suites with EROFS on
+the op after the create); fixed by initializing it to 0. Also
+`struct reparse_index` moved from reparse.c to reparse.h, which now
+includes layout.h, so the type is visible wherever the header is
+included. Evidence: `test_journal.c` 1177 checks, 0 failures (was
+899; 4 new tests: win-tag, WSL-tag, dir-link, root fallback — each
+journaled link is 17 records; replay redoes only the 2 idempotent
+records; readlink correct after replay + mount; $SI carries 0x400;
+the $R entry is exactly one after replay and after a second
+replay; the root link writes no records and still works). Crash
+tests: 3 sweeps, 177 cut points (win 59, wsl 59, dir 59; 6
+inconsistent before replay each, 0 still bad after it; link
+all-old 24/24/23, all-new 35/35/36); per cut the $R entry count
+agrees with the link (0 when absent, 1 when present);
+`test_crash.c` 5791 checks, 0 failures (was 4366). Follow-ups, not
+this class: $SI ctime on rename; parent $SI mtime on
+create/unlink/rename (Phase 2 gap); mknod (devices also carry
+reparse data but never begin).
+Next: the EA class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

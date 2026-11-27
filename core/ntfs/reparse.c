@@ -26,13 +26,6 @@ struct wsl_link_reparse_data {
 	char	link[];
 };
 
-/* Index entry in $Extend/$Reparse */
-struct reparse_index {
-	struct index_entry_header header;
-	struct reparse_index_key key;
-	__le32 filling;
-};
-
 __le16 reparse_index_name[] = {cpu_to_le16('$'), cpu_to_le16('R'), 0};
 
 
@@ -584,6 +577,43 @@ static struct ntfs_index_context *open_reparse_index(struct ntfs_volume *vol)
 put_dir_vi:
 	iput(dir_vi);
 	return xr;
+}
+
+/*
+ * Return the MFT record number of $Extend/$Reparse. The lookup is
+ * open_reparse_index's, without the index context: the journal
+ * staging in journal.c needs the $Reparse record itself, to find the
+ * $R index entry a symlink create just added.
+ */
+int ntfs_reparse_mft_no(struct ntfs_volume *vol, u64 *mft_no_out)
+{
+	struct inode *dir_vi;
+	__le16 *uname;
+	struct ntfs_name *name = NULL;
+	int uname_len;
+	u64 mref;
+
+	*mft_no_out = 0;
+	dir_vi = ntfs_iget(vol->sb, FILE_Extend);
+	if (IS_ERR(dir_vi))
+		return PTR_ERR(dir_vi);
+	uname_len = ntfs_nlstoucs(vol, "$Reparse", 8, &uname,
+				   NTFS_MAX_NAME_LEN);
+	if (uname_len < 0) {
+		iput(dir_vi);
+		return uname_len;
+	}
+	mutex_lock_nested(&NTFS_I(dir_vi)->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	mref = ntfs_lookup_inode_by_name(NTFS_I(dir_vi), uname, uname_len,
+					 &name);
+	mutex_unlock(&NTFS_I(dir_vi)->mrec_lock);
+	kfree(name);
+	kmem_cache_free(ntfs_name_cache, uname);
+	iput(dir_vi);
+	if (IS_ERR_MREF(mref))
+		return -ENOENT;
+	*mft_no_out = MREF(mref);
+	return 0;
 }
 
 

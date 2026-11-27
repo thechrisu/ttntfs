@@ -7,7 +7,26 @@
 #ifndef _LINUX_NTFS_REPARSE_H
 #define _LINUX_NTFS_REPARSE_H
 
+#include "layout.h"
+
 extern __le16 reparse_index_name[];
+
+/* Index entry in $Extend/$Reparse (layout.h: struct reparse_index_key).
+ * The header is followed by the 12-byte key (tag + file_id) and a
+ * 4-byte filling: 32 bytes total. The journal staging in journal.c
+ * scans $Reparse's $R root for the entry a symlink create just
+ * added, so the definition lives here, not in reparse.c. */
+struct reparse_index {
+	struct index_entry_header header;
+	struct reparse_index_key key;
+	__le32 filling;
+};
+
+/* Return the MFT record number of $Extend/$Reparse, or -ENOENT when
+ * it cannot be found. The journal staging in journal.c needs the
+ * $Reparse record to find the $R index entry a symlink create just
+ * added. */
+int ntfs_reparse_mft_no(struct ntfs_volume *vol, u64 *mft_no_out);
 
 /* @dir_record: the MFT record carries MFT_RECORD_IS_DIRECTORY. A junction is
  * only valid on one; a symlink may sit on either. */

@@ -17,9 +17,10 @@
  * state with no internal lock, and two concurrent commits would
  * interleave appends.
  *
- * Only regular-file creates are journaled in Phase 2. Anything else —
- * journal inactive, mkdir/symlink/special — returns 0 with *out NULL
- * and proceeds unjournaled, exactly as before.
+ * Only regular-file, directory and symlink creates are journaled
+ * (Phase 2 + Phase 3 mkdir/symlink). Anything else — journal
+ * inactive, device/special — returns 0 with *out NULL and proceeds
+ * unjournaled, exactly as before.
  */
 #ifndef NTFS_JOURNAL_H
 #define NTFS_JOURNAL_H
@@ -80,6 +81,20 @@ int ntfs_journal_create_index(struct ntfs_journal_txn *t,
 			      struct ntfs_inode *dir_ni,
 			      const struct mft_record *dir_mrec,
 			      u64 child_mref);
+
+/* Stage the three records a symlink create adds on top of a plain
+ * create, in live order: a CreateAttribute for the $REPARSE_POINT
+ * attribute, an AddIndexEntryRoot for the $R index entry in $Reparse
+ * (found by (tag, file_id)), and a 4-byte UpdateResidentValue for
+ * the $SI flags (the reparse set flipped FILE_ATTR_REPARSE_POINT in
+ * ni->flags, which the mapped $SI does not carry yet). Returns
+ * -ENOENT when any of the three cannot be described; the caller then
+ * aborts and proceeds unjournaled. The commit stamps MR_LSN into
+ * $Reparse's record too, so the replay skips the $R entry record. */
+int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
+				struct ntfs_volume *vol,
+				struct ntfs_inode *ni,
+				const struct mft_record *mrec);
 
 /* Stage the SetBits record for the allocated MFT record number. */
 int ntfs_journal_create_bitmap(struct ntfs_journal_txn *t,

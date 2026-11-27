@@ -3797,6 +3797,651 @@ out:
 }
 
 
+/* ---- 7. a symlink journals ---------------------------------------------- */
+
+/* Mount @path, look @name up under @parent (NULL: the root), read the
+ * link target into @buf (@bufsz bytes, @len_out the length read),
+ * unmount. The same shape as xattr_after_mount, for the symlink tests'
+ * post-replay checks. */
+static int readlink_after_mount(const char *path, const char *parent,
+				const char *name, char *buf, size_t bufsz,
+				size_t *len_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	err = ntfs_lookup(d, name, &f);
+	if (err)
+		goto out_d;
+	err = ntfs_readlink(f, buf, bufsz, len_out);
+	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* Read the flags word of MFT record @mft_no from the image at @path:
+ * magic 0-3, usa 4-7, lsn 8-15, sequence 16-17, link_count 18-19,
+ * attrs_offset 20-21, flags 22-23. */
+static int read_mft_flags(const char *path, uint64_t mft_no,
+			  uint16_t *flags_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+	struct ntfs_image img;
+	struct ntfs_image_io io;
+	struct ntfs_log_apply ap;
+	uint8_t *buf;
+	int err;
+
+	*flags_out = 0;
+	if (!dev)
+		return -EIO;
+	io.ctx = dev;
+	io.pread = img_pread;
+	io.pwrite = NULL;
+	io.sync = NULL;
+	memset(&img, 0, sizeof(img));
+	err = ntfs_image_open_io(&img, &io, dev->size_bytes, false);
+	if (err)
+		goto out_dev;
+	buf = malloc(img.mft_record_size);
+	if (!buf) {
+		err = -ENOMEM;
+		goto out_img;
+	}
+	ntfs_image_apply(&img, &ap);
+	err = ap.read_mft_record(ap.ctx, mft_no, buf);
+	if (!err)
+		*flags_out = (uint16_t)buf[22] | ((uint16_t)buf[23] << 8);
+	free(buf);
+out_img:
+	ntfs_image_close(&img);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* How many $R entries with reparse tag @tag for record @ino does
+ * $Reparse's $R index hold in the image at @path? Reads $Reparse's
+ * record (@rp_ino) raw and walks the $R root entries by their on-disk
+ * bytes — the driver has no read-side query for the index, and
+ * readlink does not consult it, so only this byte check proves the
+ * replay landed the entry (a missing entry leaves a link Windows
+ * cannot enumerate; a duplicated one leaves two). Returns the count,
+ * or -errno on a parse failure. */
+static int reparse_index_count_entries(const char *path, uint64_t rp_ino,
+				       uint32_t tag, uint64_t ino)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+	struct ntfs_image img;
+	struct ntfs_image_io io;
+	struct ntfs_log_apply ap;
+	uint8_t *buf;
+	int err, found = 0;
+
+	if (!dev)
+		return -EIO;
+	io.ctx = dev;
+	io.pread = img_pread;
+	io.pwrite = NULL;
+	io.sync = NULL;
+	memset(&img, 0, sizeof(img));
+	err = ntfs_image_open_io(&img, &io, dev->size_bytes, false);
+	if (err)
+		goto out_dev;
+	buf = malloc(img.mft_record_size);
+	if (!buf) {
+		err = -ENOMEM;
+		goto out_img;
+	}
+	ntfs_image_apply(&img, &ap);
+	err = ap.read_mft_record(ap.ctx, rp_ino, buf);
+	if (err)
+		goto out_buf;
+	{
+		uint16_t off = (uint16_t)buf[0x14] |
+			       ((uint16_t)buf[0x15] << 8);
+		uint32_t used = (uint32_t)buf[0x18] |
+				((uint32_t)buf[0x19] << 8) |
+				((uint32_t)buf[0x1a] << 16) |
+				((uint32_t)buf[0x1b] << 24);
+		uint16_t aoff = 0;
+		bool is_r = false;
+
+		err = -ENOENT;
+		while (off + 8 <= used) {
+			uint32_t type = (uint32_t)buf[off] |
+					((uint32_t)buf[off + 1] << 8) |
+					((uint32_t)buf[off + 2] << 16) |
+					((uint32_t)buf[off + 3] << 24);
+			uint32_t len = (uint32_t)buf[off + 4] |
+				       ((uint32_t)buf[off + 5] << 8) |
+				       ((uint32_t)buf[off + 6] << 16) |
+				       ((uint32_t)buf[off + 7] << 24);
+
+			if (type == 0xffffffff)
+				break;
+			if (len < 8 || off + len > used) {
+				err = -EIO;
+				goto out_buf;
+			}
+			/* $INDEX_ROOT, resident, named "$R". */
+			if (type == 0x90 && !buf[off + 8] &&
+			    buf[off + 9] == 2) {
+				uint16_t noff = (uint16_t)buf[off + 10] |
+						((uint16_t)buf[off + 11] << 8);
+
+				if (off + noff + 4 <= used &&
+				    buf[off + noff] == '$' &&
+				    buf[off + noff + 1] == 0 &&
+				    buf[off + noff + 2] == 'R' &&
+				    buf[off + noff + 3] == 0) {
+					aoff = off;
+					is_r = true;
+					break;
+				}
+			}
+			off += (uint16_t)len;
+		}
+		if (!is_r)
+			goto out_buf;
+		/* The $R root: value at value_offset, the index header
+		 * 16 bytes into the value, entries at entries_offset
+		 * from the header, end at index_length. Entry layout:
+		 * 8-byte data union, length u16 @+8, flags u16 @+12,
+		 * key (tag u32, file_id u64) @+16. */
+		{
+			uint16_t voff = (uint16_t)buf[aoff + 20] |
+					((uint16_t)buf[aoff + 21] << 8);
+			const uint8_t *value = buf + aoff + voff;
+			const uint8_t *ih = value + 16;
+			uint32_t eoff = (uint32_t)ih[0] |
+					((uint32_t)ih[1] << 8) |
+					((uint32_t)ih[2] << 16) |
+					((uint32_t)ih[3] << 24);
+			uint32_t ilen = (uint32_t)ih[4] |
+					((uint32_t)ih[5] << 8) |
+					((uint32_t)ih[6] << 16) |
+					((uint32_t)ih[7] << 24);
+			const uint8_t *entries = ih + eoff;
+			const uint8_t *end = ih + ilen;
+			const uint8_t *e;
+
+			err = -EIO;
+			if (entries < value || end > buf + img.mft_record_size)
+				goto out_buf;
+			for (e = entries; e + 16 <= end;) {
+				uint16_t elen = (uint16_t)e[8] |
+						((uint16_t)e[9] << 8);
+				uint16_t flags = (uint16_t)e[12] |
+						 ((uint16_t)e[13] << 8);
+
+				if (elen < 16 || e + elen > end)
+					goto out_buf;
+				if (flags & 0x02)
+					break;
+				if (elen >= 32) {
+					uint32_t etag = (uint32_t)e[16] |
+							((uint32_t)e[17] << 8) |
+							((uint32_t)e[18] << 16) |
+							((uint32_t)e[19] << 24);
+					uint64_t fid = 0;
+					int k;
+
+					for (k = 0; k < 8; k++)
+						fid |= (uint64_t)e[20 + k] <<
+						       (8 * k);
+					if (etag == tag &&
+					    (fid & 0xffffffffffffULL) == ino)
+						found++;
+				}
+				e += elen;
+			}
+			err = 0;
+		}
+	}
+out_buf:
+	free(buf);
+out_img:
+	ntfs_image_close(&img);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err ? err : found;
+}
+
+/* The walk of one journaled symlink create in a driver-made
+ * directory: 2 opens + 10 data + Commit + 3 dumps + Forget. The data
+ * records are the $MFT $DATA size extension, the record init, the
+ * $SD / $DATA-or-$INDEX_ROOT / $REPARSE_POINT / $FILE_NAME creates,
+ * the $R index entry, the $SI flags, the parent index entry and the
+ * SetBits — in that order. */
+static void check_symlink_walk(struct rec_seen *s, const char *snap,
+			       uint64_t ino, uint64_t sub_ino,
+			       uint64_t rp_ino)
+{
+	uint64_t mrlsn_file = 0, mrlsn_dir = 0, mrlsn_rp = 0,
+		 lsn_fn = 0, lsn_index = 0, lsn_r = 0;
+	int i;
+
+	CHECK_EQ(s->n, 17);
+	if (s->n != 17)
+		return;
+	{
+		static const uint16_t want_op[10] = {
+			LOP_SetNewAttributeSizes,
+			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
+			LOP_CreateAttribute, LOP_AddIndexEntryRoot,
+			LOP_SetBitsInNonresidentBitMap,
+		};
+		CHECK_EQ(s->redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s->target_attr[0], 0x18u);
+		CHECK_EQ(s->redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s->target_attr[1], 0x40u);
+		for (i = 0; i < 10; i++) {
+			CHECK_EQ(s->redo_op[i + 2], want_op[i]);
+			/* First nine target $MFT:$DATA (0x18); the
+			 * SetBits targets $MFT:$BITMAP (0x40). */
+			CHECK_EQ(s->target_attr[i + 2], i < 9 ? 0x18u : 0x40u);
+		}
+	}
+	CHECK_EQ(s->redo_op[12], LOP_CommitTransaction);
+	CHECK_EQ(s->redo_op[13], LOP_TransactionTableDump);
+	CHECK_EQ(s->redo_op[14], LOP_DirtyPageTableDump);
+	CHECK_EQ(s->redo_op[15], LOP_OpenAttributeTableDump);
+	CHECK_EQ(s->redo_op[16], LOP_ForgetTransaction);
+	/* The $FILE_NAME create is the last CreateAttribute, the
+	 * record right before the parent index entry; the $R entry
+	 * and the $SI flags sit between the $REPARSE_POINT create
+	 * and the $FILE_NAME one. */
+	lsn_r = s->lsn[7];
+	lsn_fn = s->lsn[9];
+	lsn_index = s->lsn[10];
+	CHECK_EQ(s->redo_op[9], LOP_CreateAttribute);
+	CHECK_EQ(s->redo_op[10], LOP_AddIndexEntryRoot);
+	/* The name appears in exactly one CreateAttribute's redo: the
+	 * $FILE_NAME one. */
+	CHECK_EQ(s->fn_name_hits, 1);
+	CHECK_EQ(s->fn_lsn, lsn_fn);
+	/* The SetBits names the new record number, one bit. */
+	CHECK_EQ(s->bits_bit, (uint32_t)ino);
+	CHECK_EQ(s->bits_count, 1u);
+	CHECK_EQ(s->bits_lsn, s->lsn[11]);
+	CHECK_EQ(s->target_vcn[11], 0u);
+	/* The $SI flags record: the reparse set flipped
+	 * FILE_ATTR_REPARSE_POINT (0x400) on, and the as-added $SI
+	 * carried no flags at all. */
+	CHECK_EQ(s->res_redo, 0x400u);
+	CHECK_EQ(s->res_undo, 0u);
+	CHECK_EQ(s->res_lsn, s->lsn[8]);
+	/* The $MFT $DATA size extension: exactly one record, staged
+	 * first, its redo the live size, its undo one record less. */
+	{
+		uint16_t data_off = 0;
+		uint64_t alloc = 0, data = 0;
+		uint32_t rec_size = 0;
+
+		CHECK_EQ(read_mft0_data_attr(snap, &data_off, &alloc, &data,
+					     &rec_size), 0);
+		CHECK_EQ(s->sizes_count, 1);
+		CHECK_EQ(s->sizes_lsn, s->lsn[2]);
+		CHECK_EQ(s->record_off[2], data_off);
+		CHECK_EQ(s->target_vcn[2], 0u);
+		CHECK_EQ(s->sizes_redo_data, data);
+		CHECK_EQ(s->sizes_undo_data, data - rec_size);
+		CHECK_EQ(s->sizes_redo_total, 0u);
+		CHECK(rec_size == 1024u);
+	}
+	/* All three touched records carry an MR_LSN at or past the
+	 * record that touched them: the replay's skip check. The
+	 * $Reparse stamp is the new one — without it the replay
+	 * would re-apply the $R entry and duplicate it. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_fn);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_index);
+	CHECK_EQ(read_mft_lsn(snap, rp_ino, &mrlsn_rp), 0);
+	CHECK(mrlsn_rp != 0);
+	CHECK(mrlsn_rp >= lsn_r);
+}
+
+/* One journaled symlink create in a driver-made directory, for a
+ * given link name, target and reparse tag: the win-tag case
+ * ("t.txt", 0xA000000C) and the WSL-tag case ("a:b", 0xA000001D)
+ * differ only in the tag the reparse set picks — the journal
+ * records are the same shape either way. */
+static void symlink_journaled_case(const char *label, const char *lname,
+				    const char *target, uint32_t tag)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *l = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
+	uint64_t ino = 0, sub_ino = 0, rp_ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("%s\n", label);
+	scratch_path(orig, sizeof(orig), "sorig");
+	scratch_path(snap, sizeof(snap), "ssnap");
+	scratch_path(snap1, sizeof(snap1), "ssnap1");
+	scratch_path(snap2, sizeof(snap2), "ssnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP %s: mkntfs unavailable\n", label);
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_symlink(d, lname, target, &l);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(l);
+	CHECK(ino > 16);
+	ntfs_inode_put(l);
+	l = NULL;
+	/* $Reparse's record number, for the MR_LSN and $R-entry
+	 * checks below: $Extend/$Reparse, by name. */
+	err = ntfs_lookup(root, "$Extend", &ext);
+	CHECK_EQ(err, 0);
+	if (!err) {
+		err = ntfs_lookup(ext, "$Reparse", &rp);
+		CHECK_EQ(err, 0);
+		if (!err)
+			rp_ino = ntfs_inode_number(rp);
+		ntfs_inode_put(rp);
+		rp = NULL;
+		ntfs_inode_put(ext);
+		ext = NULL;
+	}
+	CHECK(rp_ino != 0);
+	if (err) { goto out; }
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log — what a crash at this instant leaves. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: exactly one transaction, 2 open + 10 data + Commit +
+	 * 3 dumps + Forget. */
+	set_fn_name(lname);
+	CHECK_EQ(walk_log(snap, &s), 0);
+	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino);
+
+	/* Replay copy 1: the MFT records were already flushed, so only
+	 * the two records that carry no LSN to skip on redo — the $MFT
+	 * $DATA size extension and the SetBits. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The link reads back after a remount, with the right target,
+	 * the reparse flag on its $SI, and its $R entry in place. */
+	CHECK_EQ(readlink_after_mount(snap1, "sub", lname,
+				      buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, strlen(target));
+	CHECK_EQ(memcmp(buf, target, len), 0);
+	CHECK_EQ(attr_after_mount(snap1, "sub", lname, &at), 0);
+	CHECK(at.file_attributes & 0x400u);
+	CHECK_EQ(reparse_index_count_entries(snap1, rp_ino, tag, ino), 1);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * two records. Replay is idempotent — and the $R entry is not
+	 * duplicated: it is still exactly one. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(reparse_index_count_entries(snap2, rp_ino, tag, ino), 1);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+static void test_symlink_journaled(void)
+{
+	symlink_journaled_case("test_symlink_journaled", "ln.txt",
+			       "t.txt", 0xA000000Cu);
+}
+
+static void test_symlink_wsl_journaled(void)
+{
+	symlink_journaled_case("test_symlink_wsl_journaled", "w.txt",
+			       "a:b", 0xA000001Du);
+}
+
+static void test_symlink_dir_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *rd = NULL, *l = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, sub_ino = 0, rp_ino = 0;
+	uint16_t flags = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_symlink_dir_journaled\n");
+	scratch_path(orig, sizeof(orig), "sdorig");
+	scratch_path(snap, sizeof(snap), "sdsnap");
+	scratch_path(snap1, sizeof(snap1), "sdsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_symlink_dir_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+	err = ntfs_mkdir(root, "realdir", 0100755, &rd);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(rd);
+	rd = NULL;
+
+	/* The target is an existing directory here, so the link is
+	 * written as a directory record — Windows' <SYMLINKD>. */
+	err = ntfs_symlink(d, "dlink", "../realdir", &l);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(l);
+	CHECK(ino > 16);
+	ntfs_inode_put(l);
+	l = NULL;
+	err = ntfs_lookup(root, "$Extend", &ext);
+	CHECK_EQ(err, 0);
+	if (!err) {
+		err = ntfs_lookup(ext, "$Reparse", &rp);
+		CHECK_EQ(err, 0);
+		if (!err)
+			rp_ino = ntfs_inode_number(rp);
+		ntfs_inode_put(rp);
+		rp = NULL;
+		ntfs_inode_put(ext);
+		ext = NULL;
+	}
+	CHECK(rp_ino != 0);
+	if (err) { goto out; }
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	if (rd) { ntfs_inode_put(rd); rd = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk is the same 17-record shape as a file link: the
+	 * $INDEX_ROOT create is still one CreateAttribute. */
+	set_fn_name("dlink");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino);
+
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	CHECK_EQ(readlink_after_mount(snap1, "sub", "dlink",
+				      buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, strlen("../realdir"));
+	CHECK_EQ(memcmp(buf, "../realdir", len), 0);
+	CHECK_EQ(reparse_index_count_entries(snap1, rp_ino, 0xA000000Cu, ino), 1);
+	/* The link's record is a directory record, read from the image. */
+	CHECK_EQ(read_mft_flags(snap1, ino, &flags), 0);
+	CHECK(flags & 0x0002u);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+static void test_symlink_in_root_unjournaled(void)
+{
+	char orig[1024], snap[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *l = NULL;
+	struct rec_seen s;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_symlink_in_root_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "srorig");
+	scratch_path(snap, sizeof(snap), "srsnap");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_symlink_in_root_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* The create itself must succeed: the entry goes to the root's
+	 * $INDEX_ALLOCATION block, which the journal cannot describe,
+	 * so the transaction aborts — discarding the $REPARSE_POINT,
+	 * $R entry and $SI flags records already staged — and the
+	 * create proceeds unjournaled instead of failing. */
+	err = ntfs_symlink(root, "rl.txt", "t.txt", &l);
+	CHECK_EQ(err, 0);
+	if (!err) {
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+		CHECK_EQ(copy_file(orig, snap), 0);
+	}
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	CHECK_EQ(readlink_after_mount(snap, NULL, "rl.txt",
+				      buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, strlen("t.txt"));
+	CHECK_EQ(memcmp(buf, "t.txt", len), 0);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -3823,6 +4468,10 @@ int main(void)
 	test_xattr_big_create_journaled();
 	test_xattr_big_replace_remove_journaled();
 	test_xattr_in_root_journaled();
+	test_symlink_journaled();
+	test_symlink_wsl_journaled();
+	test_symlink_dir_journaled();
+	test_symlink_in_root_unjournaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

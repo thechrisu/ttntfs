@@ -3675,6 +3675,653 @@ static void test_journaled_xattr_remove_big_cut_points(void)
 	sweep_xattr_cut_points(XATTR_REMOVE_BIG);
 }
 
+/* ---- symlink ------------------------------------------------------------ */
+
+enum symlink_op {
+	SYMLINK_WIN,	/* ntfs_symlink(d, "ln", "t.txt") — native tag */
+	SYMLINK_WSL,	/* ntfs_symlink(d, "w", "a:b") — WSL tag */
+	SYMLINK_DIR,	/* ntfs_symlink(d, "dl", "../realdir") — dir record */
+};
+
+static const char *symlink_op_tag(enum symlink_op op)
+{
+	switch (op) {
+	case SYMLINK_WIN: return "symlink-win";
+	case SYMLINK_WSL: return "symlink-wsl";
+	case SYMLINK_DIR: return "symlink-dir";
+	}
+	return "symlink-unknown";
+}
+
+static const char *symlink_op_name(enum symlink_op op)
+{
+	switch (op) {
+	case SYMLINK_WIN: return "ln";
+	case SYMLINK_WSL: return "w";
+	case SYMLINK_DIR: return "dl";
+	}
+	return "ln";
+}
+
+static const char *symlink_op_target(enum symlink_op op)
+{
+	switch (op) {
+	case SYMLINK_WIN: return "t.txt";
+	case SYMLINK_WSL: return "a:b";
+	case SYMLINK_DIR: return "../realdir";
+	}
+	return "t.txt";
+}
+
+static uint32_t symlink_op_reparse_tag(enum symlink_op op)
+{
+	switch (op) {
+	case SYMLINK_WIN:
+	case SYMLINK_DIR: return 0xA000000Cu;
+	case SYMLINK_WSL: return 0xA000001Du;
+	}
+	return 0xA000000Cu;
+}
+
+/* The base for a symlink op: a fresh image with a directory "d"
+ * (and, for the dir-link op, a "realdir" for the target), flushed
+ * cleanly at base creation so the all-old outcome has known content
+ * (no link at all). */
+static int make_symlink_base(const char *path, enum symlink_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *d, *rd;
+	int err;
+
+	if (make_image(path) != 0)
+		return -EIO;
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) { ntfs_bdev_close(dev); return err; }
+	err = ntfs_volume_root(vol, &root);
+	if (!err) {
+		err = ntfs_mkdir(root, "d", 0100755, &d);
+		if (!err) {
+			ntfs_inode_put(d);
+			if (op == SYMLINK_DIR) {
+				err = ntfs_mkdir(root, "realdir", 0100755,
+						 &rd);
+				if (!err)
+					ntfs_inode_put(rd);
+			}
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* The symlink run: mount the base, do the one symlink op in "d",
+ * sync, unmount. The write budget caps the run at @limit writes, so
+ * a cut point is a crash after exactly that many writes. */
+static long crash_run_symlink_journaled(const char *path, long limit,
+					enum symlink_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *l = NULL;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_symlink(d, symlink_op_name(op),
+					 symlink_op_target(op), &l) == 0)
+				ntfs_inode_put(l);
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+struct symlink_aftermath {
+	bool mounts;
+	bool present;
+	size_t len;
+	uint64_t ino;
+};
+
+/* Read the link off a (read-only) remount. A missing link is
+ * reported as present = false. */
+static struct symlink_aftermath symlink_remount(const char *path,
+					       const char *name,
+					       char *buf, size_t bufsz)
+{
+	struct symlink_aftermath a = { 0 };
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	size_t len = 0;
+	int err;
+
+	dev = ntfs_bdev_open_path(path, true);
+	if (!dev)
+		return a;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return a;
+	}
+	a.mounts = true;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, name, &f) == 0) {
+				err = ntfs_readlink(f, buf, bufsz, &len);
+				if (err == 0) {
+					a.present = true;
+					a.len = len;
+					a.ino = ntfs_inode_number(f);
+				}
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return a;
+}
+
+/* Classify a probed link as the all-old or the all-new outcome. The
+ * target bytes are journaled whole (they live in the resident
+ * $REPARSE_POINT), so the content is asserted, not just presence. */
+static void symlink_classify(enum symlink_op op,
+			     struct symlink_aftermath *a,
+			     const char *buf, bool *is_old, bool *is_new)
+{
+	const char *target = symlink_op_target(op);
+
+	*is_old = !a->present;
+	*is_new = a->present && a->len == strlen(target) &&
+		  memcmp(buf, target, a->len) == 0;
+}
+
+/* How many $R entries with tag @tag for record @ino does $Reparse's
+ * $R index hold in the image at @path? The same byte scan as
+ * test_journal.c's reparse_index_count_entries, over geometry's
+ * read_record. Returns the count, or -errno on a parse failure. */
+static int symlink_reparse_count(const char *path, uint64_t rp_ino,
+				 uint32_t tag, uint64_t ino)
+{
+	struct geometry g;
+	uint8_t rec[4096];
+	int err, found = 0;
+
+	if (geometry_open(&g, path) != 0)
+		return -EIO;
+	if (g.img.mft_record_size > sizeof(rec)) {
+		geometry_close(&g);
+		return -EIO;
+	}
+	err = read_record(&g, rp_ino, rec);
+	if (err)
+		goto out;
+	{
+		uint16_t off = (uint16_t)rec[0x14] |
+			       ((uint16_t)rec[0x15] << 8);
+		uint32_t used = (uint32_t)rec[0x18] |
+				((uint32_t)rec[0x19] << 8) |
+				((uint32_t)rec[0x1a] << 16) |
+				((uint32_t)rec[0x1b] << 24);
+		uint16_t aoff = 0;
+		bool is_r = false;
+
+		err = -ENOENT;
+		while (off + 8 <= used) {
+			uint32_t type = (uint32_t)rec[off] |
+					((uint32_t)rec[off + 1] << 8) |
+					((uint32_t)rec[off + 2] << 16) |
+					((uint32_t)rec[off + 3] << 24);
+			uint32_t len = (uint32_t)rec[off + 4] |
+				       ((uint32_t)rec[off + 5] << 8) |
+				       ((uint32_t)rec[off + 6] << 16) |
+				       ((uint32_t)rec[off + 7] << 24);
+
+			if (type == 0xffffffff)
+				break;
+			if (len < 8 || off + len > used) {
+				err = -EIO;
+				goto out;
+			}
+			/* $INDEX_ROOT, resident, named "$R". */
+			if (type == 0x90 && !rec[off + 8] &&
+			    rec[off + 9] == 2) {
+				uint16_t noff = (uint16_t)rec[off + 10] |
+						((uint16_t)rec[off + 11] << 8);
+
+				if (off + noff + 4 <= used &&
+				    rec[off + noff] == '$' &&
+				    rec[off + noff + 1] == 0 &&
+				    rec[off + noff + 2] == 'R' &&
+				    rec[off + noff + 3] == 0) {
+					aoff = off;
+					is_r = true;
+					break;
+				}
+			}
+			off += (uint16_t)len;
+		}
+		if (!is_r)
+			goto out;
+		{
+			uint16_t voff = (uint16_t)rec[aoff + 20] |
+					((uint16_t)rec[aoff + 21] << 8);
+			const uint8_t *value = rec + aoff + voff;
+			const uint8_t *ih = value + 16;
+			uint32_t eoff = (uint32_t)ih[0] |
+					((uint32_t)ih[1] << 8) |
+					((uint32_t)ih[2] << 16) |
+					((uint32_t)ih[3] << 24);
+			uint32_t ilen = (uint32_t)ih[4] |
+					((uint32_t)ih[5] << 8) |
+					((uint32_t)ih[6] << 16) |
+					((uint32_t)ih[7] << 24);
+			const uint8_t *entries = ih + eoff;
+			const uint8_t *end = ih + ilen;
+			const uint8_t *e;
+
+			err = -EIO;
+			if (entries < value ||
+			    end > rec + g.img.mft_record_size)
+				goto out;
+			for (e = entries; e + 16 <= end;) {
+				uint16_t elen = (uint16_t)e[8] |
+						((uint16_t)e[9] << 8);
+				uint16_t flags = (uint16_t)e[12] |
+						 ((uint16_t)e[13] << 8);
+
+				if (elen < 16 || e + elen > end)
+					goto out;
+				if (flags & 0x02)
+					break;
+				if (elen >= 32) {
+					uint32_t etag = (uint32_t)e[16] |
+							((uint32_t)e[17] << 8) |
+							((uint32_t)e[18] << 16) |
+							((uint32_t)e[19] << 24);
+					uint64_t fid = 0;
+					int k;
+
+					for (k = 0; k < 8; k++)
+						fid |= (uint64_t)e[20 + k] <<
+						       (8 * k);
+					if (etag == tag &&
+					    (fid & 0xffffffffffffULL) == ino)
+						found++;
+				}
+				e += elen;
+			}
+			err = 0;
+		}
+	}
+out:
+	geometry_close(&g);
+	return err ? err : found;
+}
+
+/* The link's record number and $Reparse's, read off an image where
+ * the op ran to completion — the numbers are stable across cuts
+ * because the base is identical each time. */
+static int symlink_ids(const char *path, enum symlink_op op,
+		       uint64_t *ino_out, uint64_t *rp_ino_out)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	int err = -ENOENT;
+
+	*ino_out = 0;
+	*rp_ino_out = 0;
+	dev = ntfs_bdev_open_path(path, true);
+	if (!dev)
+		return -EIO;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -EIO;
+	}
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, symlink_op_name(op), &f) == 0) {
+				*ino_out = ntfs_inode_number(f);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		if (ntfs_lookup(root, "$Extend", &ext) == 0) {
+			if (ntfs_lookup(ext, "$Reparse", &rp) == 0) {
+				*rp_ino_out = ntfs_inode_number(rp);
+				ntfs_inode_put(rp);
+			}
+			ntfs_inode_put(ext);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (*ino_out && *rp_ino_out)
+		err = 0;
+	return err;
+}
+
+/* The symlink sweep. Same shape as the xattr sweep, but the operation
+ * is one journaled symlink create in "d": a cut before the commit
+ * must replay to no link at all, a cut after it to the link with its
+ * target — either way ntfsck-clean, and the $R entry must agree with
+ * the link (absent when the link is absent, exactly one when it is
+ * present — the replay must neither lose it nor duplicate it). */
+static void sweep_symlink_cut_points(enum symlink_op op)
+{
+	char base[1024], work[1024], probe[1024];
+	const char *tag = symlink_op_tag(op);
+	struct symlink_aftermath old_a;
+	static char probe_buf[64];
+	uint64_t ino = 0, rp_ino = 0;
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+
+	scratch_path(base, sizeof(base), "sy-base");
+	scratch_path(work, sizeof(work), "sy-work");
+	scratch_path(probe, sizeof(probe), "sy-probe");
+	if (make_symlink_base(base, op) != 0) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"mkntfs unavailable\n", tag);
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"ntfsck unavailable at '%s'\n", tag, ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	/* The old link state, read off a probe copy so the base stays
+	 * untouched: no link at all. */
+	if (copy_file(base, probe) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	old_a = symlink_remount(probe, symlink_op_name(op),
+				probe_buf, sizeof(probe_buf));
+	unlink(probe);
+	if (!old_a.mounts) { FAILF("the base does not mount\n"); unlink(base); return; }
+	{
+		bool is_old, is_new;
+
+		symlink_classify(op, &old_a, probe_buf, &is_old, &is_new);
+		if (!is_old) {
+			failures++;
+			fprintf(stderr, "FAIL: the base already has the link "
+					"(present %d len %zu)\n",
+					(int)old_a.present, old_a.len);
+			unlink(base);
+			return;
+		}
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_symlink_journaled(work, LONG_MAX, op);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-%s-uncrashed.img", tmpdir, tag);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled symlink op made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+	/* The record numbers, off the uncrashed run: the link's, and
+	 * $Reparse's for the $R-entry check. */
+	if (symlink_ids(work, op, &ino, &rp_ino) != 0) {
+		FAILF("could not read the link / $Reparse numbers off the uncrashed run\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  link present/len\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct symlink_aftermath a;
+		struct geometry g;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		int r_count = -1;
+		bool pre_bad, post_bad, is_old, is_new;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_symlink_journaled(work, cut, op);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-cut-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-replayed-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = symlink_remount(work, symlink_op_name(op),
+				    probe_buf, sizeof(probe_buf));
+		symlink_classify(op, &a, probe_buf, &is_old, &is_new);
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		/* The $R entry must agree with the link: absent when
+		 * the link is absent, exactly one when it is present. */
+		if (a.mounts && (is_old || is_new))
+			r_count = symlink_reparse_count(work, rp_ino,
+							symlink_op_reparse_tag(op),
+							ino);
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s/%zu\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.present ? "present" : "absent", a.len);
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+					tag, cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+					tag, cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+					tag, cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+					tag, cut, (unsigned long long)bad_ino,
+					(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the "
+					"volume no longer mounts after replay\n",
+					tag, cut);
+		}
+		checks++;
+		if (a.mounts && !is_old && !is_new) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the link "
+					"is present %d len %zu after replay — neither "
+					"all-old nor all-new\n",
+					tag, cut, (int)a.present, a.len);
+		}
+		checks++;
+		if (a.mounts && (is_old || is_new) &&
+		    r_count != (is_new ? 1 : 0)) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the $R "
+					"entry count is %d after replay, want %d "
+					"(link %s)\n",
+					tag, cut, r_count, is_new ? 1 : 0,
+					is_new ? "present" : "absent");
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+					tag, cut, err_rep2, an2.records_redone,
+					an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; link all-old %d times, all-new %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_%s_cut_points\n", tag);
+}
+
+static void test_journaled_symlink_win_cut_points(void)
+{
+	sweep_symlink_cut_points(SYMLINK_WIN);
+}
+
+static void test_journaled_symlink_wsl_cut_points(void)
+{
+	sweep_symlink_cut_points(SYMLINK_WSL);
+}
+
+static void test_journaled_symlink_dir_cut_points(void)
+{
+	sweep_symlink_cut_points(SYMLINK_DIR);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -3695,6 +4342,9 @@ int main(void)
 	test_journaled_xattr_replace_res_cut_points();
 	test_journaled_xattr_replace_big_cut_points();
 	test_journaled_xattr_remove_big_cut_points();
+	test_journaled_symlink_win_cut_points();
+	test_journaled_symlink_wsl_cut_points();
+	test_journaled_symlink_dir_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
