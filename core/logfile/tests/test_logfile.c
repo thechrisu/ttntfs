@@ -3786,6 +3786,355 @@ static void test_journal_create_bad_vcn(void)
 	free(buf);
 }
 
+/* Stage the two records of a regular-file unlink into @t, in the
+ * order the driver makes the sub-mutations: DeleteIndexEntryRoot for
+ * the entry in the parent's $INDEX_ROOT, then DeleteAttribute for the
+ * $FILE_NAME in the file's own record. The offsets are recomputed
+ * exactly as stage_create() lays them out (the entry sits at attribute
+ * offset 56 in the parent's $INDEX_ROOT; the $FILE_NAME follows $SD
+ * and $DATA in the new record). The replay's DeleteAttribute decrements
+ * the link count itself (it keys on the attribute's INDEXED flag), so
+ * no separate record carries the count. Returns the first error. */
+static int stage_unlink(ntfs_log_txn_t *t, uint32_t mft_attr,
+			uint64_t recno, const char *name, uint64_t parent)
+{
+	uint8_t init_rec[VRS], sd_attr[64], data_attr[32], fn_attr[256];
+	uint8_t fn_val[128], entry[256];
+	uint32_t init_len, sd_len, data_len, fn_len, fn_vlen, entry_len;
+	uint32_t sd_off, data_off, fn_off;
+	uint64_t vcn = recno * VRS / VCS;
+	uint32_t cluster_off = (uint32_t)((recno * VRS % VCS) / 512);
+	uint64_t page_lcn = MFT_LCN + vcn;
+	uint64_t pvcn = DIR_REC * VRS / VCS;	/* 8 */
+	uint64_t ppage_lcn = MFT_LCN + pvcn;	/* 24 */
+	uint16_t dir_ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+	static const uint8_t sd_val[16] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+	};
+	static const uint8_t empty_val[1] = { 0 };
+	int err;
+
+	init_len = build_init_record(init_rec, recno);
+	{
+		uint32_t off = 0;
+		put_res_attr(sd_attr, &off, ATTR_TYPE_SECURITY_DESCRIPTOR,
+			     sd_val, sizeof(sd_val), 1);
+		sd_len = off;
+		off = 0;
+		put_res_attr(data_attr, &off, ATTR_TYPE_DATA, empty_val, 0, 2);
+		data_len = off;
+	}
+	fn_vlen = build_fn_value(fn_val, parent, name);
+	{
+		uint32_t off = 0;
+		put_res_attr(fn_attr, &off, ATTR_TYPE_FILE_NAME, fn_val, fn_vlen, 3);
+		fn_attr[AT_RES_FLAGS] |= ATTR_RES_FLAG_INDEXED;
+		fn_len = off;
+	}
+	entry_len = build_index_entry(entry, recno | (1ULL << 48), fn_val, fn_vlen);
+	sd_off = init_len - 8;
+	data_off = sd_off + sd_len;
+	fn_off = data_off + data_len;
+
+	err = ntfs_log_txn_delete_index_root(t, mft_attr, pvcn, 0, ppage_lcn,
+					     dir_ir_off, 56, entry, entry_len);
+	if (err)
+		return err;
+	return ntfs_log_txn_delete_attr(t, mft_attr, vcn, cluster_off,
+					page_lcn, fn_off, fn_attr, fn_len);
+}
+
+/* Scan a deprotected MFT record for an attribute of @type; return its
+ * offset, or -1 when absent. */
+static int find_attr_off(const uint8_t *rec, uint32_t type)
+{
+	uint32_t off = lf_get16(rec + MR_ATTRS_OFFSET);
+	uint32_t used = lf_get32(rec + MR_BYTES_IN_USE);
+
+	while (off + 8 <= used) {
+		uint32_t len = lf_get32(rec + off + AT_LENGTH);
+
+		if (lf_get32(rec + off) == ATTR_TYPE_END)
+			break;
+		if (len < 8 || off + len > used)
+			return -1;
+		if (lf_get32(rec + off) == type)
+			return (int)off;
+		off += len;
+	}
+	return -1;
+}
+
+/* True when the directory record's $INDEX_ROOT holds an entry whose
+ * indexed_file is @mref. */
+static bool index_has_entry(const uint8_t *rec, uint64_t mref)
+{
+	int ir_off = find_attr_off(rec, ATTR_TYPE_INDEX_ROOT);
+	const uint8_t *a, *hdr, *e, *end;
+	uint32_t used;
+
+	if (ir_off < 0)
+		return false;
+	a = rec + ir_off;
+	hdr = a + lf_get16(a + AT_VALUE_OFFSET) + 16;
+	used = lf_get32(hdr + 4);	/* index_length */
+	e = hdr + lf_get16(hdr + 0);	/* entries_offset */
+	end = hdr + used;
+	while (e + 16 <= end) {
+		/* Entry layout: indexed_file at +0, length at +8,
+		 * key length at +10, flags at +12. */
+		uint16_t elen = lf_get16(e + 8);
+
+		if (elen < 16 || e + elen > end)
+			return false;
+		if (lf_get16(e + 12) & 2)	/* INDEX_ENTRY_END */
+			break;
+		if (lf_get64(e + 0) == mref)
+			return true;
+		e += elen;
+	}
+	return false;
+}
+
+/* Create then unlink, both committed and replayed: the log carries 14
+ * records for the create and 8 for the unlink (one open record — the
+ * unlink touches only $MFT:$DATA, but the open records are emitted per
+ * transaction, not per writer lifetime); replay redoes 9, the file's
+ * $FILE_NAME is gone, its link count is 0, the record is still in use
+ * (evict deallocates it, not the unlink), the parent's index entry is
+ * gone, bit 40 of $MFT:$BITMAP is still set, and a second replay
+ * redoes only the SetBits. */
+static void test_journal_unlink_commit(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct rec_seen s;
+	uint8_t got[VRS];
+	uint64_t first_lsn, lsn_del_idx = 0, lsn_del_attr = 0;
+	int i;
+
+	printf("test_journal_unlink_commit\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_unlink(t, 0x18, NEW_REC, "t.txt", DIR_REC), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Walk from the unlink's first record: the create's checkpoint
+	 * advanced the oldest LSN past the create's records, so a walk
+	 * from the create's first LSN is refused -EINVAL. The unlink
+	 * carries 8 records: 1 open + 2 data + Commit + 3 dumps +
+	 * Forget. */
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
+	CHECK_EQ(s.n, 8);
+	if (s.n == 8) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		for (i = 0; i < s.n; i++) {
+			if (s.redo_op[i] == LOP_DeleteIndexEntryRoot)
+				lsn_del_idx = s.lsn[i];
+			if (s.redo_op[i] == LOP_DeleteAttribute)
+				lsn_del_attr = s.lsn[i];
+		}
+		CHECK(lsn_del_idx != 0);
+		CHECK(lsn_del_attr != 0);
+	}
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 9);
+	CHECK_EQ(res.transactions_committed, 0);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK_EQ(res.mft_records_written, 2);
+	CHECK_EQ(res.clusters_written, 1);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Record 40: in use, link 0, no $FILE_NAME, $DATA intact. */
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	CHECK_EQ(lf_get16(got + MR_LINK_COUNT), 0);
+	CHECK_EQ(find_attr_off(got, ATTR_TYPE_FILE_NAME), -1);
+	CHECK(find_attr_off(got, ATTR_TYPE_DATA) >= 0);
+	CHECK_EQ(lf_get64(got + MR_LSN), lsn_del_attr);
+	/* Record 32: the entry is gone, $SI untouched (mtime is the
+	 * setattr class's gap, not the unlink's). */
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK(!index_has_entry(got, NEW_REC | (1ULL << 48)));
+	CHECK_EQ(lf_get64(got + MR_LSN), lsn_del_idx);
+	/* Bit 40 still set: the record is allocated until evict. */
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x01);
+
+	/* Second replay: only the SetBits re-applies; the volume is
+	 * unchanged. */
+	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false,
+				     &res), 0);
+	CHECK_EQ(res.records_redone, 1);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 1);
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK_EQ(lf_get16(got + MR_LINK_COUNT), 0);
+	CHECK_EQ(find_attr_off(got, ATTR_TYPE_FILE_NAME), -1);
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
+/* Create committed, unlink aborted: replay redoes only the create —
+ * the file is present with link 1, its index entry intact. */
+static void test_journal_unlink_abort(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t got[VRS];
+
+	printf("test_journal_unlink_abort\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, NULL, NULL), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_unlink(t, 0x18, NEW_REC, "t.txt", DIR_REC), 0);
+	CHECK_EQ(ntfs_log_txn_abort(t), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 7);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK(!res.needs_chkdsk);
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	CHECK_EQ(lf_get16(got + MR_LINK_COUNT), 1);
+	CHECK(find_attr_off(got, ATTR_TYPE_FILE_NAME) >= 0);
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK(index_has_entry(got, NEW_REC | (1ULL << 48)));
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
+/* Negative control: an unlink whose DeleteAttribute names an offset 8
+ * past the $FILE_NAME attribute commits fine — the writer does not
+ * validate — but replay refuses the whole log (the offset is not an
+ * attribute start) and writes nothing. */
+static void test_journal_unlink_bad_offset(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v, v2;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t init_rec[VRS], sd_attr[64], data_attr[32], fn_attr[256];
+	uint8_t fn_val[128];
+	uint32_t init_len, sd_len, data_len, fn_len, fn_vlen;
+	uint32_t sd_off, data_off, fn_off;
+	static const uint8_t sd_val[16] = {
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+		0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+	};
+	static const uint8_t empty_val[1] = { 0 };
+	int err;
+
+	printf("test_journal_unlink_bad_offset\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, NULL, NULL), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	/* Same layout math as stage_unlink, but the $FILE_NAME offset
+	 * is 8 past its true start. */
+	init_len = build_init_record(init_rec, NEW_REC);
+	{
+		uint32_t off = 0;
+		put_res_attr(sd_attr, &off, ATTR_TYPE_SECURITY_DESCRIPTOR,
+			     sd_val, sizeof(sd_val), 1);
+		sd_len = off;
+		off = 0;
+		put_res_attr(data_attr, &off, ATTR_TYPE_DATA, empty_val, 0, 2);
+		data_len = off;
+	}
+	fn_vlen = build_fn_value(fn_val, DIR_REC, "t.txt");
+	{
+		uint32_t off = 0;
+		put_res_attr(fn_attr, &off, ATTR_TYPE_FILE_NAME, fn_val, fn_vlen, 3);
+		fn_attr[AT_RES_FLAGS] |= ATTR_RES_FLAG_INDEXED;
+		fn_len = off;
+	}
+	sd_off = init_len - 8;
+	data_off = sd_off + sd_len;
+	fn_off = data_off + data_len;
+	CHECK_EQ(ntfs_log_txn_delete_attr(t, 0x18, NEW_REC * VRS / VCS,
+					  (uint32_t)((NEW_REC * VRS % VCS) / 512),
+					  MFT_LCN + NEW_REC * VRS / VCS,
+					  (uint16_t)(fn_off + 8),
+					  fn_attr, fn_len), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, NULL, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_init(&v2);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	err = ntfs_logfile_replay(log, &ap, false, &res);
+	CHECK_EQ(err, -EINVAL);
+	CHECK(res.needs_chkdsk);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(memcmp(v.disk, v2.disk, VOL_CLUSTERS * VCS) == 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(v2.disk);
+	free(buf);
+}
+
 int main(void)
 {
 	test_states();
@@ -3816,6 +4165,9 @@ int main(void)
 	test_journal_create_uncommitted();
 	test_journal_create_first_txn_uncommitted();
 	test_journal_create_bad_vcn();
+	test_journal_unlink_commit();
+	test_journal_unlink_abort();
+	test_journal_unlink_bad_offset();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;

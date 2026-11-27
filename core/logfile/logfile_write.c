@@ -1277,6 +1277,32 @@ int ntfs_log_txn_add_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
 		       NULL, 0);
 }
 
+int ntfs_log_txn_delete_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, uint16_t record_off,
+			     const void *attr, uint32_t attr_len)
+{
+	if (!attr || !attr_len || attr_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_DeleteAttribute, LOP_CreateAttribute, mft_attr,
+		       1, record_off, 0, cluster_off, target_vcn, &page_lcn,
+		       NULL, 0, attr, (uint16_t)attr_len);
+}
+
+int ntfs_log_txn_delete_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				   uint64_t target_vcn, uint16_t cluster_off,
+				   uint64_t page_lcn, uint16_t record_off,
+				   uint16_t attr_off, const void *entry,
+				   uint32_t entry_len)
+{
+	if (!entry || !entry_len || entry_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_DeleteIndexEntryRoot, LOP_AddIndexEntryRoot,
+		       mft_attr, 1, record_off, attr_off, cluster_off,
+		       target_vcn, &page_lcn, NULL, 0, entry,
+		       (uint16_t)entry_len);
+}
+
 int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
 				 uint64_t target_vcn, uint16_t cluster_off,
 				 uint64_t page_lcn, uint16_t record_off,

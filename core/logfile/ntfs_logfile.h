@@ -380,6 +380,31 @@ int ntfs_log_txn_add_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
 				uint64_t page_lcn, uint16_t record_off,
 				uint16_t attr_off, const void *entry,
 				uint32_t entry_len);
+/*
+ * DeleteAttribute: the attribute at @record_off in the MFT record at
+ * @target_vcn is removed on redo; the undo is CreateAttribute with the
+ * attribute bytes in @attr, so an uncommitted unlink rolls the
+ * $FILE_NAME back and the replay's link-count bump restores the count
+ * the redo's DeleteAttribute decremented (it keys on the attribute's
+ * INDEXED flag, which $FILE_NAME attributes carry). The redo payload
+ * is empty: the replay reads the attribute's length from the record.
+ */
+int ntfs_log_txn_delete_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
+			     uint64_t target_vcn, uint16_t cluster_off,
+			     uint64_t page_lcn, uint16_t record_off,
+			     const void *attr, uint32_t attr_len);
+/*
+ * DeleteIndexEntryRoot: the index entry at @attr_off in the $INDEX_ROOT
+ * attribute at @record_off is removed on redo; the undo is
+ * AddIndexEntryRoot with the entry bytes in @entry, re-inserted at the
+ * same offset. The redo payload is empty: the replay reads the entry's
+ * length from the record.
+ */
+int ntfs_log_txn_delete_index_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				   uint64_t target_vcn, uint16_t cluster_off,
+				   uint64_t page_lcn, uint16_t record_off,
+				   uint16_t attr_off, const void *entry,
+				   uint32_t entry_len);
 int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
 				 uint64_t target_vcn, uint16_t cluster_off,
 				 uint64_t page_lcn, uint16_t record_off,

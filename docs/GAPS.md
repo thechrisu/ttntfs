@@ -570,6 +570,36 @@ it found are fixed in the four commits above (open records,
 phantom active from table dumps, `$MFTMirr` heal). Phase 2 step 3
 is complete; a journaled create is 16 records (2 open + 9 data +
 Commit + 3 dumps + Forget).
+Phase 3, unlink — builders landed 2026-11-27 (commit, this
+round): the two transaction builders the unlink class needs, in
+`core/logfile/logfile_write.c` with declarations in
+`core/logfile/ntfs_logfile.h`. `ntfs_log_txn_delete_attr`
+stages a `LOP_DeleteAttribute` redo (empty payload — the
+replay removes the attribute at the recorded offset) with a
+`LOP_CreateAttribute` undo carrying the attribute bytes, and
+`ntfs_log_txn_delete_index_root` stages a
+`LOP_DeleteIndexEntryRoot` redo (empty) with a
+`LOP_AddIndexEntryRoot` undo carrying the entry bytes.
+Deleting an attribute decrements the link count itself in the
+replay — the $FILE_NAME's `RESIDENT_ATTR_IS_INDEXED` flag keys
+the bump, and the live record carries it (attrib.c sets it for
+every `AT_FILE_NAME` it adds), so no separate record carries
+the count. New unit tests `test_journal_unlink_commit`,
+`test_journal_unlink_abort`, `test_journal_unlink_bad_offset`
+(logfile suite 5084 checks, 0 failures): the commit test walks
+the log and checks the record sequence and the undo bytes; the
+abort test checks the undo restores the record byte-identical;
+the bad-offset test checks staging rejects an out-of-range
+attribute offset. Negative control (delete_attr stubbed to
+stage nothing): 8 failures — the tests are live, not vacuous.
+Two logfile-suite learnings worth pinning: walking from an
+older transaction's first LSN fails `-EINVAL` once a later
+transaction's checkpoint lands (oldest advances past it), and
+`txn_append_open_records` emits one open record per
+transaction, not per writer lifetime (an unlink transaction is
+1 open + 2 data + Commit + 3 dumps + Forget = 8 records).
+Driver glue (wiring into `ntfs_vfs_unlink` plus driver tests)
+follows in the next commit.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
