@@ -236,6 +236,11 @@ struct ntfs_log_replay_result {
 	uint32_t dirty_pages;
 	uint32_t mft_records_written;
 	uint32_t clusters_written;
+	uint32_t mirror_records_healed;	/* $MFTMirr records 0-3 brought
+					 * into agreement with $MFT by the
+					 * flush (a crash between a record
+					 * 0-3 writeback and its mirror bio
+					 * leaves the mirror stale) */
 	uint64_t redo_lsn;
 	bool needs_chkdsk;		/* a record could not be applied safely */
 	/*

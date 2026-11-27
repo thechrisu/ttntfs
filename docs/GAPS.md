@@ -532,12 +532,31 @@ transaction's tid, no checkpoint after it — the crash-mid-close
 state — replays with `transactions_active=0`, `records_undone=0`;
 negative control (guard forced true) fails with
 `transactions_active=1`. The crash sweep's cuts 43–49 now report
-`active 0`. Still to do in step 3: fix 4 (cut 46: the unmount
-clears the dirty flag in `$MFT` record 3 and its mirror sync is a
-separate bio, so a crash between them leaves `$MFTMirr` stale by
-one flag bit and the replay never heals it — the replay must sync
-the mirror for records 0–3 it did not itself touch), then the crash
-sweep itself, which lands when it goes green.
+`active 0`. Fix 4, landed 2026-11-27 (commit, this round): the replay's flush
+now heals `$MFTMirr` for records 0–3 it did not itself touch. A crash
+between a record 0–3 `$MFT` writeback and its mirror bio leaves the
+mirror stale by that write — the unmount's dirty-flag clear in
+record 3 is the routine case — and no log record ever touches
+record 3, so the redo/undo passes never put it in the overlay and
+the replay never healed it; `ntfsck` then reports
+"`$MFT`/`$MFTMirr` records do not match" (cut 46: one flag byte in
+record 3). After the overlay flush, `flush_overlay` in
+`core/logfile/logfile_replay.c` re-checks every record 0–3: it
+reads the raw on-disk `$MFT` bytes, validates them on a deprotected
+copy (`check_file_record`), and copies them into the mirror cluster
+when they differ (new counter `mirror_records_healed` in
+`struct ntfs_log_replay_result`). The comparison and the copy use
+the raw bytes deliberately: protecting a copy bumps the USN
+(`lfs_fixup_pre_write` increments it on every call), so a freshly
+protected record never matches the bytes on disk and the "healed"
+mirror would then mismatch `$MFT` — the first version of this fix
+did exactly that (driver journal suite 3 failures, `ntfsck` exit
+4). A record that fails validation is left alone (the mirror stays
+the better copy; chkdsk owns it) and a mirror write failure is
+counted, not returned (the volume is consistent, only its backup
+is stale). The crash sweep is now fully green: 379 checks, 0
+failures — 19 cut points, 2 inconsistent before replay, 0 still bad
+after it. Step 3 lands with the crash test itself, next.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

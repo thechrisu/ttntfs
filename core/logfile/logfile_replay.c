@@ -2000,6 +2000,101 @@ static int flush_overlay(struct replay *r)
 		else
 			mirr_rec = NULL, free(copy);
 	}
+	/*
+	 * Heal $MFTMirr for records 0-3 the loop did not sync. A crash
+	 * between a record 0-3 $MFT writeback and its mirror bio leaves
+	 * the mirror stale by that write — the unmount's dirty-flag
+	 * clear in record 3 is the routine case — and no log record
+	 * ever touches record 3, so the redo/undo passes never put it
+	 * in the overlay. After replay $MFT is authoritative: bring
+	 * the mirror into agreement for every record 0-3, re-checking
+	 * the ones the loop synced (a record it synced compares equal
+	 * and is skipped). The comparison and the copy use the raw
+	 * on-disk bytes: protecting a copy would bump the USN
+	 * (lfs_fixup_pre_write increments it on every call), so a
+	 * freshly protected record never matches the bytes on disk
+	 * and the "healed" mirror would then mismatch $MFT. A record
+	 * that fails validation (on a deprotected copy) is left alone
+	 * — the mirror stays the better copy and chkdsk owns it. A
+	 * mirror write failure is not fatal — the volume is still
+	 * consistent, only its backup is stale — so it is counted,
+	 * not returned.
+	 */
+	for (i = 0; i <= MFT_REC_VOL; i++) {
+		uint8_t *raw, *rec, *cl;
+		uint64_t lcn, vbo;
+
+		raw = malloc(r->rs);
+		if (!raw)
+			break;
+		if (r->ap->read_mft_record(r->ap->ctx, i, raw)) {
+			free(raw);
+			continue;
+		}
+		/* Validate on a deprotected copy; compare and copy raw. */
+		rec = malloc(r->rs);
+		if (!rec) {
+			free(raw);
+			break;
+		}
+		memcpy(rec, raw, r->rs);
+		if (lf_get32(rec) != LFS_MAGIC_FILE ||
+		    lfs_fixup_post_read(rec, r->rs, LFS_SECTOR_SIZE, NULL) ||
+		    !check_file_record(r, rec)) {
+			free(rec);
+			free(raw);
+			continue;
+		}
+		free(rec);
+		if (!mirr.nruns) {
+			struct ovl_mft *mir;
+			if (!ovl_get_mft(r, MFT_REC_MIRR, false, &mir) && !mir->bad &&
+			    check_file_record(r, mir->rec)) {
+				uint32_t o;
+				for (o = lf_get16(mir->rec + MR_ATTRS_OFFSET);
+				     lf_get32(mir->rec + o + AT_TYPE) != ATTR_TYPE_END;
+				     o += lf_get32(mir->rec + o + AT_LENGTH)) {
+					if (lf_get32(mir->rec + o + AT_TYPE) == ATTR_TYPE_DATA &&
+					    !mir->rec[o + AT_NAME_LENGTH]) {
+						oa_load_extent(r, &mirr, mir->rec + o);
+						break;
+					}
+				}
+			}
+			if (!mirr.nruns) {
+				free(raw);
+				break;
+			}
+		}
+		vbo = (uint64_t)i * r->rs;
+		if ((uint64_t)(i + 1) * r->rs > mirr.data_size) {
+			free(raw);
+			continue;
+		}
+		if (!run_lookup(&mirr, vbo / r->cs, &lcn) || lcn == SPARSE_LCN) {
+			free(raw);
+			continue;
+		}
+		cl = malloc(r->cs);
+		if (!cl) {
+			free(raw);
+			break;
+		}
+		if (r->ap->read_clusters(r->ap->ctx, lcn, 1, cl)) {
+			free(cl);
+			free(raw);
+			continue;
+		}
+		if (memcmp(cl + vbo % r->cs, raw, r->rs) != 0) {
+			memcpy(cl + vbo % r->cs, raw, r->rs);
+			if (!r->ap->write_clusters(r->ap->ctx, lcn, 1, cl)) {
+				r->res->mirror_records_healed++;
+				r->res->clusters_written++;
+			}
+		}
+		free(cl);
+		free(raw);
+	}
 	free(mirr.runs);
 
 	/* Clusters: coalesce runs of consecutive dirty lcns. */
