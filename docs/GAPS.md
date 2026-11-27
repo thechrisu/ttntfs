@@ -1174,14 +1174,22 @@ and $R count 1; second replay redoes 2 and the $R entry is still
 exactly one; `ntfsck` clean; the symlink and dir-link walks moved
 their $SI update after the $FILE_NAME create too — res_redo 0x400
 for a plain/WSL link, 0x10000400 for a dir-link, live and replayed
-$SI agreeing in both cases). Crash tests in the follow-up commit
-(this round). Follow-ups, not this class: no VFS operation sets
+$SI agreeing in both cases). Crash tests landed in the follow-up
+commit (this round): one cut-point sweep for the mknod half in
+core/tests/test_crash.c — 63 cut points, every write sampled, 6
+inconsistent before replay, 0 still bad after it; device all-old 27
+times, all-new 36 times; per cut the $R entry count agrees with the
+device and the $SI flags are exactly 0x40404 when present.
+Evidence: `test_crash` 8519 checks, 0 failures (was 7641). The
+sweep found one bug — the $SI staging from a not-yet-final
+ni->flags, fixed in the follow-up commit of this round before this
+sweep landed. Follow-ups, not this class: no VFS operation sets
 reparse data on an existing file, so there is no standalone
 reparse-set class to journal; the mkdir class never stages a $SI
 flags update at all, so a replayed directory's $SI carries the
 as-added flags instead of the final DUP_FILE_NAME_INDEX_PRESENT —
 the same shape, unasserted there.
-Next: the reparse crash tests, then the compressed-write class.
+Next: the compressed-write class, then Phase 4.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

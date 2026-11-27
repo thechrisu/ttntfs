@@ -4669,6 +4669,364 @@ static void test_journaled_unlink_reparse_cut_points(void)
 	printf("test_journaled_unlink_reparse_cut_points\n");
 }
 
+/* ---- mknod of a device node: the $R entry must arrive with the device --
+ *
+ * Base image with an empty directory "d"; the operation under test is
+ * one journaled mknod of a char device "dev" (S_IFCHR|0644) in it.
+ * A cut before the commit must replay to no device at all, a cut
+ * after it to the device with its mode, its RECALL_ON_OPEN /
+ * REPARSE_POINT flags and exactly one $R entry — either way
+ * ntfsck-clean, and a second replay is a no-op. The create
+ * direction: all-old is the device absent, all-new is the device
+ * present. The $R count keys on the LX_CHR tag (0x80000025), so a
+ * wrong tag fails the sweep even though the mode/flags check does
+ * not read the tag itself. */
+
+static long crash_run_mknod_journaled(const char *path, long limit)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_mknod(d, "dev", S_IFCHR | 0644, &f) == 0)
+				ntfs_inode_put(f);
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+/* The device's record number and $Reparse's, read off an image where
+ * the mknod ran to completion — the numbers are stable across cuts
+ * because the base is identical each time. */
+static int mknod_ids(const char *path, uint64_t *ino_out,
+		     uint64_t *rp_ino_out)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	int err = -ENOENT;
+
+	*ino_out = 0;
+	*rp_ino_out = 0;
+	dev = ntfs_bdev_open_path(path, true);
+	if (!dev)
+		return -EIO;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -EIO;
+	}
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "dev", &f) == 0) {
+				*ino_out = ntfs_inode_number(f);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		if (ntfs_lookup(root, "$Extend", &ext) == 0) {
+			if (ntfs_lookup(ext, "$Reparse", &rp) == 0) {
+				*rp_ino_out = ntfs_inode_number(rp);
+				ntfs_inode_put(rp);
+			}
+			ntfs_inode_put(ext);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (*ino_out && *rp_ino_out)
+		err = 0;
+	return err;
+}
+
+static void test_journaled_mknod_cut_points(void)
+{
+	char base[1024], work[1024], probe[1024];
+	struct aftermath old_a;
+	uint64_t ino = 0, rp_ino = 0;
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+
+	scratch_path(base, sizeof(base), "mk-base");
+	scratch_path(work, sizeof(work), "mk-work");
+	scratch_path(probe, sizeof(probe), "mk-probe");
+	if (make_symlink_base(base, SYMLINK_WIN) != 0) {
+		fprintf(stderr, "SKIP test_journaled_mknod_cut_points: "
+				"mkntfs unavailable\n");
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_mknod_cut_points: "
+				"ntfsck unavailable at '%s'\n", ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	/* The old device state, read off a probe copy so the base stays
+	 * untouched: no device at all. */
+	if (copy_file(base, probe) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	old_a = remount(probe, "d", "dev");
+	unlink(probe);
+	if (!old_a.mounts) { FAILF("the base does not mount\n"); unlink(base); return; }
+	if (old_a.file_present) {
+		failures++;
+		fprintf(stderr, "FAIL: the base already has the device\n");
+		unlink(base);
+		return;
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_mknod_journaled(work, LONG_MAX);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-mknod-uncrashed.img", tmpdir);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled mknod made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+	/* The record numbers, off the uncrashed run: the device's, and
+	 * $Reparse's for the $R-entry check. */
+	if (mknod_ids(work, &ino, &rp_ino) != 0) {
+		FAILF("could not read the device / $Reparse numbers off the uncrashed run\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  device present/mode\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct aftermath a;
+		struct geometry g;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		int r_count = -1;
+		bool pre_bad, post_bad, is_old, is_new;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_mknod_journaled(work, cut);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-mknod-cut-%ld.img",
+					 tmpdir, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-mknod-replayed-%ld.img",
+					 tmpdir, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = remount(work, "d", "dev");
+		/* remount opens the device read-only, so the mode it
+		 * reports has the write bits stripped (020444, not
+		 * 020644 — the crash-test pattern, see the setattr
+		 * sweep); the $SI flags are exact — a replay that lost
+		 * the SYSTEM bit (0x40400, live 0x40404) is exactly the
+		 * bug the first mknod glue had. */
+		is_old = !a.file_present;
+		is_new = a.file_present && a.mode == 020444u &&
+			 a.flags == 0x40404u;
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		/* The $R entry must agree with the device: exactly one
+		 * when it is present, absent when it is gone. */
+		if (a.mounts && (is_old || is_new))
+			r_count = symlink_reparse_count(work, rp_ino,
+							0x80000025u, ino);
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s/0%o\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.file_present ? "present" : "absent", a.mode);
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+					cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+					cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+					cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+					cut, (unsigned long long)bad_ino,
+					(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: the "
+					"volume no longer mounts after replay\n",
+					cut);
+		}
+		checks++;
+		if (a.mounts && !is_old && !is_new) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: the device "
+					"is present %d mode 0%o flags 0x%x after replay — neither "
+					"all-old nor all-new\n",
+					cut, (int)a.file_present, a.mode, a.flags);
+		}
+		checks++;
+		if (a.mounts && (is_old || is_new) &&
+		    r_count != (is_new ? 1 : 0)) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: the $R "
+					"entry count is %d after replay, want %d "
+					"(device %s)\n",
+					cut, r_count, is_new ? 1 : 0,
+					is_new ? "present" : "absent");
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled mknod cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+					cut, err_rep2, an2.records_redone,
+					an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; device all-old %d times, all-new %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_mknod_cut_points\n");
+}
 
 /* ---- EA ------------------------------------------------------------ */
 
@@ -5283,6 +5641,7 @@ int main(void)
 	test_journaled_create_cut_points();
 	test_journaled_unlink_cut_points();
 	test_journaled_unlink_reparse_cut_points();
+	test_journaled_mknod_cut_points();
 	test_journaled_rename_cut_points();
 	test_journaled_rename_over_cut_points();
 	test_journaled_mkdir_cut_points();
