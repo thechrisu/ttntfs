@@ -209,7 +209,13 @@ int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 	int err;
 
 	*out = NULL;
-	if (!vol->log_writer || !S_ISREG(mode))
+	/* Phase 3 mkdir: directories begin too (their $INDEX_ROOT is
+	 * staged in __ntfs_create, next to the $DATA staging for files).
+	 * Symlinks, devices and other non-regular, non-directory files
+	 * never begin — their reparse staging belongs to their own
+	 * classes, and a transaction that cannot describe them would
+	 * abort anyway. */
+	if (!vol->log_writer || (!S_ISREG(mode) && !S_ISDIR(mode)))
 		return 0;
 	jt = kmalloc(sizeof(*jt), GFP_NOFS);
 	if (!jt)

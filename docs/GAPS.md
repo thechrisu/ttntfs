@@ -746,7 +746,55 @@ inconsistent before replay, 0 still bad after it; j.txt
 present 21 times, k.txt present all 54 — the target name must
 always survive, and both names present is the correct undo
 outcome). Whole test_crash binary: 1406 checks, 0 failures.
-Next: the mkdir class.
+Phase 3, mkdir — glue landed 2026-11-27 (commit, this round):
+two changes, both in the create path, because a mkdir IS a
+create with an $INDEX_ROOT instead of a $DATA attribute. First,
+`ntfs_journal_create_begin` now begins for S_ISDIR as well as
+S_ISREG (symlinks, devices and other non-regular, non-directory
+files still never begin — their reparse staging belongs to their
+own classes). Second, `__ntfs_create` stages the $INDEX_ROOT
+attribute add (`ntfs_journal_create_attr` with AT_INDEX_ROOT,
+I30, 4) — staged after the inherited-compression flag set, so
+the logged bytes are the final ones; staging before it would
+replay an $INDEX_ROOT without the COMPRESSED flag the live
+record carries. Everything else was already staged for
+directories: the $MFT sizes, the Initialize record, $SECURITY_
+DESCRIPTOR, $EA_INFORMATION + $EA, $FILE_NAME, the index entry
+and the bitmap bit. A journaled mkdir is the same 16 records as
+a journaled create (2 open + 9 data + Commit + 3 dumps +
+Forget), the five CreateAttributes being $SECURITY_DESCRIPTOR,
+$INDEX_ROOT, $EA_INFORMATION, $EA and $FILE_NAME — the
+$INDEX_ROOT sitting exactly where the file's $DATA sits. A mkdir
+in the root still falls back to unjournaled, as before: the
+root's entry lands in its $INDEX_ALLOCATION block, which the
+journal cannot describe.
+Driver tests (`core/tests/test_journal.c`, suite 442 checks, 0
+failures): new `test_mkdir_journaled` (walk 16, same op sequence
+as a create; replay redoes only the create's 2 idempotent
+records; after replay a file can be created inside the replayed
+directory — that is what proves the replayed record carries a
+usable $INDEX_ROOT, not just the name). The $FILE_NAME name scan
+in the walk harness is now a settable pattern (`set_fn_name`,
+default "j.txt", reset after each walk) so a test that creates
+another name can scan for it — the mkdir test scans for "jdir".
+`test_rmdir_journaled` updated for the new world: its setup
+mkdir of sub/sub2 now journals, so the walk holds the mkdir's 14
+still-live records plus the rmdir's 11 (25), and replay redoes 3
+(the mkdir's sizes + SetBits and the rmdir's ClearBits).
+Negative control ($INDEX_ROOT staging stubbed to -ENOENT): 18
+failures across the mkdir and rmdir tests, and the mkdirs
+themselves still succeed — the abort-to-unjournaled path works
+as designed. (A first stub that replaced the whole
+`journal_stage` call instead made every mkdir fail with
+-ENOENT — the abort-and-swallow lives in `journal_stage`
+itself, so a control must stub the staging call inside it.)
+Crash tests (`core/tests/test_crash.c`, this round, land as
+their own commit next): `test_journaled_mkdir_cut_points`
+(mkdir d/e, 56 cut points sampled at every write, 6
+inconsistent before replay, 0 still bad after it; d/e present
+34 times, absent 22). Whole test_crash binary: 1808 checks, 0
+failures.
+Next: the truncate/extend class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

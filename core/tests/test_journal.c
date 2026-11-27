@@ -286,10 +286,30 @@ struct rec_seen {
 	int sizes_count;
 };
 
+/* $FILE_NAME create: its redo carries the name in UTF-16LE. The
+ * pattern defaults to "j.txt"; a test that creates another name
+ * calls set_fn_name() before walk_log(). walk_log() resets the
+ * pattern to the default after each walk, so a test that does not
+ * call it always scans for "j.txt". */
+static uint8_t fn_name_pat[2 * 32];
+static size_t fn_name_len;
+
+static void set_fn_name(const char *name)
+{
+	size_t i, n = strlen(name);
+
+	if (n > 32)
+		n = 32;
+	for (i = 0; i < n; i++) {
+		fn_name_pat[2 * i] = (uint8_t)name[i];
+		fn_name_pat[2 * i + 1] = 0;
+	}
+	fn_name_len = 2 * n;
+}
+
 static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 {
 	struct rec_seen *s = ctx;
-	static const uint8_t name_utf16[] = { 'j', 0, '.', 0, 't', 0, 'x', 0, 't', 0 };
 	size_t i;
 
 	if (r->record_type != LFS_RECORD_TYPE_CLIENT || s->n >= 64)
@@ -299,10 +319,12 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 	s->target_attr[s->n] = r->target_attr;
 	s->target_vcn[s->n] = r->target_vcn;
 	s->record_off[s->n] = r->record_off;
-	if (r->redo_op == LOP_CreateAttribute && r->redo && r->redo_len >= sizeof(name_utf16)) {
+	if (fn_name_len == 0)
+		set_fn_name("j.txt");
+	if (r->redo_op == LOP_CreateAttribute && r->redo && r->redo_len >= fn_name_len) {
 		const uint8_t *p = r->redo;
-		for (i = 0; i + sizeof(name_utf16) <= r->redo_len; i++) {
-			if (!memcmp(p + i, name_utf16, sizeof(name_utf16))) {
+		for (i = 0; i + fn_name_len <= r->redo_len; i++) {
+			if (!memcmp(p + i, fn_name_pat, fn_name_len)) {
 				s->fn_name_hits++;
 				s->fn_lsn = r->lsn;
 				break;
@@ -400,6 +422,8 @@ out_img:
 	ntfs_image_close(&img);
 out_dev:
 	ntfs_bdev_close(dev);
+	/* Back to the default pattern for the next test. */
+	set_fn_name("j.txt");
 	return err;
 }
 
@@ -825,7 +849,219 @@ static void test_mkdir_unjournaled(void)
 	unlink(snap);
 }
 
-/* ---- 3. a create in the root falls back to unjournaled -------------- */
+/* ---- 3. a mkdir in a driver-made directory journals -------------------- */
+
+static void test_mkdir_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *sub = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, sub_ino = 0, mrlsn_file = 0, mrlsn_dir = 0,
+		lsn_fn = 0, lsn_index = 0;
+	int err, i;
+
+	printf("test_mkdir_journaled\n");
+	scratch_path(orig, sizeof(orig), "morig");
+	scratch_path(snap, sizeof(snap), "msnap");
+	scratch_path(snap1, sizeof(snap1), "msnap1");
+	scratch_path(snap2, sizeof(snap2), "msnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_mkdir_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* "sub" goes in the root and so stays unjournaled (test 2); the
+	 * mkdir under test goes in "sub", whose $INDEX_ROOT is resident
+	 * and describable. A mkdir is a create with an $INDEX_ROOT
+	 * instead of a $DATA attribute: the same 16 records, the same
+	 * order, the $INDEX_ROOT CreateAttribute sitting exactly where
+	 * the file's $DATA CreateAttribute sits. */
+	err = ntfs_mkdir(root, "sub", 0100755, &sub);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(sub);
+
+	err = ntfs_mkdir(sub, "jdir", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(d);
+	CHECK(ino > 16);
+	ntfs_inode_put(d);
+	d = NULL;
+	CHECK_EQ(ntfs_lookup(sub, "jdir", &f), 0);
+	if (f) { ntfs_inode_put(f); f = NULL; }
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log — what a crash at this instant leaves. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (sub) { ntfs_inode_put(sub); sub = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: exactly one transaction, 2 open + 9 data + Commit +
+	 * 3 dumps + Forget, in the order the create staged them. The
+	 * five CreateAttributes are $SECURITY_DESCRIPTOR, $INDEX_ROOT,
+	 * $EA_INFORMATION, $EA and $FILE_NAME — the $INDEX_ROOT in the
+	 * slot the file's $DATA occupies. */
+	/* The $FILE_NAME scan looks for the created name. */
+	set_fn_name("jdir");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 16);
+	if (s.n == 16) {
+		static const uint16_t want_op[9] = {
+			LOP_SetNewAttributeSizes,
+			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_AddIndexEntryRoot, LOP_SetBitsInNonresidentBitMap,
+		};
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		for (i = 0; i < 9; i++) {
+			CHECK_EQ(s.redo_op[i + 2], want_op[i]);
+			CHECK_EQ(s.target_attr[i + 2], i < 8 ? 0x18u : 0x40u);
+		}
+		CHECK_EQ(s.redo_op[11], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[12], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+		/* The $FILE_NAME create is the last CreateAttribute, the
+		 * record right before the index entry. */
+		lsn_fn = s.lsn[8];
+		lsn_index = s.lsn[9];
+		CHECK_EQ(s.redo_op[8], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_AddIndexEntryRoot);
+	}
+	/* The name appears in exactly one CreateAttribute's redo: the
+	 * $FILE_NAME one, and it is the record before the index entry. */
+	CHECK_EQ(s.fn_name_hits, 1);
+	CHECK_EQ(s.fn_lsn, lsn_fn);
+	/* The SetBits names the new record number, one bit. */
+	CHECK_EQ(s.bits_bit, (uint32_t)ino);
+	CHECK_EQ(s.bits_count, 1u);
+	CHECK_EQ(s.bits_lsn, s.lsn[10]);
+	/* The SetBits targets the bitmap's first cluster. */
+	CHECK_EQ(s.target_vcn[10], 0u);
+	/* The $MFT $DATA size extension: exactly one record, staged
+	 * first, its redo the live size, its undo one record less. */
+	{
+		uint16_t data_off = 0;
+		uint64_t alloc = 0, data = 0;
+		uint32_t rec_size = 0;
+		CHECK_EQ(read_mft0_data_attr(snap, &data_off, &alloc, &data, &rec_size), 0);
+		CHECK_EQ(s.sizes_count, 1);
+		CHECK_EQ(s.sizes_lsn, s.lsn[2]);
+		CHECK_EQ(s.record_off[2], data_off);
+		CHECK_EQ(s.target_vcn[2], 0u);
+		CHECK_EQ(s.sizes_redo_data, data);
+		CHECK_EQ(s.sizes_undo_data, data - rec_size);
+		CHECK_EQ(s.sizes_redo_total, 0u);
+		CHECK(rec_size == 1024u);
+	}
+
+	/* Both touched records carry an MR_LSN at or past the record
+	 * that touched them: the replay's skip check. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_fn);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_index);
+
+	/* Replay copy 1: the MFT records were already flushed, so only
+	 * the two records that carry no LSN to skip on redo — the $MFT
+	 * $DATA size extension and the SetBits — and the extension
+	 * writes MFT record 0. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The directory is present on the replayed volume, and a file
+	 * can be created inside it: that is what proves the replayed
+	 * record carries a usable $INDEX_ROOT, not just the name. */
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "jdir"), 0);
+	{
+		struct ntfs_bdev *dev1;
+		ntfs_volume_t *vol1 = NULL;
+		ntfs_inode_t *root1 = NULL, *sub1 = NULL, *d1 = NULL,
+			*f1 = NULL;
+
+		dev1 = ntfs_bdev_open_path(snap1, false);
+		CHECK(dev1 != NULL);
+		if (dev1) {
+			err = ntfs_mount(dev1, &mopts, &vol1);
+			CHECK_EQ(err, 0);
+			if (!err) {
+				CHECK_EQ(ntfs_volume_root(vol1, &root1), 0);
+				if (root1) {
+					CHECK_EQ(ntfs_lookup(root1, "sub", &sub1), 0);
+					if (sub1) {
+						CHECK_EQ(ntfs_lookup(sub1, "jdir", &d1), 0);
+						if (d1) {
+							CHECK_EQ(ntfs_create(d1, "x.txt", 0100644, &f1), 0);
+							if (f1) { ntfs_inode_put(f1); f1 = NULL; }
+							ntfs_inode_put(d1);
+							d1 = NULL;
+						}
+						ntfs_inode_put(sub1);
+						sub1 = NULL;
+					}
+					ntfs_inode_put(root1);
+					root1 = NULL;
+				}
+				CHECK_EQ(ntfs_volume_sync(vol1), 0);
+				ntfs_unmount(vol1);
+			}
+			ntfs_bdev_close(dev1);
+		}
+	}
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * two records. Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+/* ---- 4. a create in the root falls back to unjournaled -------------- */
 
 static void test_create_in_root_unjournaled(void)
 {
@@ -879,7 +1115,7 @@ static void test_create_in_root_unjournaled(void)
 	unlink(snap);
 }
 
-/* ---- 4. a regular-file unlink journals --------------------------------- */
+/* ---- 5. a regular-file unlink journals --------------------------------- */
 
 static void test_unlink_journaled(void)
 {
@@ -1047,7 +1283,7 @@ out:
 	unlink(snap1);
 }
 
-/* ---- 5. an unlink in the root falls back to unjournaled --------------- */
+/* ---- 6. an unlink in the root falls back to unjournaled --------------- */
 
 static void test_unlink_in_root_unjournaled(void)
 {
@@ -1106,7 +1342,7 @@ out:
 	unlink(snap);
 }
 
-/* ---- 6. an rmdir journals like an unlink ------------------------------ */
+/* ---- 7. an rmdir journals like an unlink ------------------------------ */
 
 static void test_rmdir_journaled(void)
 {
@@ -1165,35 +1401,45 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
+	/* The walk holds the mkdir's 14 still-live records first (its
+	 * two opens precede oldest_lsn and are dispensable), then the
+	 * rmdir's full 11 — the rmdir's opens follow oldest_lsn, so
+	 * they are held. Before the mkdir class the setup mkdir was
+	 * unjournaled and the walk held only the rmdir's 11. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 11);
-	if (s.n == 11) {
-		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[0], 0x18u);
-		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[1], 0x40u);
-		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
-		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
-		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[3], sub2_ino / 4);
-		CHECK_EQ(s.target_vcn[4], sub2_ino / 4);
-		CHECK_EQ(s.target_vcn[5], (sub2_ino / 8) / 4096);
+	CHECK_EQ(s.n, 25);
+	if (s.n == 25) {
+		/* The mkdir's first and last live records. */
+		CHECK_EQ(s.redo_op[0], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x40u);
+		CHECK_EQ(s.redo_op[16], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[18], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[19], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[17], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[18], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[19], (sub2_ino / 8) / 4096);
 	}
 
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	/* Only the ClearBits redoes (idempotent clear of an
-	 * already-clear bit); the Deallocate is skipped on its
-	 * effect — the record is already free on disk. */
-	CHECK_EQ(an.records_redone, 1u);
+	/* Three records redo: the mkdir's $MFT $DATA size extension
+	 * and SetBits (both idempotent) plus the rmdir's ClearBits
+	 * (idempotent clear of an already-clear bit); the Deallocate
+	 * is skipped on its effect — the record is already free on
+	 * disk. */
+	CHECK_EQ(an.records_redone, 3u);
 	CHECK(!an.needs_chkdsk);
 
 	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "sub2"), -ENOENT);
@@ -1204,7 +1450,7 @@ out:
 	unlink(snap1);
 }
 
-/* ---- 7. a same-directory rename journals the link + old-name removal */
+/* ---- 8. a same-directory rename journals the link + old-name removal */
 
 static void test_rename_journaled(void)
 {
@@ -1345,7 +1591,7 @@ out:
 	unlink(snap1);
 }
 
-/* ---- 8. a rename in the root falls back to unjournaled ---------------- */
+/* ---- 9. a rename in the root falls back to unjournaled ---------------- */
 
 static void test_rename_in_root_unjournaled(void)
 {
@@ -1406,7 +1652,7 @@ out:
 	unlink(snap);
 }
 
-/* ---- 9. renaming over an existing file journals the target's removal -- */
+/* ---- 10. renaming over an existing file journals the target's removal -- */
 
 static void test_rename_over_journaled(void)
 {
@@ -1558,7 +1804,7 @@ out:
 	unlink(snap1);
 }
 
-/* ---- 10. a rename across driver-made directories ---------------------- */
+/* ---- 11. a rename across driver-made directories ---------------------- */
 
 static void test_rename_cross_dir_journaled(void)
 {
@@ -1694,6 +1940,7 @@ int main(void)
 	ntfs_set_logger(quiet_logger, NULL);
 	test_create_journaled();
 	test_mkdir_unjournaled();
+	test_mkdir_journaled();
 	test_create_in_root_unjournaled();
 	test_unlink_journaled();
 	test_unlink_in_root_unjournaled();

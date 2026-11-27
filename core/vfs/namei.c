@@ -363,7 +363,9 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	 * and insert_inode_hash) and before the directory is marked
 	 * dirty. A begin failure is not a create failure — the driver
 	 * created unjournaled for years — so warn and proceed
-	 * unjournaled. Non-regular files never begin (jt stays NULL).
+	 * unjournaled. Symlinks, devices and other non-regular,
+	 * non-directory files never begin (jt stays NULL); regular
+	 * files and directories do (Phase 3 mkdir).
 	 */
 	err = ntfs_journal_create_begin(vol, mode, &jt);
 	if (err)
@@ -575,6 +577,21 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			if (err)
 				goto err_out;
 		}
+
+		/*
+		 * PORT: journal the $INDEX_ROOT (docs/JOURNAL-DESIGN.md
+		 * Phase 3 mkdir). Staged after the compression-flag set,
+		 * so the logged bytes are the final ones — staging before
+		 * it would replay an $INDEX_ROOT without the COMPRESSED
+		 * flag the live record carries. The $DATA branch below is
+		 * the file equivalent; directories carry no $DATA.
+		 */
+		err = journal_stage(jt ? ntfs_journal_create_attr(jt, ni, ni_mrec,
+								  AT_INDEX_ROOT,
+								  I30, 4) : 0,
+				    &jt);
+		if (err)
+			goto err_out;
 
 		if (dir_link) {
 			/* Native tag only: the resolver already required a target
