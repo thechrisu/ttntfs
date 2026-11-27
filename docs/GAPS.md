@@ -692,7 +692,61 @@ outcome is correct depending on where the crash landed. Whole
 test_crash binary: 536 checks, 0 failures. The sweep is what
 drove the free-in-unlink fix above: before the fix it was 16
 bad (resurrected bitmap bit) and then 7 bad (link-count-0
-record with no $FILE_NAME). Next: the rename class.
+record with no $FILE_NAME).
+Phase 3, rename — glue landed 2026-11-27 (commit, this round):
+one transaction per `__ntfs_vfs_rename` call, in live order —
+the target's removal (when renaming over an existing file, the
+unlink records including its record free, staged by
+`ntfs_delete` itself), then the link
+(`ntfs_journal_rename_stage_link`: a CreateAttribute for the
+new $FILE_NAME plus an AddIndexEntryRoot for the new entry),
+then the old name's removal (the unlink records again). The
+transaction reuses the unlink carrier
+(`ntfs_journal_unlink_begin`/`abort`); only the link staging
+and the commit are rename-specific
+(`ntfs_journal_rename_commit` stamps MR_LSN into the moved
+record, both parents and the replaced target). The link staging
+matches by name AND parent — a cross-directory rename to the
+same name briefly carries two $FILE_NAMEs with the same name
+and different parents, and the first version matched by name
+alone, staged the old $FILE_NAME, failed the index lookup and
+fell back to unjournaled (caught by the cross-dir driver test:
+walk 16, MR_LSN of the new parent 0). The replay's
+Add/DeleteIndexEntryRoot apply at the staged offset, and
+staging order is live order, so a same-directory rename
+replays to the exact live layout. A case-only rename goes
+through a temporary name in two calls, so it writes two
+transactions — a crash between them leaves the file under the
+temporary name, consistent and ntfsck-clean, the same outcome
+the unjournaled driver has always had there. The $SI
+mtime/ctime updates the rename makes are not journaled (the
+setattr class's work); the staged $FILE_NAME carries the
+pre-rename timestamps, matching the live $FILE_NAME bytes.
+Driver tests (`core/tests/test_journal.c`, suite 358 checks, 0
+failures): `test_rename_journaled` (one 10-record transaction,
+walk 24, replay redoes only the create's 2 idempotent records),
+`test_rename_in_root_unjournaled` (no client records),
+`test_rename_over_journaled` (15-record transaction, walk 45 —
+the second create's opens are still live, the first's precede
+oldest; replay redoes 5), `test_rename_cross_dir_journaled`
+(same four data records split across two parents, walk 24).
+Negative control (link staging stubbed to -ENOENT): 6 failures
+across the three journaled tests, including an ntfsck exit 4
+on the rename-over replay — the target's freed record bit
+resurrected by the create's SetBits redo, the same failure mode
+the unlink's free-in-transaction fix closed.
+Crash tests (`core/tests/test_crash.c`, this round, land as
+their own commit next): `test_journaled_rename_cut_points`
+(same-directory rename, 42 cut points sampled at every write —
+the 21-sample sweep missed the torn window entirely, 0
+pre-bad; 3 inconsistent before replay, 0 still bad after it;
+j.txt present 10 times, k.txt 32) and
+`test_journaled_rename_over_cut_points` (54 cut points, 6
+inconsistent before replay, 0 still bad after it; j.txt
+present 21 times, k.txt present all 54 — the target name must
+always survive, and both names present is the correct undo
+outcome). Whole test_crash binary: 1406 checks, 0 failures.
+Next: the mkdir class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

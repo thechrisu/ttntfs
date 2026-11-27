@@ -57,6 +57,36 @@
  *                        file unlink; replay redoes only the
  *                        ClearBits.
  *
+ *   rename_journaled   a same-directory rename writes exactly one
+ *                        transaction to $LogFile (one open record —
+ *                        $MFT:$DATA — CreateAttribute, AddIndexEntryRoot,
+ *                        DeleteIndexEntryRoot, DeleteAttribute, Commit,
+ *                        three table dumps, Forget); the create's
+ *                        records stay live, so the walk holds 24.
+ *                        Replaying the snapshot redoes only the
+ *                        create's two idempotent records — the
+ *                        rename's records are skipped on their MR_LSN
+ *                        stamps — and the file is under its new name
+ *                        and ntfsck -n is clean.
+ *   rename_in_root_unjournaled
+ *                        a rename in the root writes no client records
+ *                        (both entries live in the root's
+ *                        $INDEX_ALLOCATION block) and still succeeds.
+ *   rename_over_journaled
+ *                        renaming over an existing file journals the
+ *                        target's removal (including its record free)
+ *                        in the same transaction as the link and the
+ *                        old name's removal: 2 open + 8 data + Commit
+ *                        + 3 dumps + Forget = 15 records; the walk
+ *                        holds 45 with the two creates' live records
+ *                        (14 + 16 — the second create's opens are
+ *                        still live, the first's precede oldest).
+ *   rename_cross_dir_journaled
+ *                        a rename across driver-made directories
+ *                        journals the same four data records as a
+ *                        same-directory rename, split across the two
+ *                        parents; the walk holds 24.
+ *
  * The snapshot is copied after create+sync while the original is still
  * mounted, so the copy holds the flushed metadata and the still-dirty
  * log: exactly what a crash at that instant would leave. The original
@@ -1174,6 +1204,490 @@ out:
 	unlink(snap1);
 }
 
+/* ---- 7. a same-directory rename journals the link + old-name removal */
+
+static void test_rename_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, sub_ino = 0, mrlsn_file = 0, mrlsn_dir = 0,
+		lsn_create_attr = 0, lsn_add_idx = 0, lsn_del_idx = 0,
+		lsn_del_attr = 0;
+	int err;
+
+	printf("test_rename_journaled\n");
+	scratch_path(orig, sizeof(orig), "rnorig");
+	scratch_path(snap, sizeof(snap), "rnsnap");
+	scratch_path(snap1, sizeof(snap1), "rnsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_rename_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(f);
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* The rename: same directory, no target to replace. */
+	CHECK_EQ(ntfs_rename(d, "j.txt", d, "k.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds 24 records: the create's 14 still-live ones
+	 * (see test_unlink_journaled) plus the rename's 10 — 1 open
+	 * ($MFT:$DATA: the rename allocates and frees nothing, so no
+	 * $MFT:$BITMAP open record) + 4 data + Commit + 3 dumps +
+	 * Forget. The rename's data records are the link half first
+	 * (CreateAttribute for the new $FILE_NAME, AddIndexEntryRoot
+	 * for the new entry) then the old name's removal
+	 * (DeleteIndexEntryRoot, DeleteAttribute), in live order. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 24);
+	if (s.n == 24) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[16], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.target_attr[18], 0x18u);
+		/* The new $FILE_NAME and the old one's removal target
+		 * the file's record; both index records target the
+		 * parent's. */
+		CHECK_EQ(s.target_vcn[15], ino / 4);
+		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[17], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[18], ino / 4);
+		lsn_create_attr = s.lsn[15];
+		lsn_add_idx = s.lsn[16];
+		lsn_del_idx = s.lsn[17];
+		lsn_del_attr = s.lsn[18];
+	}
+
+	/* Both touched records carry an MR_LSN at or past the record
+	 * that touched them. The file's record was touched by the
+	 * CreateAttribute and the DeleteAttribute; the parent's by
+	 * both index records. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_create_attr);
+	CHECK(mrlsn_file >= lsn_del_attr);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_add_idx);
+	CHECK(mrlsn_dir >= lsn_del_idx);
+
+	/* Replay: only the create's two idempotent records redo
+	 * (SetNewAttributeSizes on record 0 and SetBits on the $MFT
+	 * bitmap cluster) — the rename's four data records are all
+	 * skipped on their MR_LSN stamps, because the file and the
+	 * directory were flushed after the commit. The file is under
+	 * its new name and ntfsck is clean. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "k.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "k.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 8. a rename in the root falls back to unjournaled ---------------- */
+
+static void test_rename_in_root_unjournaled(void)
+{
+	char orig[1024], snap[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct rec_seen s;
+	int err;
+
+	printf("test_rename_in_root_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "rrorig");
+	scratch_path(snap, sizeof(snap), "rrsnap");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_rename_in_root_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* Create in the root (unjournaled — see test 3), then rename
+	 * it in the root: both entries live in the root's
+	 * $INDEX_ALLOCATION block, which the rename transaction
+	 * cannot describe, so it aborts and the rename proceeds
+	 * unjournaled instead of failing. */
+	err = ntfs_create(root, "r.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(ntfs_rename(root, "r.txt", root, "s.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	CHECK_EQ(lookup_after_mount(snap, "s.txt"), 0);
+	CHECK_EQ(lookup_after_mount(snap, "r.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+}
+
+/* ---- 9. renaming over an existing file journals the target's removal -- */
+
+static void test_rename_over_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t j_ino = 0, k_ino = 0, sub_ino = 0;
+	int err;
+
+	printf("test_rename_over_journaled\n");
+	scratch_path(orig, sizeof(orig), "roorig");
+	scratch_path(snap, sizeof(snap), "rosnap");
+	scratch_path(snap1, sizeof(snap1), "rosnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_rename_over_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	j_ino = ntfs_inode_number(f);
+	ntfs_inode_put(f);
+	f = NULL;
+	err = ntfs_create(d, "k.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	k_ino = ntfs_inode_number(f);
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Rename j.txt over k.txt: the target's removal (index entry
+	 * + $FILE_NAME + record free + bitmap bit) is staged in the
+	 * same transaction as the link and the old name's removal. */
+	CHECK_EQ(ntfs_rename(d, "j.txt", d, "k.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds 45 records: the two creates' still-live
+	 * ones (14 for the first, 16 for the second — see below),
+	 * plus the rename's 15 — 2 open ($MFT:$DATA and
+	 * $MFT:$BITMAP: the target's free touches the bitmap) + 8
+	 * data + Commit + 3 dumps + Forget. The rename's data
+	 * records are the target's removal first (DeleteIndexEntryRoot,
+	 * DeleteAttribute, DeallocateFileRecordSegment,
+	 * ClearBitsInNonresidentBitMap), then the link half
+	 * (CreateAttribute, AddIndexEntryRoot), then the old name's
+	 * removal (DeleteIndexEntryRoot, DeleteAttribute). */
+	/* The walk holds 45 records: the first create's 14 still-live
+	 * ones (its 2 open records precede oldest — oldest sits at
+	 * its first data record, the Initialize — so they are already
+	 * dispensable), the second create's full 16 (its opens follow
+	 * oldest, so they are still live; it stages a sizes record
+	 * too, because allocating its record grows $MFT $DATA's
+	 * data_size by one record), plus the rename's 15 — 2 open
+	 * ($MFT:$DATA and $MFT:$BITMAP: the target's free touches
+	 * the bitmap) + 8 data + Commit + 3 dumps + Forget. The
+	 * rename's data records are the target's removal first
+	 * (DeleteIndexEntryRoot, DeleteAttribute,
+	 * DeallocateFileRecordSegment,
+	 * ClearBitsInNonresidentBitMap), then the link half
+	 * (CreateAttribute, AddIndexEntryRoot), then the old name's
+	 * removal (DeleteIndexEntryRoot, DeleteAttribute). */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 45);
+	if (s.n == 45) {
+		CHECK_EQ(s.redo_op[30], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[30], 0x18u);
+		CHECK_EQ(s.redo_op[31], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[31], 0x40u);
+		CHECK_EQ(s.redo_op[32], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[33], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[34], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[35], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[36], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[37], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[38], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[39], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[40], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[41], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[42], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[43], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[44], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_vcn[32], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[33], k_ino / 4);
+		CHECK_EQ(s.target_vcn[34], k_ino / 4);
+		CHECK_EQ(s.target_vcn[35], (k_ino / 8) / 4096);
+		CHECK_EQ(s.target_vcn[36], j_ino / 4);
+		CHECK_EQ(s.target_vcn[37], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[38], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[39], j_ino / 4);
+	}
+
+	/* Replay: the two creates' idempotent records redo (each
+	 * create's sizes + SetBits — every record allocation grows
+	 * $MFT $DATA's data_size by one record, so both creates
+	 * staged a sizes record) plus the rename's ClearBits for
+	 * the target's freed record — the rest of the rename's
+	 * records are skipped on their MR_LSN stamps (or, for the
+	 * Deallocate, on its effect). The file is under the target
+	 * name with the source's inode, and ntfsck is clean. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 5u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "k.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "k.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 10. a rename across driver-made directories ---------------------- */
+
+static void test_rename_cross_dir_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d1 = NULL, *d2 = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, d1_ino = 0, d2_ino = 0, mrlsn_file = 0,
+		mrlsn_d1 = 0, mrlsn_d2 = 0, lsn_create_attr = 0,
+		lsn_add_idx = 0, lsn_del_idx = 0, lsn_del_attr = 0;
+	int err;
+
+	printf("test_rename_cross_dir_journaled\n");
+	scratch_path(orig, sizeof(orig), "rxorig");
+	scratch_path(snap, sizeof(snap), "rxsnap");
+	scratch_path(snap1, sizeof(snap1), "rxsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_rename_cross_dir_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "d1", 0100755, &d1);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	d1_ino = ntfs_inode_number(d1);
+	err = ntfs_mkdir(root, "d2", 0100755, &d2);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	d2_ino = ntfs_inode_number(d2);
+
+	err = ntfs_create(d1, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(f);
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* The rename: d1/j.txt -> d2/j.txt, no target to replace. */
+	CHECK_EQ(ntfs_rename(d1, "j.txt", d2, "j.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d2) { ntfs_inode_put(d2); d2 = NULL; }
+	if (d1) { ntfs_inode_put(d1); d1 = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds 24 records: the create's 14 still-live ones
+	 * plus the rename's 10 — the same four data records as a
+	 * same-directory rename, split across the two parents: the
+	 * link half targets d2, the old name's removal targets d1. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 24);
+	if (s.n == 24) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[16], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_vcn[15], ino / 4);
+		CHECK_EQ(s.target_vcn[16], d2_ino / 4);
+		CHECK_EQ(s.target_vcn[17], d1_ino / 4);
+		CHECK_EQ(s.target_vcn[18], ino / 4);
+		lsn_create_attr = s.lsn[15];
+		lsn_add_idx = s.lsn[16];
+		lsn_del_idx = s.lsn[17];
+		lsn_del_attr = s.lsn[18];
+	}
+
+	/* All three touched records carry an MR_LSN at or past the
+	 * record that touched them. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_create_attr);
+	CHECK(mrlsn_file >= lsn_del_attr);
+	CHECK_EQ(read_mft_lsn(snap, d2_ino, &mrlsn_d2), 0);
+	CHECK(mrlsn_d2 != 0);
+	CHECK(mrlsn_d2 >= lsn_add_idx);
+	CHECK_EQ(read_mft_lsn(snap, d1_ino, &mrlsn_d1), 0);
+	CHECK(mrlsn_d1 != 0);
+	CHECK(mrlsn_d1 >= lsn_del_idx);
+
+	/* Replay: only the create's two idempotent records redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	CHECK_EQ(lookup_nested_after_mount(snap1, "d2", "j.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap1, "d1", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	CHECK_EQ(lookup_nested_after_mount(snap, "d2", "j.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "d1", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -1184,6 +1698,10 @@ int main(void)
 	test_unlink_journaled();
 	test_unlink_in_root_unjournaled();
 	test_rmdir_journaled();
+	test_rename_journaled();
+	test_rename_in_root_unjournaled();
+	test_rename_over_journaled();
+	test_rename_cross_dir_journaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

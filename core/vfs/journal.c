@@ -731,34 +731,36 @@ int ntfs_journal_unlink_check(struct ntfs_journal_unlink *u,
 	return err;
 }
 
-int ntfs_journal_unlink_stage_index(struct ntfs_journal_unlink *u,
-				    struct ntfs_inode *dir_ni,
-				    const struct file_name_attr *fn,
-				    u32 fn_len)
+/*
+ * Find the index entry whose key is the $FILE_NAME value @fn (@fn_len
+ * bytes) in @dir_mrec's $INDEX_ROOT. Match by the whole $FILE_NAME
+ * value, not by mref: a hard link in the same directory has the same
+ * parent and the same target record, but a different name. The entry
+ * key is the $FILE_NAME value; key length first, then bytes.
+ * On success fills @attr_off_out (the $INDEX_ROOT's offset in the
+ * record), @entry_off_out (the entry's offset from the attribute
+ * record's start — the aoff the log records carry), @len_out and
+ * @entry_out (the entry itself, valid while @dir_mrec stays mapped).
+ * Returns -ENOENT when the entry is not in the root (it lives in an
+ * $INDEX_ALLOCATION block, which this phase cannot describe) and
+ * -EINVAL on a corrupt index.
+ */
+static int find_index_entry_by_key(const struct mft_record *dir_mrec,
+				   const struct file_name_attr *fn, u32 fn_len,
+				   u16 *attr_off_out, u16 *entry_off_out,
+				   u32 *len_out,
+				   const struct index_entry **entry_out)
 {
-	struct mft_record *dir_mrec;
 	const struct attr_record *a;
 	const struct index_root *ir;
 	const struct index_header *ih;
 	const u8 *value, *entries, *end;
 	const struct index_entry *e;
 	u16 attr_off = 0;
-	u8 *copy;
-	u32 len;
-	u64 vcn, page_lcn;
-	u16 cluster_off, entry_off;
-	int err;
 
-	if (!u)
-		return -EINVAL;
-	dir_mrec = map_mft_record(dir_ni);
-	if (IS_ERR(dir_mrec))
-		return -ENOENT;
 	a = find_attr(dir_mrec, AT_INDEX_ROOT, I30, 4, &attr_off);
-	if (!a || a->non_resident) {
-		err = -ENOENT;
-		goto out;
-	}
+	if (!a || a->non_resident)
+		return -ENOENT;
 	value = (const u8 *)a +
 		le16_to_cpu(a->data.resident.value_offset);
 	ir = (const struct index_root *)value;
@@ -768,45 +770,65 @@ int ntfs_journal_unlink_stage_index(struct ntfs_journal_unlink *u,
 	entries = (const u8 *)ih + le32_to_cpu(ih->entries_offset);
 	end = (const u8 *)ih + le32_to_cpu(ih->index_length);
 	if (entries < value ||
-	    end > value + le32_to_cpu(a->data.resident.value_length)) {
-		err = -EINVAL;
-		goto out;
-	}
-	/* Match by the whole $FILE_NAME value, not by mref: a hard
-	 * link in the same directory has the same parent and the
-	 * same target record, but a different name. The entry key
-	 * is the $FILE_NAME value; key length first, then bytes. */
+	    end > value + le32_to_cpu(a->data.resident.value_length))
+		return -EINVAL;
 	for (e = (const struct index_entry *)entries;
 	     (const u8 *)e + 16 <= end;) {
 		u16 elen = le16_to_cpu(e->length);
 
-		if (elen < 16 || (const u8 *)e + elen > end) {
-			err = -EINVAL;
-			goto out;
-		}
+		if (elen < 16 || (const u8 *)e + elen > end)
+			return -EINVAL;
 		if (e->flags & INDEX_ENTRY_END)
 			break;
 		if (le16_to_cpu(e->key_length) == fn_len &&
 		    !memcmp((const u8 *)e + 16, fn, fn_len)) {
-			len = elen;
-			goto found;
+			if (attr_off_out)
+				*attr_off_out = attr_off;
+			if (entry_off_out)
+				*entry_off_out = (u16)((const u8 *)e -
+						       (const u8 *)a);
+			if (len_out)
+				*len_out = elen;
+			if (entry_out)
+				*entry_out = e;
+			return 0;
 		}
 		e = (const struct index_entry *)((const u8 *)e + elen);
 	}
 	/* Not in the root: the entry lives in an $INDEX_ALLOCATION
 	 * block, which this class cannot describe. */
-	err = -ENOENT;
-	goto out;
+	return -ENOENT;
+}
 
-found:
+int ntfs_journal_unlink_stage_index(struct ntfs_journal_unlink *u,
+				    struct ntfs_inode *dir_ni,
+				    const struct file_name_attr *fn,
+				    u32 fn_len)
+{
+	struct mft_record *dir_mrec;
+	const struct index_entry *e = NULL;
+	u16 attr_off = 0;
+	u8 *copy;
+	u32 len = 0;
+	u64 vcn, page_lcn;
+	u16 cluster_off, entry_off = 0;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	dir_mrec = map_mft_record(dir_ni);
+	if (IS_ERR(dir_mrec))
+		return -ENOENT;
+	err = find_index_entry_by_key(dir_mrec, fn, fn_len, &attr_off,
+				      &entry_off, &len, &e);
+	if (err)
+		goto out;
 	copy = kmalloc(len, GFP_NOFS);
 	if (!copy) {
 		err = -ENOMEM;
 		goto out;
 	}
 	memcpy(copy, e, len);
-	/* aoff is the entry's offset from the attribute record's start. */
-	entry_off = (u16)((const u8 *)e - (const u8 *)a);
 	err = mft_coords(u->vol, dir_ni->mft_no, &vcn, &cluster_off,
 			 &page_lcn);
 	if (!err)
@@ -955,5 +977,213 @@ int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
 					     em, elen);
 		unmap_mft_record(ext);
 	}
+	return err;
+}
+
+/* ---- rename (Phase 3) ---------------------------------------------------- */
+
+/*
+ * Find the $FILE_NAME attribute in the base record @m whose value's
+ * file_name matches (@name, @name_len) and whose parent is
+ * @parent_mref. find_attr returns the first $FILE_NAME, but a
+ * hard-linked inode carries several, and a cross-directory rename
+ * to the same name briefly carries two $FILE_NAMEs with the same
+ * name and different parents — the new link is the one with this
+ * name AND this parent. Returns NULL when no such attribute is in
+ * the base record (it went to an extent) or the record is corrupt.
+ */
+static const struct attr_record *find_file_name_attr(const struct mft_record *m,
+						     const __le16 *name, u8 name_len,
+						     u64 parent_mref,
+						     u16 *off_out)
+{
+	u16 off = le16_to_cpu(m->attrs_offset);
+	u32 used = le32_to_cpu(m->bytes_in_use);
+
+	while (off + 8 <= used) {
+		const struct attr_record *a =
+			(const struct attr_record *)((const u8 *)m + off);
+		u32 len;
+
+		if (a->type == AT_END)
+			break;
+		len = le32_to_cpu(a->length);
+		if (len < 8 || off + len > used)
+			return NULL;
+		if (a->type == AT_FILE_NAME && !a->non_resident) {
+			u16 voff = le16_to_cpu(a->data.resident.value_offset);
+			u32 vlen = le32_to_cpu(a->data.resident.value_length);
+			const struct file_name_attr *fn;
+
+			if (voff + sizeof(*fn) <= len && vlen >= sizeof(*fn)) {
+				fn = (const struct file_name_attr *)
+					((const u8 *)a + voff);
+				if (MREF_LE(fn->parent_directory) == parent_mref &&
+				    fn->file_name_length == name_len &&
+				    sizeof(*fn) + name_len * sizeof(__le16) <= vlen &&
+				    !memcmp(fn->file_name, name,
+					    name_len * sizeof(__le16))) {
+					if (off_out)
+						*off_out = off;
+					return a;
+				}
+			}
+		}
+		off += (u16)len;
+	}
+	return NULL;
+}
+
+int ntfs_journal_rename_stage_link(struct ntfs_journal_unlink *u,
+				   struct ntfs_inode *ni,
+				   struct ntfs_inode *dir_ni,
+				   const __le16 *name, u8 name_len)
+{
+	struct mft_record *ni_mrec, *dir_mrec;
+	const struct attr_record *a;
+	const struct index_entry *e = NULL;
+	const struct file_name_attr *fn;
+	u32 fn_len;
+	u16 off = 0, attr_off = 0, entry_off = 0;
+	u32 len = 0;
+	u8 *copy;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	/*
+	 * The $FILE_NAME half: find the new name's attribute in the
+	 * moved record (by value, not first match) and stage a
+	 * CreateAttribute carrying its bytes. The INDEXED flag on the
+	 * copy is what keys the replay's link-count bump, as in the
+	 * create path.
+	 */
+	ni_mrec = map_mft_record(ni);
+	if (IS_ERR(ni_mrec))
+		return -ENOENT;
+	a = find_file_name_attr(ni_mrec, name, name_len, dir_ni->mft_no,
+				&off);
+	if (!a) {
+		err = -ENOENT;
+		goto out_ni;
+	}
+	fn_len = le32_to_cpu(a->data.resident.value_length);
+	fn = (const struct file_name_attr *)((const u8 *)a +
+		le16_to_cpu(a->data.resident.value_offset));
+	{
+		u32 alen = le32_to_cpu(a->length);
+		u8 *acopy = kmalloc(alen, GFP_NOFS);
+
+		if (!acopy) {
+			err = -ENOMEM;
+			goto out_ni;
+		}
+		memcpy(acopy, a, alen);
+		if (!((struct attr_record *)acopy)->non_resident)
+			((struct attr_record *)acopy)->data.resident.flags |=
+				RESIDENT_ATTR_IS_INDEXED;
+		err = mft_coords(u->vol, ni->mft_no, &vcn, &cluster_off,
+				 &page_lcn);
+		if (!err)
+			err = ntfs_log_txn_create_attr(u->t,
+						       u->vol->log_mft_data_attr,
+						       vcn, cluster_off, page_lcn,
+						       off, acopy, alen);
+		kfree(acopy);
+		if (err)
+			goto out_ni;
+	}
+	/*
+	 * The index half: the entry whose key is that $FILE_NAME value,
+	 * in the new parent's $INDEX_ROOT. The moved record stays
+	 * mapped while the entry is found, so @fn stays valid.
+	 */
+	dir_mrec = map_mft_record(dir_ni);
+	if (IS_ERR(dir_mrec)) {
+		err = -ENOENT;
+		goto out_ni;
+	}
+	err = find_index_entry_by_key(dir_mrec, fn, fn_len, &attr_off,
+				      &entry_off, &len, &e);
+	if (err)
+		goto out_dir;
+	copy = kmalloc(len, GFP_NOFS);
+	if (!copy) {
+		err = -ENOMEM;
+		goto out_dir;
+	}
+	memcpy(copy, e, len);
+	err = mft_coords(u->vol, dir_ni->mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (!err)
+		err = ntfs_log_txn_add_index_root(u->t,
+						  u->vol->log_mft_data_attr,
+						  vcn, cluster_off, page_lcn,
+						  attr_off, entry_off,
+						  copy, len);
+	kfree(copy);
+out_dir:
+	unmap_mft_record(dir_ni);
+out_ni:
+	unmap_mft_record(ni);
+	return err;
+}
+
+int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
+			       struct ntfs_inode *old_ni,
+			       struct ntfs_inode *old_dir_ni,
+			       struct ntfs_inode *new_dir_ni,
+			       struct ntfs_inode *new_ni)
+{
+	uint64_t last_lsn = 0;
+	struct ntfs_inode *targets[4];
+	int i, err;
+
+	if (!u)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(u->t, NULL, &last_lsn);
+	if (!err) {
+		/*
+		 * Stamp MR_LSN into every record the rename touched
+		 * before the metadata flush, as in the unlink commit:
+		 * without the stamp a second replay would re-apply
+		 * the records onto records that already carry their
+		 * effects. The stamp is the transaction's last LSN,
+		 * >= every record that touched any of them. A record
+		 * touched twice (old and new parent are the same
+		 * directory) is stamped once.
+		 */
+		targets[0] = old_ni;
+		targets[1] = old_dir_ni;
+		targets[2] = new_dir_ni;
+		targets[3] = new_ni;
+		for (i = 0; i < 4 && !err; i++) {
+			struct ntfs_inode *ni = targets[i];
+			struct mft_record *m;
+			int j;
+
+			if (!ni)
+				continue;
+			for (j = 0; j < i; j++) {
+				if (targets[j] == ni)
+					break;
+			}
+			if (j < i)
+				continue;
+			m = map_mft_record(ni);
+			if (IS_ERR(m)) {
+				err = PTR_ERR(m);
+				break;
+			}
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&u->vol->log_txn_open);
+	mutex_unlock(&u->vol->log_txn_lock);
+	kfree(u);
 	return err;
 }

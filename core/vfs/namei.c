@@ -1653,8 +1653,18 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	int err = 0;
 	int is_dir;
 	struct super_block *sb = old_dir->i_sb;
+	struct ntfs_volume *vol = NTFS_SB(old_dir->i_sb);
 	struct ntfs_inode *old_ni, *new_ni = NULL;
 	struct ntfs_inode *old_dir_ni = NTFS_I(old_dir), *new_dir_ni = NTFS_I(new_dir);
+	/* The journal transaction, when one is open: the target's
+	 * removal, the link and the old name's removal stage into it
+	 * through ntfs_delete and ntfs_journal_rename_stage_link.
+	 * Staging failures abort it (and the rename proceeds
+	 * unjournaled, as before Phase 2) instead of failing the
+	 * rename. One transaction per __ntfs_vfs_rename call: a
+	 * case-only rename goes through a temporary name in two
+	 * calls, so it writes two transactions. */
+	struct ntfs_journal_unlink *ut = NULL;
 
 	old_ni = NTFS_I(old_inode);
 
@@ -1668,11 +1678,33 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	    (new_inode && IS_IMMUTABLE(new_inode)))
 		return -EPERM;
 
+	/*
+	 * PORT: journal the rename (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Begin before the mrec locks: the lock order is log_txn_lock
+	 * then mrec_lock, as in __ntfs_create and ntfs_vfs_unlink. A
+	 * begin failure is not a rename failure — the driver renamed
+	 * unjournaled for years — so warn and proceed unjournaled.
+	 * The commit runs at err_out, before the unlocks, so the
+	 * locks stay held across it: a concurrent unjournaled
+	 * mutation of either directory between the last staged
+	 * sub-mutation and the commit could shift a staged index
+	 * entry's offset.
+	 */
+	err = ntfs_journal_unlink_begin(vol, &ut);
+	if (err)
+		ntfs_error(vol->sb,
+			   "journal begin failed (%d); renaming unjournaled.\n",
+			   err);
+
 	mutex_lock_nested(&old_ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	mutex_lock_nested(&old_dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
 
 	if (NInoBeingDeleted(old_ni) || NInoBeingDeleted(old_dir_ni)) {
 		err = -ENOENT;
+		if (ut) {
+			ntfs_journal_unlink_abort(ut);
+			ut = NULL;
+		}
 		goto unlock_old;
 	}
 
@@ -1709,7 +1741,7 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 		}
 
 		err = ntfs_delete(new_ni, new_dir_ni, uname_new, new_name_len, false,
-				NULL);
+				&ut);
 		if (err)
 			goto err_out;
 	} else {
@@ -1726,15 +1758,33 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	if (err)
 		goto err_out;
 
+	/*
+	 * PORT: journal the link half (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Stage after the link, from the live bytes: the new $FILE_NAME
+	 * and the new index entry exist only now. A staging failure
+	 * aborts the transaction and the rename proceeds unjournaled —
+	 * the link already happened, so the old-name delete below runs
+	 * unjournaled too.
+	 */
+	if (ut) {
+		err = ntfs_journal_rename_stage_link(ut, old_ni, new_dir_ni,
+						     uname_new, new_name_len);
+		if (err) {
+			ntfs_journal_unlink_abort(ut);
+			ut = NULL;
+			err = 0;
+		}
+	}
+
 	err = ntfs_delete(old_ni, old_dir_ni, uname_old, old_name_len, false,
-			NULL);
+			&ut);
 	if (err) {
 		int err2;
 
 		ntfs_error(sb, "Failed to delete old ntfs inode(%llu) in old dir, err : %d\n",
 				old_ni->mft_no, err);
 		err2 = ntfs_delete(old_ni, new_dir_ni, uname_new, new_name_len,
-				   false, NULL);
+				   false, &ut);
 		if (err2)
 			ntfs_error(sb, "Failed to delete old ntfs inode in new dir, err : %d\n",
 					err2);
@@ -1764,6 +1814,29 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	inode_inc_iversion(new_dir);
 
 err_out:
+	/*
+	 * PORT: commit the rename transaction (docs/JOURNAL-DESIGN.md
+	 * Phase 3), before the unlocks — the locks stay held across
+	 * the commit (see the begin comment). On a commit failure the
+	 * in-memory rename stands, but the volume is suspect — mark
+	 * it, as every other metadata I/O failure does. The next
+	 * mount replays the partial transaction's undo and restores
+	 * the file under its old name, which is the correct outcome
+	 * for a failed rename.
+	 */
+	if (ut) {
+		if (err) {
+			ntfs_journal_unlink_abort(ut);
+		} else {
+			err = ntfs_journal_rename_commit(ut, old_ni,
+							 old_dir_ni, new_dir_ni,
+							 new_ni);
+			if (err)
+				NVolSetErrors(vol);
+		}
+		/* Commit consumed the transaction either way. */
+		ut = NULL;
+	}
 	if (old_dir != new_dir)
 		mutex_unlock(&new_dir_ni->mrec_lock);
 	if (new_inode)

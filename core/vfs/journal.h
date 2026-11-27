@@ -233,4 +233,92 @@ int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
 				   struct ntfs_inode *ni,
 				   const struct mft_record *mrec);
 
+/* ---- Rename (Phase 3, second class) -------------------------------------
+ *
+ * A rename is one transaction per __ntfs_vfs_rename call, in the order
+ * the driver makes the sub-mutations: the target's removal (when
+ * renaming over an existing file — the unlink records, including the
+ * record free when its link count hits 0, staged by ntfs_delete
+ * itself), then the link (a CreateAttribute for the new $FILE_NAME
+ * plus an AddIndexEntryRoot for the new entry in the new parent's
+ * $INDEX_ROOT), then the old name's removal (the unlink records
+ * again). The replay's CreateAttribute bumps the link count on the
+ * $FILE_NAME's INDEXED flag and its DeleteAttribute decrements it,
+ * so the count goes 1 -> 2 -> 1 across the transaction and no
+ * separate record carries it.
+ *
+ * The transaction reuses the unlink carrier (ntfs_journal_unlink
+ * begin/abort) — it is just a log transaction with a WAL gate, and
+ * the rename's delete steps ARE unlink steps, staged by ntfs_delete
+ * through the same jtp. Only the link staging and the commit are
+ * rename-specific: the commit stamps MR_LSN into every record the
+ * rename touched (moved inode, old parent, new parent, replaced
+ * target when there is one).
+ *
+ * The link staging matches by name and parent, not by first match:
+ * a hard-linked inode carries several $FILE_NAME attributes, and a
+ * cross-directory rename to the same name briefly holds two
+ * $FILE_NAMEs with the same name and different parents — the new
+ * one is the one with this name AND this parent. The $FILE_NAME is
+ * found by its value's file_name and parent, and the index entry
+ * by its key (the whole $FILE_NAME value), the same match the
+ * unlink stage_index uses. Staging order is live order: the link
+ * is staged after __ntfs_link, so its offsets are post-add
+ * offsets, and the old-name delete is staged after that, so its
+ * offsets are post-add too. The replay applies the records in log
+ * order (add, then delete) and its Add/DeleteIndexEntryRoot apply
+ * at the staged offset, so a same-directory rename replays to the
+ * exact live layout — verified by the crash test, which sweeps the
+ * same-directory case.
+ *
+ * Not journaled, by design: any step whose staging fails (-ENOENT
+ * from a lookup miss — an entry in an $INDEX_ALLOCATION block, a
+ * $FILE_NAME outside the base record, a reparse point or object ID
+ * on either deleted name, via ntfs_delete's check) aborts the
+ * transaction and the rename proceeds unjournaled, exactly as the
+ * driver did before Phase 2. The $SI mtime/ctime updates the
+ * rename makes (simple_rename_timestamp) are not journaled either
+ * — the same known gap as the create path's parent $SI mtime, the
+ * setattr class's work; the staged $FILE_NAME carries the
+ * pre-rename timestamps, matching the live $FILE_NAME bytes, so
+ * replay reproduces them exactly.
+ *
+ * One transaction per __ntfs_vfs_rename call: a case-only rename
+ * goes through a temporary name in two calls, so it writes two
+ * transactions. A crash between them leaves the file under the
+ * temporary name — consistent and ntfsck-clean, and the same
+ * outcome the unjournaled driver has always had there. Each step
+ * is atomic; the two-step case is not yet one atomic rename.
+ */
+
+/* Stage the link half of a rename: a CreateAttribute for the new
+ * $FILE_NAME (found by name in @ni's record) and an
+ * AddIndexEntryRoot for the new entry (found by key in @dir_ni's
+ * $INDEX_ROOT). Call after __ntfs_link succeeds. Returns -ENOENT
+ * when either half cannot be found in the base record / root. */
+int ntfs_journal_rename_stage_link(struct ntfs_journal_unlink *u,
+				   struct ntfs_inode *ni,
+				   struct ntfs_inode *dir_ni,
+				   const __le16 *name, u8 name_len);
+
+/* Commit: append the staged records, the Commit record, a checkpoint
+ * and the Forget record; stamp MR_LSN = the last LSN into the moved
+ * record, the old parent, the new parent and the replaced target
+ * (@new_ni, NULL when there is none); lower the WAL gate; release
+ * the lock. The stamp is the transaction's last LSN for every
+ * record, as in the unlink commit.
+ *
+ * On a log-write failure the transaction stays ACTIVE in the log and
+ * the caller must set the volume error flag (NVolSetErrors) and
+ * return the error: the in-memory rename stands, but the next
+ * mount's replay undoes the partial transaction and restores the
+ * file under its old name, which is the correct outcome for a
+ * failed rename. The gate is lowered and the lock released in all
+ * cases. */
+int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
+			       struct ntfs_inode *old_ni,
+			       struct ntfs_inode *old_dir_ni,
+			       struct ntfs_inode *new_dir_ni,
+			       struct ntfs_inode *new_ni);
+
 #endif /* NTFS_JOURNAL_H */
