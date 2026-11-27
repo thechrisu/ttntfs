@@ -794,7 +794,53 @@ their own commit): `test_journaled_mkdir_cut_points`
 inconsistent before replay, 0 still bad after it; d/e present
 34 times, absent 22). Whole test_crash binary: 1808 checks, 0
 failures.
-Next: the truncate/extend class.
+Phase 3, truncate/extend — glue landed 2026-11-27 (commit, this
+round): explicit truncate via setattr only (`ntfs_truncate_vfs`,
+sole caller `ntfs_setattr_size`), non-resident $DATA of a regular
+file only. The begin snapshots the $DATA sizes, mapping pairs and
+run list before the resize; the stage runs after the resize and
+stages the $Bitmap delta first (set difference of old vs new
+run lists, split at bitmap-page boundaries), then
+UpdateMappingPairs, then SetNewAttributeSizes; the commit stamps
+MR_LSN into the file's record. A staging failure aborts and the
+resize stands unjournaled; a commit failure marks the volume, and
+the next mount's replay undoes the partial transaction.
+Two things the design did not foresee. First, an extend takes the
+hole path (`HOLES_OK`): it allocates nothing, appends a hole run
+and flips the file sparse — which inserts the 8-byte
+compressed_size field and moves name_offset and
+mapping_pairs_offset 64 -> 72. The pairs record therefore carries
+the attribute header it depends on: both payloads are prefixed
+with an 8-byte header (flags, name_off, pairs_off), the replay
+applies the header before writing the pairs, and the undo payload
+is the only copy of the old header (landed as its own commit
+first, with a logfile-level redo/undo test). A journaled shrink
+is 10 records (2 open + ClearBits + pairs + sizes + Commit + 3
+dumps + Forget); a journaled extend is 8 (1 open + pairs + sizes
++ Commit + 3 dumps + Forget — no $Bitmap record, so $BITMAP
+never opens). The parent index entry's duplicated $FILE_NAME
+data_size is not staged (refreshed by `ntfs_inode_sync_filename`
+at parent writeback; the WAL gate holds the file record until
+commit). fallocate and extending writes during writeback are not
+in this class.
+Driver tests (`core/tests/test_journal.c`, suite 538 checks, 0
+failures): `test_truncate_shrink_journaled` (walk 24: create 14
++ shrink 10; replay redoes 3 — the create's sizes + SetBits and
+the shrink's ClearBits; the shrink's pairs and sizes are skipped
+by the file record's MR_LSN stamp) and
+`test_truncate_extend_journaled` (walk 32: create 14 + shrink 10
++ extend 8; replay still redoes 3 — the extend's pairs and sizes
+are skipped by the same stamp and it has no $Bitmap record; the
+file is 256 KiB after replay and ntfsck-clean). Negative control
+(truncate staging stubbed to -ENOENT): the truncates still
+succeed, sizes right, ntfsck clean — only the walk counts and
+redo counts fail, as designed. One nuance the control exposed:
+with the truncates aborted, the walk starts at the create's
+first Open record (16, not 14) — oldest_lsn lands on the first
+record of the oldest transaction when no later transaction
+dirties; the opens are dispensable and the replay skips them,
+so this is benign.
+Next: the truncate crash tests, then setattr.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

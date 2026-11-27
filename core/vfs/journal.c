@@ -1206,3 +1206,401 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
 	kfree(u);
 	return err;
 }
+
+/* ---- truncate/extend (Phase 3) ------------------------------------------ */
+
+struct ntfs_journal_truncate {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+	/* The $DATA sizes + mapping pairs as they stood at begin, before
+	 * the resize. */
+	struct mft_attr_snapshot snap;
+	bool snap_ok;
+	/* The run list as it stood at begin: a copy of ni->runlist.rl
+	 * up to and including its length-0 terminator. The bitmap delta
+	 * is the set difference between this and the live run list. */
+	struct runlist_element *old_rl;
+	size_t old_count;
+};
+
+static void free_truncate_snapshot(struct ntfs_journal_truncate *t)
+{
+	if (!t)
+		return;
+	free_snapshot(&t->snap);
+	kfree(t->old_rl);
+	t->old_rl = NULL;
+	t->old_count = 0;
+}
+
+int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
+				struct ntfs_inode *ni,
+				struct ntfs_journal_truncate **out)
+{
+	struct ntfs_journal_truncate *t;
+	struct mft_record *m;
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	/* Regular files only, non-resident $DATA only. A resident
+	 * $DATA, an attribute list (the $DATA may span extent
+	 * records), a compressed or encrypted file: unjournaled. */
+	if (!S_ISREG(VFS_I(ni)->i_mode) || !NInoNonResident(ni) ||
+	    ni->attr_list || NInoCompressed(ni) || NInoEncrypted(ni))
+		return 0;
+	t = kmalloc(sizeof(*t), GFP_NOFS);
+	if (!t)
+		return -ENOMEM;
+	t->vol = vol;
+	t->t = NULL;
+	t->snap.pairs = NULL;
+	t->snap_ok = false;
+	t->old_rl = NULL;
+	t->old_count = 0;
+	/*
+	 * Snapshot the $DATA sizes + pairs and the run list before
+	 * anything mutates. The run list must be whole: a partially
+	 * mapped list would miss the tail runs the shrink frees.
+	 * The snapshot is taken before log_txn_lock — the same
+	 * window the create begin has for record 0, and the stage
+	 * re-verifies the attribute offset before staging anything.
+	 */
+	err = ntfs_attr_map_whole_runlist(ni);
+	if (err)
+		goto out_free;
+	m = map_mft_record(ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+		goto out_free;
+	}
+	err = snapshot_mft_attr(m, AT_DATA, &t->snap);
+	unmap_mft_record(ni);
+	if (err)
+		goto out_free;
+	t->snap_ok = true;
+	{
+		struct runlist_element *rl;
+		size_t n = 0;
+
+		down_read(&ni->runlist.lock);
+		rl = ni->runlist.rl;
+		if (rl) {
+			while (rl[n].length)
+				n++;
+			n++; /* the length-0 terminator */
+			t->old_rl = kmalloc_array(n,
+						  sizeof(*t->old_rl),
+						  GFP_NOFS);
+			if (t->old_rl) {
+				memcpy(t->old_rl, rl,
+				       n * sizeof(*t->old_rl));
+				t->old_count = n;
+			}
+		}
+		up_read(&ni->runlist.lock);
+		if (!t->old_rl) {
+			err = -ENOMEM;
+			goto out_free;
+		}
+	}
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &t->t);
+	if (err) {
+		mutex_unlock(&vol->log_txn_lock);
+		goto out_free;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = t;
+	return 0;
+
+out_free:
+	free_truncate_snapshot(t);
+	kfree(t);
+	return err;
+}
+
+void ntfs_journal_truncate_abort(struct ntfs_journal_truncate *t)
+{
+	if (!t)
+		return;
+	(void)ntfs_log_txn_abort(t->t);
+	atomic_dec(&t->vol->log_txn_open);
+	mutex_unlock(&t->vol->log_txn_lock);
+	free_truncate_snapshot(t);
+	kfree(t);
+}
+
+/*
+ * Interval set difference: the LCN ranges in @a that are not covered
+ * by any range in @b. Both lists are arrays of runlist_elements
+ * terminated by length 0; only lcn >= 0 elements count (holes are
+ * not clusters). The result is written into @out (at most @out_max
+ * entries, each {vcn = start LCN, length = run length}); adjacent
+ * results are merged. Returns the number of result entries, or
+ * -ENOSPC when @out is too small.
+ */
+struct lcn_range {
+	u64 lcn;
+	u64 len;
+};
+
+static int lcn_ranges_sub(const struct runlist_element *a,
+			  const struct runlist_element *b,
+			  struct lcn_range *out, size_t out_max)
+{
+	size_t n = 0, i, j;
+
+	for (i = 0; a[i].length; i++) {
+		u64 start, end, cur;
+		size_t k;
+
+		if (a[i].lcn < 0)
+			continue;
+		start = (u64)a[i].lcn;
+		end = start + (u64)a[i].length;
+		/* Subtract every b interval from [start, end). */
+		for (j = 0; b[j].length; j++) {
+			u64 bs, be;
+
+			if (b[j].lcn < 0)
+				continue;
+			bs = (u64)b[j].lcn;
+			be = bs + (u64)b[j].length;
+			if (be <= start || bs >= end)
+				continue;
+			/* [start, end) minus [bs, be): the left part
+			 * survives, the right part is re-examined
+			 * against the remaining b intervals. */
+			if (bs > start) {
+				if (n >= out_max)
+					return -ENOSPC;
+				out[n].lcn = start;
+				out[n].len = bs - start;
+				n++;
+			}
+			if (be >= end) {
+				start = end;
+				break;
+			}
+			start = be;
+		}
+		if (start < end) {
+			if (n >= out_max)
+				return -ENOSPC;
+			out[n].lcn = start;
+			out[n].len = end - start;
+			n++;
+		}
+		/* Merge with the previous result when adjacent. */
+		for (k = 1; k < n; k++) {
+			if (out[k - 1].lcn + out[k - 1].len == out[k].lcn) {
+				out[k - 1].len += out[k].len;
+				memmove(&out[k], &out[k + 1],
+					(n - k - 1) * sizeof(*out));
+				n--;
+				k--;
+			}
+		}
+	}
+	return (int)n;
+}
+
+/*
+ * Stage one $Bitmap range as SetBits (set = true) or ClearBits
+ * (set = false) records, split at bitmap-page boundaries: one
+ * record addresses one page, and a range crossing into the next
+ * page would stage bits the replay applies to the wrong page.
+ * A bitmap page holds cluster_size * 8 bits.
+ */
+static int stage_bitmap_range(struct ntfs_journal_truncate *t,
+			      u64 bit, u64 nbits, bool set)
+{
+	u64 page_bits = (u64)t->vol->cluster_size * 8;
+	int err = 0;
+
+	while (nbits && !err) {
+		u64 page_end = (bit / page_bits + 1) * page_bits;
+		u64 chunk = page_end - bit;
+		u64 vcn, page_lcn;
+		u16 cluster_off;
+
+		if (chunk > nbits)
+			chunk = nbits;
+		err = bitmap_coords(t->vol, bit,
+				    &vcn, &cluster_off, &page_lcn);
+		if (err)
+			break;
+		err = ntfs_log_txn_set_bitmap(t->t,
+					      t->vol->log_mft_bitmap_attr,
+					      vcn, cluster_off, page_lcn,
+					      (u32)bit, (u32)chunk, set);
+		bit += chunk;
+		nbits -= chunk;
+	}
+	return err;
+}
+
+int ntfs_journal_truncate_stage(struct ntfs_journal_truncate *t,
+				struct ntfs_inode *ni,
+				const struct mft_record *mrec)
+{
+	const struct attr_record *a;
+	u16 off = 0, pairs_off;
+	u32 len;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	if (!t || !t->snap_ok)
+		return -ENOENT;
+	a = find_attr(mrec, AT_DATA, NULL, 0, &off);
+	if (!a || !a->non_resident)
+		return -ENOENT;
+	len = le32_to_cpu(a->length);
+	pairs_off = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+	/* The attribute itself must not have moved; the header fields
+	 * may legitimately flip. An extend by a hole flips the file
+	 * sparse, which inserts the 8-byte compressed_size field and
+	 * moves name_offset and mapping_pairs_offset by 8 (and sets
+	 * ATTR_IS_SPARSE) — the pairs record carries the old and new
+	 * header, so that flip is journaled, not a reason to abort. */
+	if (off != t->snap.attr_off)
+		return -ENOENT;
+	if (pairs_off >= len)
+		return -EIO;
+	err = mft_coords(t->vol, ni->mft_no,
+			 &vcn, &cluster_off, &page_lcn);
+	if (err)
+		return err;
+
+	/* The $Bitmap delta first: the clusters the resize freed or
+	 * allocated, from the set difference of the run lists. */
+	{
+		struct runlist_element *new_rl = NULL;
+		size_t new_count = 0, i;
+		struct lcn_range *freed = NULL, *allocd = NULL;
+		int n_freed, n_allocd;
+
+		down_read(&ni->runlist.lock);
+		if (ni->runlist.rl) {
+			size_t n = 0;
+
+			while (ni->runlist.rl[n].length)
+				n++;
+			n++;
+			new_rl = kmalloc_array(n, sizeof(*new_rl),
+					       GFP_NOFS);
+			if (new_rl) {
+				memcpy(new_rl, ni->runlist.rl,
+				       n * sizeof(*new_rl));
+				new_count = n;
+			}
+		}
+		up_read(&ni->runlist.lock);
+		if (!new_rl) {
+			err = -ENOMEM;
+			goto out;
+		}
+		/* Upper bound: one result range per input run. */
+		freed = kmalloc_array(t->old_count + new_count,
+				      sizeof(*freed), GFP_NOFS);
+		allocd = kmalloc_array(t->old_count + new_count,
+				       sizeof(*allocd), GFP_NOFS);
+		if (!freed || !allocd) {
+			err = -ENOMEM;
+			goto out_rl;
+		}
+		n_freed = lcn_ranges_sub(t->old_rl, new_rl,
+					 freed, t->old_count + new_count);
+		n_allocd = lcn_ranges_sub(new_rl, t->old_rl,
+					  allocd, t->old_count + new_count);
+		if (n_freed < 0 || n_allocd < 0) {
+			err = -ENOSPC;
+			goto out_rl;
+		}
+		for (i = 0; i < (size_t)n_freed && !err; i++)
+			err = stage_bitmap_range(t, freed[i].lcn,
+						 freed[i].len, false);
+		for (i = 0; i < (size_t)n_allocd && !err; i++)
+			err = stage_bitmap_range(t, allocd[i].lcn,
+						 allocd[i].len, true);
+out_rl:
+		kfree(freed);
+		kfree(allocd);
+		kfree(new_rl);
+		if (err)
+			goto out;
+	}
+
+	/* The mapping pairs next, when they changed. */
+	if (len - pairs_off != t->snap.pairs_len ||
+	    memcmp((const u8 *)a + pairs_off, t->snap.pairs,
+		   t->snap.pairs_len) != 0) {
+		err = ntfs_log_txn_update_mapping_pairs(
+			t->t, t->vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			off, pairs_off,
+			le16_to_cpu(a->flags), le16_to_cpu(a->name_offset),
+			(const u8 *)a + pairs_off, (u16)(len - pairs_off),
+			t->snap.flags, t->snap.name_off, t->snap.pairs_off,
+			t->snap.pairs, t->snap.pairs_len);
+		if (err)
+			goto out;
+	}
+
+	/* The sizes last, when they changed. */
+	{
+		u64 alloc = le64_to_cpu(a->data.non_resident.allocated_size);
+		u64 valid = le64_to_cpu(a->data.non_resident.initialized_size);
+		u64 data = le64_to_cpu(a->data.non_resident.data_size);
+		u64 total = pairs_off >= 0x48 ?
+			le64_to_cpu(a->data.non_resident.compressed_size) : 0;
+
+		if (alloc != t->snap.alloc || valid != t->snap.valid ||
+		    data != t->snap.data || total != t->snap.total) {
+			err = ntfs_log_txn_set_attr_sizes(
+				t->t, t->vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				off, alloc, valid, data, total,
+				t->snap.alloc, t->snap.valid,
+				t->snap.data, t->snap.total);
+		}
+	}
+
+out:
+	return err;
+}
+
+int ntfs_journal_truncate_commit(struct ntfs_journal_truncate *t,
+				 struct ntfs_inode *ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!t)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(t->t, NULL, &last_lsn);
+	if (!err) {
+		/* Stamp MR_LSN into the file's record before the
+		 * metadata flush, as in the other commits: without
+		 * the stamp a second replay would re-apply the
+		 * sizes/pairs records onto a record that already
+		 * carries their effects. */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&t->vol->log_txn_open);
+	mutex_unlock(&t->vol->log_txn_lock);
+	free_truncate_snapshot(t);
+	kfree(t);
+	return err;
+}

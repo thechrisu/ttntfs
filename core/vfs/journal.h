@@ -321,4 +321,85 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
 			       struct ntfs_inode *new_dir_ni,
 			       struct ntfs_inode *new_ni);
 
+/* ---- Truncate/extend (Phase 3, fourth class) ----------------------------
+ *
+ * An explicit size change (truncate via setattr, one transaction per
+ * ntfs_truncate_vfs call) is staged as the three things the design
+ * doc names for an extend — mapping pairs plus sizes plus bitmap —
+ * in redo order: the $Bitmap bit records first (the clusters the
+ * resize freed or allocated), then the UpdateMappingPairs record
+ * for the $DATA attribute's run list, then the SetNewAttributeSizes
+ * record for its sizes. The undo side carries the old pairs, the
+ * old sizes and the opposite bitmap bits, so a crash before the
+ * commit restores the old size with the old clusters, and a crash
+ * after it redoes the new size with the new clusters. File data is
+ * never journaled, only metadata.
+ *
+ * Lifetime: begin before the resize (it takes vol->log_txn_lock and
+ * raises the WAL gate, and snapshots the $DATA sizes, mapping pairs
+ * and run list as they stand before the resize), stage once after
+ * __ntfs_attr_truncate_vfs succeeds, commit, or abort on any error.
+ * The snapshot is read from the live record at begin; the staging
+ * reads the live record again after the resize and logs what moved
+ * — nothing is reconstructed from a parallel model.
+ *
+ * Scope, step 1: non-resident $DATA of a regular file only.
+ * Compressed and encrypted files are rejected before
+ * ntfs_truncate_vfs is reached (ntfs_setattr_size), and a resident
+ * $DATA, a $DATA in an extent record (attribute list), or a resize
+ * that converts the attribute resident (shrink to zero calls
+ * ntfs_attr_make_resident) aborts the transaction and proceeds
+ * unjournaled — the resident path needs its own verification (the
+ * replay's UpdateResidentValue handles length changes, but the
+ * header fields it must also move have not been proven). The
+ * parent index entry's duplicated $FILE_NAME (its data_size copy)
+ * is NOT staged: it is refreshed by ntfs_inode_sync_filename at
+ * the parent's writeback, outside this transaction's window — the
+ * same class as the create path's parent $SI mtime gap, and the
+ * WAL gate holds the file record until the commit, so the sizes
+ * can never reach the disk ahead of the transaction. Extending
+ * writes during writeback are also not journaled: they allocate
+ * clusters without a user-visible transaction boundary, and
+ * journaling them is a separate design problem (see GAPS.md §1.2).
+ */
+
+struct ntfs_journal_truncate;
+
+/* Begin a truncate transaction, or NULL (0) when there is nothing to
+ * journal: no writer, not a regular file, $DATA resident, in an
+ * extent, compressed or encrypted. On error the gate was never raised
+ * and the lock was never taken; the caller proceeds unjournaled. */
+int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
+				struct ntfs_inode *ni,
+				struct ntfs_journal_truncate **out);
+
+/* Abort: write nothing, lower the WAL gate, release the lock. */
+void ntfs_journal_truncate_abort(struct ntfs_journal_truncate *t);
+
+/* Stage the resize's records after __ntfs_attr_truncate_vfs succeeds:
+ * Set/ClearBits for the $Bitmap delta (old vs new run list, split at
+ * bitmap-page boundaries), UpdateMappingPairs when the pairs changed,
+ * SetNewAttributeSizes when the sizes changed. Returns -ENOENT when
+ * the $DATA cannot be staged (it left the base record, or the resize
+ * converted it resident); the caller then aborts and proceeds
+ * unjournaled — the resize stands, it is just not logged. */
+int ntfs_journal_truncate_stage(struct ntfs_journal_truncate *t,
+				struct ntfs_inode *ni,
+				const struct mft_record *mrec);
+
+/* Commit: append the staged records, the Commit record, a checkpoint
+ * and the Forget record; stamp MR_LSN = the last LSN into the file's
+ * record; lower the WAL gate; release the lock. The stamp is the
+ * transaction's last LSN, as in the other commits.
+ *
+ * On a log-write failure the transaction stays ACTIVE in the log and
+ * the caller must set the volume error flag (NVolSetErrors) and
+ * return the error: the in-memory resize stands, but the next
+ * mount's replay undoes the partial transaction and restores the old
+ * size with the old clusters, which is the correct outcome for a
+ * failed truncate. The gate is lowered and the lock released in all
+ * cases. */
+int ntfs_journal_truncate_commit(struct ntfs_journal_truncate *t,
+				 struct ntfs_inode *ni);
+
 #endif /* NTFS_JOURNAL_H */

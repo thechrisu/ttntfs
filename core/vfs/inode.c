@@ -19,6 +19,7 @@
 #include "ea.h"
 #include "attrib.h"
 #include "object_id.h"
+#include "journal.h"	/* PORT: Phase 3 truncate journaling */
 #include "vfs.h"	/* PORT */
 
 /*
@@ -2449,10 +2450,73 @@ int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_volume *vol = ni->vol;
+	struct ntfs_journal_truncate *jt = NULL;
+	struct mft_record *mrec = NULL;
 	int err;
+
+	/*
+	 * PORT: journal the truncate (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Begin before the mrec lock (lock order log_txn_lock ->
+	 * mrec_lock, as in __ntfs_create): the begin snapshots the
+	 * $DATA sizes, mapping pairs and run list as they stand
+	 * before the resize. A begin failure is not a truncate
+	 * failure — the driver truncated unjournaled for years — so
+	 * warn and proceed unjournaled. A resident $DATA, an
+	 * attribute list, a compressed/encrypted file or no writer
+	 * also begins NULL and proceeds unjournaled.
+	 */
+	err = ntfs_journal_truncate_begin(vol, ni, &jt);
+	if (err)
+		ntfs_error(vol->sb,
+			   "journal begin failed (%d); truncating unjournaled.\n",
+			   err);
 
 	mutex_lock(&ni->mrec_lock);
 	err = __ntfs_attr_truncate_vfs(ni, new_size, i_size);
+	if (err)
+		goto out_unlock;
+	if (jt) {
+		/*
+		 * Stage the resize's records from the live record,
+		 * then commit — the commit stamps MR_LSN before the
+		 * metadata flush. A staging failure aborts the
+		 * transaction and the resize stands unjournaled: the
+		 * in-memory resize is already done, it is just not
+		 * logged. A commit failure marks the volume: the next
+		 * mount's replay undoes the partial transaction and
+		 * restores the old size with the old clusters.
+		 */
+		mrec = map_mft_record(ni);
+		if (IS_ERR(mrec)) {
+			err = PTR_ERR(mrec);
+			mrec = NULL;
+			goto out_abort;
+		}
+		err = ntfs_journal_truncate_stage(jt, ni, mrec);
+		unmap_mft_record(ni);
+		mrec = NULL;
+		if (err)
+			goto out_abort;
+		err = ntfs_journal_truncate_commit(jt, ni);
+		jt = NULL;
+		if (err) {
+			NVolSetErrors(vol);
+			goto out_unlock;
+		}
+	}
+	mutex_unlock(&ni->mrec_lock);
+
+	inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
+	return 0;
+
+out_abort:
+	ntfs_journal_truncate_abort(jt);
+	jt = NULL;
+	/* The resize stands, it is just not logged: a staging
+	 * failure is not a truncate failure. */
+	err = 0;
+out_unlock:
 	mutex_unlock(&ni->mrec_lock);
 	if (err < 0)
 		return err;

@@ -279,6 +279,9 @@ struct rec_seen {
 	/* SetBits: bit and count from the redo payload. */
 	uint32_t bits_bit, bits_count;
 	uint64_t bits_lsn;
+	/* ClearBits: the same, for the clear record. */
+	uint32_t clear_bits_bit, clear_bits_count;
+	uint64_t clear_bits_lsn;
 	/* SetNewAttributeSizes: the $DATA size from redo/undo. */
 	uint64_t sizes_redo_data, sizes_undo_data;
 	uint64_t sizes_redo_total;
@@ -342,6 +345,18 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 			((uint32_t)p[BR_BITS + 2] << 16) |
 			((uint32_t)p[BR_BITS + 3] << 24);
 		s->bits_lsn = r->lsn;
+	}
+	if (r->redo_op == LOP_ClearBitsInNonresidentBitMap && r->redo && r->redo_len >= BR_SIZE) {
+		const uint8_t *p = r->redo;
+		s->clear_bits_bit = (uint32_t)p[BR_BITMAP_OFF] |
+			((uint32_t)p[BR_BITMAP_OFF + 1] << 8) |
+			((uint32_t)p[BR_BITMAP_OFF + 2] << 16) |
+			((uint32_t)p[BR_BITMAP_OFF + 3] << 24);
+		s->clear_bits_count = (uint32_t)p[BR_BITS] |
+			((uint32_t)p[BR_BITS + 1] << 8) |
+			((uint32_t)p[BR_BITS + 2] << 16) |
+			((uint32_t)p[BR_BITS + 3] << 24);
+		s->clear_bits_lsn = r->lsn;
 	}
 	if (r->redo_op == LOP_SetNewAttributeSizes && r->redo && r->redo_len >= NAS_SIZE &&
 	    r->undo && r->undo_len >= NAS_SIZE) {
@@ -609,6 +624,53 @@ out_dev:
 static int lookup_after_mount(const char *path, const char *name)
 {
 	return lookup_nested_after_mount(path, NULL, name);
+}
+
+/* Mount @path, look @name up under @parent (NULL: the root), read its
+ * size, unmount. Returns the lookup err. */
+static int size_after_mount(const char *path, const char *parent,
+			    const char *name, u64 *size_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct ntfs_attr at;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	err = ntfs_lookup(d, name, &f);
+	if (err)
+		goto out_d;
+	err = ntfs_getattr(f, &at);
+	if (!err)
+		*size_out = at.size;
+	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
 }
 
 /* ---- 1. a regular-file create journals --------------------------------- */
@@ -1934,6 +1996,393 @@ out:
 	unlink(snap1);
 }
 
+/* ---- 12. a truncate of a non-resident file journals -------------------- */
+
+/* Shared setup for the truncate tests: a file with 256 KiB of data in
+ * a driver-made directory, synced — so its $DATA is non-resident and
+ * its clusters are allocated and flushed. The volume stays mounted
+ * on success: the caller truncates, syncs and snapshots, then puts
+ * the inodes and unmounts. Returns 0 on success. */
+static int truncate_setup(const char *orig, struct ntfs_bdev **dev_out,
+			  ntfs_volume_t **vol_out,
+			  ntfs_inode_t **root_out,
+			  ntfs_inode_t **d_out, ntfs_inode_t **f_out,
+			  uint64_t *ino_out)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	u8 *buf;
+	int err;
+
+	dev = ntfs_bdev_open_path(orig, false);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) { ntfs_bdev_close(dev); return err; }
+	err = ntfs_volume_root(vol, &root);
+	if (err) { ntfs_unmount(vol); ntfs_bdev_close(dev); return err; }
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	if (err)
+		goto out;
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	if (err)
+		goto out;
+	buf = malloc(256 * 1024);
+	if (!buf) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memset(buf, 'z', 256 * 1024);
+	if (ntfs_write(f, buf, 256 * 1024, 0) != 256 * 1024)
+		err = -EIO;
+	free(buf);
+	if (err)
+		goto out;
+	*ino_out = ntfs_inode_number(f);
+	err = ntfs_volume_sync(vol);
+	if (err)
+		goto out;
+	*dev_out = dev;
+	*vol_out = vol;
+	*root_out = root;
+	*d_out = d;
+	*f_out = f;
+	return 0;
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+static void test_truncate_shrink_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, size = 0;
+	int err, i;
+
+	printf("test_truncate_shrink_journaled\n");
+	scratch_path(orig, sizeof(orig), "tsorig");
+	scratch_path(snap, sizeof(snap), "tssnap");
+	scratch_path(snap1, sizeof(snap1), "tssnap1");
+	scratch_path(snap2, sizeof(snap2), "tssnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_truncate_shrink_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+	CHECK(ino > 16);
+
+	/* Shrink 256 KiB -> 64 KiB: 48 clusters freed, one run. */
+	err = ntfs_truncate(f, 64 * 1024);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14 still-live records, then the
+	 * truncate's 10 (2 open + 3 data + Commit + 3 dumps +
+	 * Forget). The three data records are the $Bitmap ClearBits
+	 * for the freed run, the UpdateMappingPairs for the shorter
+	 * run list, and the SetNewAttributeSizes for the new sizes —
+	 * in that order: clusters first, then the pairs that name
+	 * them, then the sizes. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 24);
+	if (s.n == 24) {
+		/* The opens come in first-use order: the truncate
+		 * stages the $Bitmap record first, so $BITMAP opens
+		 * before $DATA — the reverse of the create. */
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x40u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[16], 0x40u);
+		CHECK_EQ(s.redo_op[17], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[18], 0x18u);
+		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+		/* The ClearBits frees 48 clusters, one run. (The
+		 * SetBits fields still hold the create's 1-bit record;
+		 * the clear has its own capture.) */
+		CHECK_EQ(s.clear_bits_count, 48u);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[16]);
+		/* The sizes record names the new data size. */
+		CHECK_EQ(s.sizes_redo_data, 64u * 1024u);
+		CHECK_EQ(s.sizes_undo_data, 256u * 1024u);
+		CHECK_EQ(s.sizes_lsn, s.lsn[18]);
+		/* The pairs record is the $DATA attribute, at the
+		 * same record offset as the sizes record. */
+		CHECK_EQ(s.record_off[17], s.record_off[18]);
+	}
+	(void)i;
+
+	/* Replay copy 1: three records redo — the create's sizes
+	 * and SetBits, and the truncate's ClearBits. The truncate's
+	 * sizes record is skipped by the file record's MR_LSN stamp
+	 * (the commit stamped it and the sync flushed it), as is the
+	 * pairs record. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The file is 64 KiB on the replayed volume, and it is clean. */
+	CHECK_EQ(size_after_mount(snap1, "sub", "j.txt", &size), 0);
+	CHECK_EQ(size, 64u * 1024u);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * three records. Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+/* ---- 13. an extend of a non-resident file journals ---------------------- */
+
+static void test_truncate_extend_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, size = 0;
+	int err;
+
+	printf("test_truncate_extend_journaled\n");
+	scratch_path(orig, sizeof(orig), "teorig");
+	scratch_path(snap, sizeof(snap), "tesnap");
+	scratch_path(snap1, sizeof(snap1), "tesnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_truncate_extend_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+	CHECK(ino > 16);
+
+	/* Shrink journaled, then extend back to 256 KiB journaled: the
+	 * walk then holds the create (14) + shrink (10) + extend (8)
+	 * = 32. The extend is what this test reads. It allocates
+	 * nothing: the expand takes the hole path (HOLES_OK), so the
+	 * run list gains a 48-cluster hole and the file flips sparse
+	 * — the pairs record carries the old and new header (flags,
+	 * name_off, pairs_off 0x40 -> 0x48) and there is no $Bitmap
+	 * record at all, so the extend has a single open ($DATA). */
+	err = ntfs_truncate(f, 64 * 1024);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	err = ntfs_truncate(f, 256 * 1024);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+out:
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 32);
+	if (s.n == 32) {
+		/* The extend's records sit at [24..31]: one open
+		 * ($DATA — no $Bitmap record, so $BITMAP never
+		 * opens), then pairs, sizes, Commit, dumps, Forget. */
+		CHECK_EQ(s.redo_op[24], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[24], 0x18u);
+		CHECK_EQ(s.redo_op[25], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[25], 0x18u);
+		CHECK_EQ(s.redo_op[26], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[26], 0x18u);
+		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
+		/* No bitmap record in the extend: the ClearBits
+		 * fields still hold the shrink's 48-cluster free. */
+		CHECK_EQ(s.clear_bits_count, 48u);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[16]);
+		/* The sizes record names the new data size. */
+		CHECK_EQ(s.sizes_redo_data, 256u * 1024u);
+		CHECK_EQ(s.sizes_undo_data, 64u * 1024u);
+		CHECK_EQ(s.sizes_lsn, s.lsn[26]);
+		/* The pairs record is the $DATA attribute, at the
+		 * same record offset as the sizes record. */
+		CHECK_EQ(s.record_off[25], s.record_off[26]);
+	}
+
+	/* Replay: three records redo — the create's sizes and SetBits
+	 * and the shrink's ClearBits. The extend adds none: its pairs
+	 * and sizes are skipped by the file record's MR_LSN stamp
+	 * (the commit stamped it and the sync flushed it), and it has
+	 * no $Bitmap record to redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	CHECK_EQ(size_after_mount(snap1, "sub", "j.txt", &size), 0);
+	CHECK_EQ(size, 256u * 1024u);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 14. a truncate of a resident file writes no client records -------- */
+
+static void test_truncate_resident_unjournaled(void)
+{
+	char orig[1024], snap[1024], snap0[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	int err;
+
+	printf("test_truncate_resident_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "trorig");
+	scratch_path(snap, sizeof(snap), "trsnap");
+	scratch_path(snap0, sizeof(snap0), "trsnap0");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_truncate_resident_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* A small file, never written: its $DATA is resident. The
+	 * create journals (14 live records); the truncate must add
+	 * none — walk before and after and compare. */
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	{
+		static const char small[] = "hello";
+		CHECK_EQ(ntfs_write(f, small, sizeof(small), 0),
+			 (ssize_t)sizeof(small));
+	}
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	/* Walk a snapshot copy, not the live image: the volume is
+	 * still mounted. */
+	CHECK_EQ(copy_file(orig, snap0), 0);
+	CHECK_EQ(walk_log(snap0, &s), 0);
+	CHECK_EQ(s.n, 16);
+
+	/* Truncate the resident file to 2 bytes. */
+	err = ntfs_truncate(f, 2);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* Still 16: the truncate added no client records. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 16);
+
+	{
+		uint64_t size = 0;
+
+		CHECK_EQ(size_after_mount(snap, "sub", "j.txt", &size), 0);
+		CHECK_EQ(size, 2u);
+	}
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap0);
+	return;
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	unlink(orig);
+	unlink(snap0);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -1949,6 +2398,9 @@ int main(void)
 	test_rename_in_root_unjournaled();
 	test_rename_over_journaled();
 	test_rename_cross_dir_journaled();
+	test_truncate_shrink_journaled();
+	test_truncate_extend_journaled();
+	test_truncate_resident_unjournaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
