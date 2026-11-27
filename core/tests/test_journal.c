@@ -3626,9 +3626,11 @@ static void test_xattr_big_replace_remove_journaled(void)
 		CHECK_EQ(s.target_attr[25], 0x68u);
 		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
 		CHECK_EQ(s.target_attr[26], 0x18u);
-		CHECK_EQ(s.redo_op[27], LOP_SetNewAttributeSizes);
+		/* The mapping pairs come before the sizes that name them
+		 * (the truncate class stages the same way). */
+		CHECK_EQ(s.redo_op[27], LOP_UpdateMappingPairs);
 		CHECK_EQ(s.target_attr[27], 0x18u);
-		CHECK_EQ(s.redo_op[28], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[28], LOP_SetNewAttributeSizes);
 		CHECK_EQ(s.target_attr[28], 0x18u);
 		CHECK_EQ(s.redo_op[29], LOP_SetBitsInNonresidentBitMap);
 		CHECK_EQ(s.target_attr[29], 0x68u);

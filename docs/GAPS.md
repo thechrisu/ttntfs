@@ -995,9 +995,14 @@ decoded runlist when non-resident. Create stages `CreateAttribute` +
 `SetBits`; remove stages `DeleteAttribute` (begin-time bytes/offset) +
 `ClearBits`; resident→resident replace stages one whole-value
 `UpdateResidentValue` (first class to prove the replay length-change
-path); non-resident→non-resident stages sizes + pairs +
-bitmap delta via `lcn_ranges_sub`; flip either way stages
-Delete+Create+bitmap delta. Aborts to unjournaled on attribute list,
+path); non-resident→non-resident stages the mapping pairs first
+(dedicated `UpdateMappingPairs` op, redo order is extend the runs
+then the sizes that name them) then sizes + bitmap delta via
+`lcn_ranges_sub`; flip either way stages Delete+Create+bitmap
+delta. The first version staged the pairs as a raw
+`UpdateResidentValue` after the sizes — the crash sweep caught it:
+18 cuts still bad after replay, `Corrupt mapping pairs array`,
+ADS unreadable; fixed to the truncate class's pairs op + order. Aborts to unjournaled on attribute list,
 compressed/encrypted ADS, moved ADS, `$SI` missing/too short,
 non-regular file/directory. No `$FILE_NAME` record (ADS sizes are not
 in the parent dup). Bug fixed en route: `lcn_ranges_sub` returns the

@@ -2955,6 +2955,38 @@ static int stage_xattr_ads(struct ntfs_journal_xattr *xt,
 			new_rl = NULL;
 			goto out_free;
 		}
+		/* The mapping pairs first (redo order is extend the runs,
+		 * then the sizes that name them), then the sizes — the
+		 * truncate class stages the same way, through the dedicated
+		 * mapping-pairs op, not a raw UpdateResidentValue on the
+		 * pairs bytes: the replay validates the pairs against the
+		 * sizes, and a raw value update leaves them disagreeing.
+		 * A header change (flags, name or pairs offset moved) is
+		 * not describable here; abort to unjournaled rather than
+		 * log a half-described attribute. */
+		if (new_snap.flags != xt->ads_snap.flags ||
+		    new_snap.name_off != xt->ads_snap.name_off ||
+		    new_snap.pairs_off != xt->ads_snap.pairs_off) {
+			err = -ENOENT;
+			goto out_free;
+		}
+		if (new_snap.pairs_len != xt->ads_snap.pairs_len ||
+		    memcmp(new_snap.pairs, xt->ads_snap.pairs,
+			   new_snap.pairs_len)) {
+			err = ntfs_log_txn_update_mapping_pairs(
+				t, vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ads_off, new_snap.pairs_off,
+				new_snap.flags, new_snap.name_off,
+				new_snap.pairs, new_snap.pairs_len,
+				xt->ads_snap.flags,
+				xt->ads_snap.name_off,
+				xt->ads_snap.pairs_off,
+				xt->ads_snap.pairs,
+				xt->ads_snap.pairs_len);
+			if (err)
+				goto out_free;
+		}
 		if (new_snap.alloc != xt->ads_snap.alloc ||
 		    new_snap.valid != xt->ads_snap.valid ||
 		    new_snap.data != xt->ads_snap.data ||
@@ -2966,22 +2998,8 @@ static int stage_xattr_ads(struct ntfs_journal_xattr *xt,
 				new_snap.data, new_snap.total,
 				xt->ads_snap.alloc, xt->ads_snap.valid,
 				xt->ads_snap.data, xt->ads_snap.total);
-			if (err) {
+			if (err)
 				goto out_free;
-			}
-		}
-		if (new_snap.pairs_len != xt->ads_snap.pairs_len ||
-		    memcmp(new_snap.pairs, xt->ads_snap.pairs,
-			   new_snap.pairs_len)) {
-			err = ntfs_log_txn_update_resident(
-				t, vol->log_mft_data_attr,
-				vcn, cluster_off, page_lcn,
-				ads_off, new_snap.pairs_off,
-				new_snap.pairs, new_snap.pairs_len,
-				xt->ads_snap.pairs, xt->ads_snap.pairs_len);
-			if (err) {
-				goto out_free;
-			}
 		}
 		freed = kmalloc_array(xt->old_count + new_count,
 				      sizeof(*freed), GFP_KERNEL);
