@@ -678,11 +678,21 @@ the new shape (test_journal 191 checks, 0 failures); logfile
 test `stage_unlink` now stages the free records too
 (test_journal_unlink_commit expects the 11-record walk, the
 free record with no $FILE_NAME, and the clear bitmap bit).
-Crash sweep (test_journaled_unlink_cut_points, not yet pushed):
-536 checks, 0 failures, 22 cut points, 0 still bad after
-replay — down from 16 bad (resurrected bitmap bit) and 7 bad
-(link-count-0 record with no $FILE_NAME). Next: land the crash
-test as its own commit, then the rename class.
+Crash test landed (commit, this round):
+`test_journaled_unlink_cut_points` (`core/tests/test_crash.c`,
+modelled on `test_journaled_create_cut_points`): a base image
+with `d/j.txt`, a write-budget cut sweep over the journaled
+unlink, per cut pre-replay ntfsck + coverage, replay,
+post-replay ntfsck + coverage + remount lookup + second replay
+no-op. 22 cut points: 3 inconsistent before replay, 0 still
+bad after it; j.txt present 6 times (crash before the unlink
+commit — replay undoes it), absent 16 times (crash after —
+replay redoes it). Presence is counted, never asserted: either
+outcome is correct depending on where the crash landed. Whole
+test_crash binary: 536 checks, 0 failures. The sweep is what
+drove the free-in-unlink fix above: before the fix it was 16
+bad (resurrected bitmap bit) and then 7 bad (link-count-0
+record with no $FILE_NAME). Next: the rename class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
