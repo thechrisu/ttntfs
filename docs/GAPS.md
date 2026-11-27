@@ -1132,8 +1132,13 @@ test_unlink_reparse_journaled: walk 27 records — the create's 15
 still-live plus the unlink's 12; $R delete targets $MFT:$DATA at vcn
 rp_ino/4; MR_LSN stamped into the file, the parent and $Reparse;
 replay redoes 3; link gone and $R count 0 after replay and on the
-live snapshot; `ntfsck` clean). Crash tests in the follow-up commit
-(this round). Follow-ups, not this class: the mknod half (device
+live snapshot; `ntfsck` clean). Crash tests landed in the follow-up
+commit (this round): one cut-point sweep in core/tests/test_crash.c
+— 46 cut points, every write sampled, 6 inconsistent before replay,
+0 still bad after it; link all-old 13 times, all-new 33 times; per
+cut the $R entry count agrees with the link (1 when present, 0 when
+gone). Evidence: `test_crash` 8012 checks, 0 failures (was 7641).
+The sweep found no bug. Follow-ups, not this class: the mknod half (device
 creation still never begins — its reparse staging is the next commit
 of this class); no VFS operation sets reparse data on an existing
 file, so there is no standalone reparse-set class to journal.
