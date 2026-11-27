@@ -3113,6 +3113,568 @@ static void test_journaled_setattr_cut_points(void)
 	sweep_setattr_cut_points();
 }
 
+/* ---- xattr ------------------------------------------------------------ */
+
+enum xattr_op {
+	XATTR_CREATE_SMALL, /* set user.a = "abc" (resident create) */
+	XATTR_CREATE_BIG,   /* set user.big = 8 KiB (non-resident create) */
+	XATTR_REPLACE_RES,  /* user.a "abc" -> "abcdef" (resident length change) */
+	XATTR_REPLACE_BIG,  /* user.big 8 KiB -> 16 KiB (non-resident replace) */
+	XATTR_REMOVE_BIG,   /* remove user.big (16 KiB, non-resident) */
+};
+
+static const char *xattr_op_tag(enum xattr_op op)
+{
+	switch (op) {
+	case XATTR_CREATE_SMALL: return "xattr-create-small";
+	case XATTR_CREATE_BIG:   return "xattr-create-big";
+	case XATTR_REPLACE_RES:  return "xattr-replace-res";
+	case XATTR_REPLACE_BIG:  return "xattr-replace-big";
+	case XATTR_REMOVE_BIG:   return "xattr-remove-big";
+	}
+	return "xattr-unknown";
+}
+
+static const char *xattr_op_xname(enum xattr_op op)
+{
+	switch (op) {
+	case XATTR_CREATE_SMALL:
+	case XATTR_REPLACE_RES:
+		return "user.a";
+	case XATTR_CREATE_BIG:
+	case XATTR_REPLACE_BIG:
+	case XATTR_REMOVE_BIG:
+		return "user.big";
+	}
+	return "user.a";
+}
+
+/* The base for a create op carries no xattr; a replace/remove op carries
+ * the old value, flushed cleanly at base creation so the all-old outcome
+ * has known content. */
+static int xattr_base_xattr(enum xattr_op op, const void **val, size_t *len)
+{
+	static char big8[8 * 1024];
+	static char big16[16 * 1024];
+	static int filled;
+
+	if (!filled) {
+		memset(big8, 'B', sizeof(big8));
+		memset(big16, 'C', sizeof(big16));
+		filled = 1;
+	}
+	switch (op) {
+	case XATTR_CREATE_SMALL:
+	case XATTR_CREATE_BIG:
+		*val = NULL;
+		*len = 0;
+		return 0;
+	case XATTR_REPLACE_RES:
+		*val = "abc";
+		*len = 3;
+		return 0;
+	case XATTR_REPLACE_BIG:
+		*val = big8;
+		*len = sizeof(big8);
+		return 0;
+	case XATTR_REMOVE_BIG:
+		*val = big16;
+		*len = sizeof(big16);
+		return 0;
+	}
+	return -EINVAL;
+}
+
+static int make_xattr_base(const char *path, enum xattr_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *d, *f;
+	const void *xval = NULL;
+	size_t xlen = 0;
+	u8 *buf;
+	int err;
+
+	if (xattr_base_xattr(op, &xval, &xlen) != 0)
+		return -EINVAL;
+	if (make_image(path) != 0)
+		return -EIO;
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) { ntfs_bdev_close(dev); return err; }
+	err = ntfs_volume_root(vol, &root);
+	if (!err) {
+		err = ntfs_mkdir(root, "d", 0100755, &d);
+		if (!err) {
+			err = ntfs_create(d, "j.txt", 0100644, &f);
+			if (!err) {
+				buf = malloc(256 * 1024);
+				if (!buf) {
+					err = -ENOMEM;
+				} else {
+					memset(buf, 'z', 256 * 1024);
+					if (ntfs_write(f, buf, 256 * 1024, 0) != 256 * 1024)
+						err = -EIO;
+					free(buf);
+				}
+				if (!err && xval)
+					err = ntfs_setxattr(f, xattr_op_xname(op),
+							      xval, xlen, 0);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+static int xattr_run_op(ntfs_inode_t *f, enum xattr_op op)
+{
+	static char big8[8 * 1024];
+	static char big16[16 * 1024];
+	static int filled;
+
+	if (!filled) {
+		memset(big8, 'B', sizeof(big8));
+		memset(big16, 'C', sizeof(big16));
+		filled = 1;
+	}
+	switch (op) {
+	case XATTR_CREATE_SMALL:
+		return ntfs_setxattr(f, "user.a", "abc", 3, 0);
+	case XATTR_CREATE_BIG:
+		return ntfs_setxattr(f, "user.big", big8, sizeof(big8), 0);
+	case XATTR_REPLACE_RES:
+		return ntfs_setxattr(f, "user.a", "abcdef", 6, 0);
+	case XATTR_REPLACE_BIG:
+		return ntfs_setxattr(f, "user.big", big16, sizeof(big16), 0);
+	case XATTR_REMOVE_BIG:
+		return ntfs_removexattr(f, "user.big");
+	}
+	return -EINVAL;
+}
+
+/* The xattr run: mount the base, do the one xattr op on d/j.txt, sync,
+ * unmount. The write budget caps the run at @limit writes, so a cut
+ * point is a crash after exactly that many writes. */
+static long crash_run_xattr_journaled(const char *path, long limit,
+				      enum xattr_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "j.txt", &f) == 0) {
+				xattr_run_op(f, op);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+struct xattr_aftermath {
+	bool mounts;
+	bool present;
+	size_t len;
+};
+
+/* Read the xattr off a (read-only) remount. A missing xattr is
+ * -ENOATTR, reported as present = false. */
+static struct xattr_aftermath xattr_remount(const char *path,
+					    const char *xname,
+					    void *buf, size_t bufsz)
+{
+	struct xattr_aftermath a = { 0 };
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	size_t len = 0;
+	int err;
+
+	dev = ntfs_bdev_open_path(path, true);
+	if (!dev)
+		return a;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return a;
+	}
+	a.mounts = true;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "j.txt", &f) == 0) {
+				err = ntfs_getxattr(f, xname, buf, bufsz, &len);
+				if (err == 0) {
+					a.present = true;
+					a.len = len;
+				}
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return a;
+}
+
+/* Classify a probed xattr as the all-old or the all-new outcome.
+ * Resident values are in the MFT record, so they redo atomically and
+ * their content is asserted. A non-resident new value's bytes may be
+ * stale or zero when the crash landed after the commit but before the
+ * pagecache flush — the same as a regular file write crash — so for
+ * those only presence + size are asserted; the old value was flushed
+ * at base creation, so its content is known. */
+static void xattr_classify(enum xattr_op op, struct xattr_aftermath *a,
+			   const void *buf, bool *is_old, bool *is_new)
+{
+	static char big8[8 * 1024];
+	static char big16[16 * 1024];
+	static int filled;
+
+	/* Fill the patterns once with the same bytes the ops write. */
+	if (!filled) {
+		memset(big8, 'B', sizeof(big8));
+		memset(big16, 'C', sizeof(big16));
+		filled = 1;
+	}
+	*is_old = false;
+	*is_new = false;
+	switch (op) {
+	case XATTR_CREATE_SMALL:
+		*is_old = !a->present;
+		*is_new = a->present && a->len == 3 &&
+			    memcmp(buf, "abc", 3) == 0;
+		break;
+	case XATTR_CREATE_BIG:
+		*is_old = !a->present;
+		*is_new = a->present && a->len == 8u * 1024u;
+		break;
+	case XATTR_REPLACE_RES:
+		*is_old = a->present && a->len == 3 &&
+			    memcmp(buf, "abc", 3) == 0;
+		*is_new = a->present && a->len == 6 &&
+			    memcmp(buf, "abcdef", 6) == 0;
+		break;
+	case XATTR_REPLACE_BIG:
+		/* Size only: the replace truncates to 0 and rewrites, so the
+		 * new write reuses the old clusters — a crash after the data
+		 * landed but before the commit leaves the old size holding
+		 * new bytes. The value bytes are file data, not journaled
+		 * metadata; only the size is atomic. */
+		*is_old = a->present && a->len == 8u * 1024u;
+		*is_new = a->present && a->len == 16u * 1024u;
+		break;
+	case XATTR_REMOVE_BIG:
+		*is_old = a->present && a->len == 16u * 1024u &&
+			    memcmp(buf, big16, sizeof(big16)) == 0;
+		*is_new = !a->present;
+		break;
+	}
+}
+
+/* The xattr sweep. Same shape as the setattr sweep, but the operation
+ * is one journaled setxattr/removexattr on d/j.txt: a cut before the
+ * commit must replay to the old value (or absence), a cut after it to
+ * the new one — either way ntfsck-clean, and the value after replay
+ * is all-old or all-new, never a mix (the $SI, the ADS and the bitmap
+ * are one transaction). */
+static void sweep_xattr_cut_points(enum xattr_op op)
+{
+	char base[1024], work[1024], probe[1024];
+	const char *tag = xattr_op_tag(op);
+	const char *xname = xattr_op_xname(op);
+	struct xattr_aftermath old_a;
+	static char probe_buf[16 * 1024];
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+
+	scratch_path(base, sizeof(base), "xa-base");
+	scratch_path(work, sizeof(work), "xa-work");
+	scratch_path(probe, sizeof(probe), "xa-probe");
+	if (make_xattr_base(base, op) != 0) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"mkntfs unavailable\n", tag);
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"ntfsck unavailable at '%s'\n", tag, ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	/* The old xattr state, read off a probe copy so the base stays
+	 * untouched. */
+	if (copy_file(base, probe) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	old_a = xattr_remount(probe, xname, probe_buf, sizeof(probe_buf));
+	unlink(probe);
+	if (!old_a.mounts) { FAILF("the base does not mount\n"); unlink(base); return; }
+	{
+		bool is_old, is_new;
+
+		xattr_classify(op, &old_a, probe_buf, &is_old, &is_new);
+		if (!is_old) {
+			failures++;
+			fprintf(stderr, "FAIL: the base xattr is not in the old "
+					"state (present %d len %zu)\n",
+				(int)old_a.present, old_a.len);
+			unlink(base);
+			return;
+		}
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_xattr_journaled(work, LONG_MAX, op);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-%s-uncrashed.img", tmpdir, tag);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled xattr op made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  xattr present/len\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct xattr_aftermath a;
+		struct geometry g;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		bool pre_bad, post_bad, is_old, is_new;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_xattr_journaled(work, cut, op);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-cut-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-replayed-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = xattr_remount(work, xname, probe_buf, sizeof(probe_buf));
+		xattr_classify(op, &a, probe_buf, &is_old, &is_new);
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s/%zu\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.present ? "present" : "absent", a.len);
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+					tag, cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+					tag, cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+					tag, cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+					tag, cut, (unsigned long long)bad_ino,
+					(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the "
+					"volume no longer mounts after replay\n",
+					tag, cut);
+		}
+		checks++;
+		if (a.mounts && !is_old && !is_new) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the xattr "
+					"is present %d len %zu after replay — neither "
+					"all-old nor all-new\n",
+					tag, cut, (int)a.present, a.len);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+					tag, cut, err_rep2, an2.records_redone,
+					an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; xattr all-old %d times, all-new %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_%s_cut_points\n", tag);
+}
+
+static void test_journaled_xattr_create_small_cut_points(void)
+{
+	sweep_xattr_cut_points(XATTR_CREATE_SMALL);
+}
+
+static void test_journaled_xattr_create_big_cut_points(void)
+{
+	sweep_xattr_cut_points(XATTR_CREATE_BIG);
+}
+
+static void test_journaled_xattr_replace_res_cut_points(void)
+{
+	sweep_xattr_cut_points(XATTR_REPLACE_RES);
+}
+
+static void test_journaled_xattr_replace_big_cut_points(void)
+{
+	sweep_xattr_cut_points(XATTR_REPLACE_BIG);
+}
+
+static void test_journaled_xattr_remove_big_cut_points(void)
+{
+	sweep_xattr_cut_points(XATTR_REMOVE_BIG);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -3128,6 +3690,11 @@ int main(void)
 	test_journaled_truncate_shrink_cut_points();
 	test_journaled_truncate_extend_cut_points();
 	test_journaled_setattr_cut_points();
+	test_journaled_xattr_create_small_cut_points();
+	test_journaled_xattr_create_big_cut_points();
+	test_journaled_xattr_replace_res_cut_points();
+	test_journaled_xattr_replace_big_cut_points();
+	test_journaled_xattr_remove_big_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

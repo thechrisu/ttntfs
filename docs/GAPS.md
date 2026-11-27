@@ -1014,7 +1014,10 @@ loop by count). Evidence: `test_journal.c` 899 checks, 0 failures
 (5 new tests: create, replace, big create, big replace+remove, root;
 walk 45 records in the big test: create 14, big-create 10, replace
 11, remove 10; replay redoes 5, 2 dirty overlay clusters written
-back). Crash tests in the follow-up commit. Follow-ups, not this
+back). Crash tests in the follow-up commit: 5 sweeps, 199 cut points
+(create-small 37, create-big 41, replace-res 36, replace-big 45,
+remove-big 40), 0 still bad after replay; `test_crash.c` 4366 checks,
+0 failures (was 2958). Follow-ups, not this
 class: the `$EA` class reuses the resident-replace pattern proven
 here; `$FILE_NAME` times never update on setattr/xattr (live-driver
 bug); extending writes during writeback (still unjournaled).
