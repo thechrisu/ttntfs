@@ -1075,9 +1075,154 @@ out_dev:
 	return err;
 }
 
+/* Mount @path, look @name up under @parent (NULL: the root), read the
+ * first @len bytes at @off into @buf, unmount. The same shape as
+ * size_after_mount, for the compressed-write tests' post-replay
+ * content checks. Returns the lookup/read err, or -EIO on a short
+ * read. */
+static int content_after_mount(const char *path, const char *parent,
+			       const char *name, void *buf, size_t len,
+			       loff_t off)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	ssize_t r;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	err = ntfs_lookup(d, name, &f);
+	if (err)
+		goto out_d;
+	r = ntfs_read(f, buf, len, off);
+	err = r == (ssize_t)len ? 0 : (r < 0 ? (int)r : -EIO);
+	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
 /* Mount @path, look @name up under @parent (NULL: the root), read its
  * full attributes (mode, times, flags), unmount. The same shape as
  * size_after_mount, for the setattr tests' post-replay checks. */
+/* Two-level variants of size_after_mount/content_after_mount: the
+ * compressed-write convert test's file lives at
+ * /compressed/inherit/j.txt, one level deeper than the single-parent
+ * helpers reach. */
+static int size_after_mount2(const char *path, const char *parent1,
+			     const char *parent2, const char *name,
+			     u64 *size_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d1 = NULL, *d2 = NULL, *f = NULL;
+	struct ntfs_attr at;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(root, parent1, &d1);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(d1, parent2, &d2);
+	if (err)
+		goto out_d1;
+	err = ntfs_lookup(d2, name, &f);
+	if (err)
+		goto out_d2;
+	err = ntfs_getattr(f, &at);
+	if (!err)
+		*size_out = at.size;
+	ntfs_inode_put(f);
+out_d2:
+	if (d2)
+		ntfs_inode_put(d2);
+out_d1:
+	if (d1)
+		ntfs_inode_put(d1);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+static int content_after_mount2(const char *path, const char *parent1,
+				const char *parent2, const char *name,
+				void *buf, size_t len, loff_t off)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d1 = NULL, *d2 = NULL, *f = NULL;
+	ssize_t r;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(root, parent1, &d1);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(d1, parent2, &d2);
+	if (err)
+		goto out_d1;
+	err = ntfs_lookup(d2, name, &f);
+	if (err)
+		goto out_d2;
+	r = ntfs_read(f, buf, len, off);
+	err = r == (ssize_t)len ? 0 : (r < 0 ? (int)r : -EIO);
+	ntfs_inode_put(f);
+out_d2:
+	if (d2)
+		ntfs_inode_put(d2);
+out_d1:
+	if (d1)
+		ntfs_inode_put(d1);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
 static int attr_after_mount(const char *path, const char *parent,
 			    const char *name, struct ntfs_attr *at_out)
 {
@@ -2707,6 +2852,13 @@ static void test_truncate_shrink_journaled(void)
 	 * sizes. */
 	CHECK_EQ(walk_log(snap, &s), 0);
 	CHECK_EQ(s.n, 27);
+	if (s.n != 27) {
+		int k;
+		for (k = 0; k < s.n; k++)
+			fprintf(stderr, "DBG ow op[%d]=%u attr=0x%x lsn=%llu\n",
+				k, s.redo_op[k], s.target_attr[k],
+				(unsigned long long)s.lsn[k]);
+	}
 	if (s.n == 27) {
 		/* The opens come in first-use order: the truncate
 		 * stages the $Bitmap record first, so the volume
@@ -5562,6 +5714,13 @@ out:
 
 	CHECK_EQ(walk_log(snap, &s), 0);
 	CHECK_EQ(s.n, 27);
+	if (s.n != 27) {
+		int k;
+		for (k = 0; k < s.n; k++)
+			fprintf(stderr, "DBG ow op[%d]=%u attr=0x%x lsn=%llu\n",
+				k, s.redo_op[k], s.target_attr[k],
+				(unsigned long long)s.lsn[k]);
+	}
 	if (s.n == 27) {
 		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[15], 0x18u);
@@ -5871,6 +6030,738 @@ out:
 	unlink(snap2);
 }
 
+/* ---- compressed-write (Phase 3, last class) --------------------------- */
+
+/* Deterministic incompressible bytes: the encoder must fall back to
+ * storing the block raw, which is a different branch of
+ * ntfs_write_cb() from the one a compressible block takes. */
+static void cwrite_fill_random(unsigned char *p, size_t n, unsigned seed)
+{
+	unsigned s = seed | 1;
+
+	while (n--) {
+		s = s * 1103515245u + 12345u;
+		*p++ = (unsigned char)(s >> 16);
+	}
+}
+
+/* Set the compressed flag on a file's $DATA, through the same
+ * system.ntfs_attrib handler a user sets it with. Not journaled:
+ * the EA class does not journal the flags path. */
+static int cwrite_set_compressed(ntfs_inode_t *h)
+{
+	uint32_t v = 0x800u; /* FILE_ATTRIBUTE_COMPRESSED */
+
+	return ntfs_xattr_handlers[0]->set(ntfs_xattr_handlers[0], NULL, NULL,
+					    (struct inode *)h,
+					    "system.ntfs_attrib",
+					    &v, sizeof(v), 0);
+}
+
+/*
+ * Setup shared by the compressed-write tests: a driver-made
+ * subdirectory "sub" holding a compressed file "j.txt" with 200 KiB
+ * of incompressible bytes (three full 64 KiB compression blocks plus
+ * an 8 KiB tail, stored raw). Setting the flag converts the file to
+ * non-resident eagerly (ntfs_new_attr_flags calls
+ * ntfs_attr_make_non_resident), so the initial write is NOT a
+ * conversion: it is an ordinary non-resident compressed write, and
+ * it IS journaled as a cwrite transaction of its own (2 opens +
+ * SetBits + pairs + sizes + $SI + $FILE_NAME + Commit + 3 dumps +
+ * Forget = 12 records). The tests below therefore pin TWO
+ * transactions in the walk: the setup write's, then the test op's.
+ * Returns 0 with @f the open file, @ino its record number.
+ */
+static int cwrite_setup(ntfs_volume_t *vol, ntfs_inode_t *root,
+			ntfs_inode_t **d_out, ntfs_inode_t **f_out,
+			uint64_t *ino_out, uint64_t *sub_ino_out)
+{
+	ntfs_inode_t *d = NULL, *f = NULL;
+	unsigned char *buf;
+	ssize_t w;
+	int err;
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	if (err)
+		return err;
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	if (err) {
+		ntfs_inode_put(d);
+		return err;
+	}
+	err = cwrite_set_compressed(f);
+	if (err) {
+		ntfs_inode_put(f);
+		ntfs_inode_put(d);
+		return err;
+	}
+	buf = malloc(200 * 1024);
+	if (!buf) {
+		ntfs_inode_put(f);
+		ntfs_inode_put(d);
+		return -ENOMEM;
+	}
+	cwrite_fill_random(buf, 200 * 1024, 12345);
+	w = ntfs_write(f, buf, 200 * 1024, 0);
+	free(buf);
+	if (w != 200 * 1024) {
+		ntfs_inode_put(f);
+		ntfs_inode_put(d);
+		return w < 0 ? (int)w : -EIO;
+	}
+	*sub_ino_out = ntfs_inode_number(d);
+	*ino_out = ntfs_inode_number(f);
+	*d_out = d;
+	*f_out = f;
+	return 0;
+}
+
+static void test_cwrite_overwrite_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
+	uint64_t ino = 0, sub_ino = 0;
+	uint64_t mrlsn_file = 0, mrlsn_dir = 0, lsn_fn = 0;
+	unsigned char *bbuf = NULL, *orig_buf = NULL, *got = NULL;
+	int err, i;
+
+	printf("test_cwrite_overwrite_journaled\n");
+	scratch_path(orig, sizeof(orig), "cworig");
+	scratch_path(snap, sizeof(snap), "cwsnap");
+	scratch_path(snap1, sizeof(snap1), "cwsnap1");
+	scratch_path(snap2, sizeof(snap2), "cwsnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_cwrite_overwrite_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = cwrite_setup(vol, root, &d, &f, &ino, &sub_ino);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	CHECK(ino > 16);
+
+	/* Overwrite the first 64 KiB block with 'B's: the old block
+	 * was stored raw (16 clusters of incompressible bytes), the
+	 * new one compresses to a single cluster, so the write moves
+	 * the bitmap, the pairs, the sizes (alloc and compressed
+	 * total) and the parent's $FILE_NAME dup, all at once — the
+	 * one transaction this class exists for. */
+	bbuf = malloc(64 * 1024);
+	CHECK(bbuf != NULL);
+	if (!bbuf) { goto out; }
+	memset(bbuf, 'B', 64 * 1024);
+	{
+		ssize_t w = ntfs_write(f, bbuf, 64 * 1024, 0);
+
+		CHECK_EQ(w, 64 * 1024);
+		if (w != 64 * 1024) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	ntfs_inode_put(f);
+	f = NULL;
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log — what a crash at this instant leaves. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	free(bbuf);
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14 still-live records, then the
+	 * compressed write's 13 — 2 open + 6 data + Commit + 3 dumps +
+	 * Forget. The data records, in staging order: the $Bitmap
+	 * delta (ClearBits for the freed old block, SetBits for the
+	 * new cluster), UpdateMappingPairs, SetNewAttributeSizes, the
+	 * $SI 36 bytes, the parent's $FILE_NAME. The bitmap comes
+	 * first and the pairs before the sizes, the truncate class's
+	 * order: the pairs must name the runs before the sizes that
+	 * count them, and the bitmap must agree with both. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 39);
+	if (s.n == 39) {
+		static const uint16_t want_setup[5] = {
+			LOP_SetBitsInNonresidentBitMap,
+			LOP_UpdateMappingPairs,
+			LOP_SetNewAttributeSizes,
+			LOP_UpdateResidentValue,
+			LOP_UpdateFileNameRoot,
+		};
+		static const uint16_t want_op[6] = {
+			LOP_ClearBitsInNonresidentBitMap,
+			LOP_SetBitsInNonresidentBitMap,
+			LOP_UpdateMappingPairs,
+			LOP_SetNewAttributeSizes,
+			LOP_UpdateResidentValue,
+			LOP_UpdateFileNameRoot,
+		};
+		/* The create's 14 still-live records come first
+		 * (its two opens precede oldest_lsn, as in the
+		 * truncate test). */
+		CHECK_EQ(s.redo_op[0], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
+		/* The setup write's 12: 2 opens + SetBits for the
+		 * fresh clusters + pairs + sizes (0 -> 200 KiB) +
+		 * $SI + $FILE_NAME + Commit + 3 dumps + Forget. No
+		 * ClearBits: the file had no clusters to free. */
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x68u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		for (i = 0; i < 5; i++) {
+			CHECK_EQ(s.redo_op[i + 16], want_setup[i]);
+			CHECK_EQ(s.target_attr[i + 16],
+				 i < 1 ? 0x68u : 0x18u);
+		}
+		CHECK_EQ(s.redo_op[21], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[22], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[25], LOP_ForgetTransaction);
+		/* The overwrite's 13: 2 opens + the $Bitmap delta
+		 * (ClearBits for the freed old block, SetBits for
+		 * the new cluster) + pairs + sizes + $SI +
+		 * $FILE_NAME + Commit + 3 dumps + Forget. The
+		 * bitmap comes first and the pairs before the
+		 * sizes, the truncate class's order: the pairs
+		 * must name the runs before the sizes that count
+		 * them, and the bitmap must agree with both. */
+		CHECK_EQ(s.redo_op[26], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[26], 0x68u);
+		CHECK_EQ(s.redo_op[27], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[27], 0x18u);
+		for (i = 0; i < 6; i++) {
+			CHECK_EQ(s.redo_op[i + 28], want_op[i]);
+			CHECK_EQ(s.target_attr[i + 28],
+				 i < 2 ? 0x68u : 0x18u);
+		}
+		CHECK_EQ(s.redo_op[34], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[35], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
+		lsn_fn = s.lsn[33];
+		/* The freed run is the old raw block, 16 clusters;
+		 * the new block is one cluster. */
+		CHECK_EQ(s.clear_bits_count, 16u);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[28]);
+		CHECK_EQ(s.bits_count, 1u);
+		CHECK_EQ(s.bits_lsn, s.lsn[29]);
+		/* The sizes: data_size is unchanged (an overwrite
+		 * within the file), the compressed total drops.
+		 * Three sizes records in the walk: the create's
+		 * $MFT $DATA extension, the setup write's, and
+		 * this overwrite's — the captures hold the last. */
+		CHECK_EQ(s.sizes_count, 3);
+		CHECK_EQ(s.sizes_lsn, s.lsn[31]);
+		CHECK_EQ(s.sizes_redo_data, 200u * 1024);
+		CHECK_EQ(s.sizes_undo_data, 200u * 1024);
+		CHECK(s.sizes_redo_total != 0u);
+		/* The $SI: only the times move — the flags cannot
+		 * change on this path, the file was already
+		 * compressed. */
+		CHECK(s.si_redo_mtime > s.si_undo_mtime);
+		CHECK(s.si_redo_ctime > s.si_undo_ctime);
+		CHECK_EQ(s.si_redo_flags, s.si_undo_flags);
+		CHECK_EQ(s.si_lsn, s.lsn[32]);
+		/* The parent's dup: the data size is unchanged, the
+		 * allocated size drops with the compressed total.
+		 * Both flags are COMPRESSED (0x800): the old dup
+		 * takes them from ni->flags at begin, not from the
+		 * mapped $SI — the flags handler never writes the
+		 * $SI record bytes, so the mapped value is 0x0 and
+		 * would stage an undo that clears COMPRESSED from
+		 * the entry on replay. */
+		CHECK_EQ(s.fn_redo_data, 200u * 1024);
+		CHECK_EQ(s.fn_undo_data, 200u * 1024);
+		CHECK(s.fn_redo_alloc < s.fn_undo_alloc);
+		CHECK_EQ(s.fn_redo_flags, 0x800u);
+		CHECK_EQ(s.fn_undo_flags, 0x800u);
+		CHECK_EQ(s.fnupd_lsn, lsn_fn);
+		/* The $SI flags agree the same way: the 36-byte
+		 * record is built from in-memory state at both
+		 * ends. */
+		CHECK_EQ(s.si_redo_flags, 0x800u);
+		CHECK_EQ(s.si_undo_flags, 0x800u);
+	}
+	/* The file's record carries an MR_LSN at or past the last
+	 * data record: the replay's skip check. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_fn);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+
+	/* Replay copy 1: seven records redo — the create's sizes and
+	 * SetBits, the setup write's SetBits and $FILE_NAME, and the
+	 * overwrite's ClearBits, SetBits and $FILE_NAME. The sizes,
+	 * pairs and $SI records of both writes are skipped by the
+	 * file record's MR_LSN stamp, as is the create's $FILE_NAME
+	 * — but the parent's record carries no stamp to skip on, so
+	 * both dups redo. Two MFT records are written (record 0 and
+	 * the parent) and two clusters (the $MFT:$BITMAP cluster and
+	 * the volume $Bitmap's own cluster). */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 7u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The replayed file reads back all-new in the rewritten
+	 * block and all-old everywhere else, and its size is
+	 * unchanged. */
+	CHECK_EQ(size_after_mount(snap1, "sub", "j.txt", &at.size), 0);
+	CHECK_EQ(at.size, 200u * 1024);
+	orig_buf = malloc(200 * 1024);
+	got = malloc(200 * 1024);
+	CHECK(orig_buf != NULL && got != NULL);
+	if (orig_buf && got) {
+		cwrite_fill_random(orig_buf, 200 * 1024, 12345);
+		memset(orig_buf, 'B', 64 * 1024);
+		CHECK_EQ(content_after_mount(snap1, "sub", "j.txt",
+					     got, 200 * 1024, 0), 0);
+		CHECK_EQ(memcmp(got, orig_buf, 200 * 1024), 0);
+	}
+	free(orig_buf);
+	free(got);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * seven records, and the content is still the new block.
+	 * Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 7u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 2u);
+	orig_buf = malloc(200 * 1024);
+	got = malloc(200 * 1024);
+	if (orig_buf && got) {
+		cwrite_fill_random(orig_buf, 200 * 1024, 12345);
+		memset(orig_buf, 'B', 64 * 1024);
+		CHECK_EQ(content_after_mount(snap2, "sub", "j.txt",
+					     got, 200 * 1024, 0), 0);
+		CHECK_EQ(memcmp(got, orig_buf, 200 * 1024), 0);
+	}
+	free(orig_buf);
+	free(got);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+static void test_cwrite_append_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
+	uint64_t ino = 0, sub_ino = 0;
+	uint64_t mrlsn_file = 0, mrlsn_dir = 0, lsn_fn = 0;
+	unsigned char *bbuf = NULL, *orig_buf = NULL, *got = NULL;
+	int err, i;
+
+	printf("test_cwrite_append_journaled\n");
+	scratch_path(orig, sizeof(orig), "cw2orig");
+	scratch_path(snap, sizeof(snap), "cw2snap");
+	scratch_path(snap1, sizeof(snap1), "cw2snap1");
+	scratch_path(snap2, sizeof(snap2), "cw2snap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_cwrite_append_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = cwrite_setup(vol, root, &d, &f, &ino, &sub_ino);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	CHECK(ino > 16);
+
+	/* Append one 64 KiB block of 'B's at EOF: a fresh block, so
+	 * there is no old run to free — only a SetBits — but the
+	 * pairs, the sizes (data grows 200 KiB to 264 KiB) and the
+	 * parent's dup all move. */
+	bbuf = malloc(64 * 1024);
+	CHECK(bbuf != NULL);
+	if (!bbuf) { goto out; }
+	memset(bbuf, 'B', 64 * 1024);
+	{
+		ssize_t w = ntfs_write(f, bbuf, 64 * 1024, 200 * 1024);
+
+		CHECK_EQ(w, 64 * 1024);
+		if (w != 64 * 1024) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	ntfs_inode_put(f);
+	f = NULL;
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	free(bbuf);
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14 still-live records, the setup
+	 * write's 12, then the append's 13 — 2 open + 6 data +
+	 * Commit + 3 dumps + Forget. The append DOES free a run:
+	 * it starts at 200 KiB, inside block 3, which still holds
+	 * the setup's 8 KiB tail (stored raw, 2 clusters), so the
+	 * append rewrites that block — allocating fresh clusters
+	 * for it and punching the old tail — and writes block 4
+	 * fresh. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 39);
+	if (s.n == 39) {
+		static const uint16_t want_setup[5] = {
+			LOP_SetBitsInNonresidentBitMap,
+			LOP_UpdateMappingPairs,
+			LOP_SetNewAttributeSizes,
+			LOP_UpdateResidentValue,
+			LOP_UpdateFileNameRoot,
+		};
+		static const uint16_t want_op[6] = {
+			LOP_ClearBitsInNonresidentBitMap,
+			LOP_SetBitsInNonresidentBitMap,
+			LOP_UpdateMappingPairs,
+			LOP_SetNewAttributeSizes,
+			LOP_UpdateResidentValue,
+			LOP_UpdateFileNameRoot,
+		};
+		CHECK_EQ(s.redo_op[0], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
+		/* The setup write's 12, as in the overwrite test. */
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x68u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		for (i = 0; i < 5; i++) {
+			CHECK_EQ(s.redo_op[i + 16], want_setup[i]);
+			CHECK_EQ(s.target_attr[i + 16],
+				 i < 1 ? 0x68u : 0x18u);
+		}
+		CHECK_EQ(s.redo_op[21], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[22], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[25], LOP_ForgetTransaction);
+		/* The append's 13, in the same staging order as the
+		 * overwrite's. */
+		CHECK_EQ(s.redo_op[26], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[26], 0x68u);
+		CHECK_EQ(s.redo_op[27], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[27], 0x18u);
+		for (i = 0; i < 6; i++) {
+			CHECK_EQ(s.redo_op[i + 28], want_op[i]);
+			CHECK_EQ(s.target_attr[i + 28],
+				 i < 2 ? 0x68u : 0x18u);
+		}
+		CHECK_EQ(s.redo_op[34], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[35], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
+		lsn_fn = s.lsn[33];
+		/* The freed run is the old tail block, 3 clusters:
+		 * the 8 KiB of incompressible tail is stored raw
+		 * with the unit's sub-block framing. The new
+		 * clusters are the rewritten block 3 (8 KiB of
+		 * incompressible tail plus 56 KiB of 'B's) and the
+		 * fresh block 4. */
+		CHECK_EQ(s.clear_bits_count, 3u);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[28]);
+		CHECK_EQ(s.bits_count, 4u);
+		CHECK_EQ(s.bits_lsn, s.lsn[29]);
+		/* The sizes: data grows 200 KiB to 264 KiB. Three
+		 * sizes records in the walk: the create's, the
+		 * setup write's, and this append's. */
+		CHECK_EQ(s.sizes_count, 3);
+		CHECK_EQ(s.sizes_lsn, s.lsn[31]);
+		CHECK_EQ(s.sizes_redo_data, 264u * 1024);
+		CHECK_EQ(s.sizes_undo_data, 200u * 1024);
+		CHECK(s.sizes_redo_total != 0u);
+		/* The $SI times move, the flags do not. */
+		CHECK(s.si_redo_mtime > s.si_undo_mtime);
+		CHECK_EQ(s.si_redo_flags, s.si_undo_flags);
+		CHECK_EQ(s.si_lsn, s.lsn[32]);
+		/* The parent's dup: both sizes grow. */
+		CHECK_EQ(s.fn_redo_data, 264u * 1024);
+		CHECK_EQ(s.fn_undo_data, 200u * 1024);
+		CHECK(s.fn_redo_alloc > s.fn_undo_alloc);
+		CHECK_EQ(s.fnupd_lsn, lsn_fn);
+	}
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_fn);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+
+	/* Replay copy 1: seven records redo — the create's sizes and
+	 * SetBits, the setup write's SetBits and $FILE_NAME, and the
+	 * append's ClearBits, SetBits and $FILE_NAME. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 7u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	CHECK_EQ(size_after_mount(snap1, "sub", "j.txt", &at.size), 0);
+	CHECK_EQ(at.size, 264u * 1024);
+	orig_buf = malloc(264 * 1024);
+	got = malloc(264 * 1024);
+	CHECK(orig_buf != NULL && got != NULL);
+	if (orig_buf && got) {
+		cwrite_fill_random(orig_buf, 200 * 1024, 12345);
+		memset(orig_buf + 200 * 1024, 'B', 64 * 1024);
+		CHECK_EQ(content_after_mount(snap1, "sub", "j.txt",
+					     got, 264 * 1024, 0), 0);
+		CHECK_EQ(memcmp(got, orig_buf, 264 * 1024), 0);
+	}
+	free(orig_buf);
+	free(got);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * seven records, and the content is still the appended block. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 7u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 2u);
+	orig_buf = malloc(264 * 1024);
+	got = malloc(264 * 1024);
+	if (orig_buf && got) {
+		cwrite_fill_random(orig_buf, 200 * 1024, 12345);
+		memset(orig_buf + 200 * 1024, 'B', 64 * 1024);
+		CHECK_EQ(content_after_mount(snap2, "sub", "j.txt",
+					     got, 264 * 1024, 0), 0);
+		CHECK_EQ(memcmp(got, orig_buf, 264 * 1024), 0);
+	}
+	free(orig_buf);
+	free(got);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+static void test_cwrite_convert_unjournaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], fx[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *cdir = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
+	unsigned char *buf = NULL, *got = NULL;
+	const char *idir = getenv("NTFS_IMAGES");
+	int err;
+
+	printf("test_cwrite_convert_unjournaled\n");
+	snprintf(fx, sizeof(fx), "%s/compressed-sparse.img",
+		 idir && *idir ? idir : "tools/images");
+	scratch_path(orig, sizeof(orig), "cw3orig");
+	scratch_path(snap, sizeof(snap), "cw3snap");
+	scratch_path(snap1, sizeof(snap1), "cw3snap1");
+	if (copy_file(fx, orig) != 0) {
+		fprintf(stderr, "SKIP test_cwrite_convert_unjournaled: fixture %s unavailable\n", fx);
+		return;
+	}
+
+	/* A resident file that is compressed when its first write
+	 * begins: created inside the fixture's /compressed/inherit,
+	 * a compressed directory (its $INDEX_ROOT carries
+	 * ATTR_IS_COMPRESSED, so the inode loader sets NInoCompressed
+	 * on it and __ntfs_create flags the new file's $DATA the same
+	 * way — resident, empty, compressed). The first write then
+	 * converts the attribute inside do_write, which the log's ops
+	 * cannot describe — the attribute changes shape and every
+	 * following attribute shifts — so the write proceeds
+	 * unjournaled by design.
+	 *
+	 * The fixture is used because the test cannot flag a
+	 * directory itself: the $INDEX_ROOT flag is set by
+	 * ntfs_attr_set_compression_flag(), which takes the raw
+	 * struct ntfs_inode *, and the test API's ntfs_inode_t is an
+	 * opaque handle — the raw inode is only reachable through
+	 * NTFS_I() inside the driver. (An earlier version of this
+	 * test declared the helper extern and passed the handle: the
+	 * call read the VFS inode's bytes at the raw inode's field
+	 * offsets and segfaulted in map_mft_record. That was the
+	 * test's type error, not a driver bug — the "stale folio"
+	 * theory from the debug session was wrong, and no
+	 * unmap_mft_record fix is owed.) The setxattr handler cannot
+	 * substitute either: for a directory it only updates
+	 * ni->flags/$SI, never $INDEX_ROOT, and for a file it converts
+	 * to non-resident eagerly — the cwrite_setup path, not a
+	 * conversion. The fixture's log is clean (walked at 0 live
+	 * records before this test was written), so the walk below
+	 * pins exactly the create's records. */
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+	err = ntfs_lookup(root, "compressed", &cdir);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	err = ntfs_lookup(cdir, "inherit", &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	/* The inheritance must have landed: a resident file with
+	 * the compressed flag, or the write below would not take
+	 * the compressed branch at all and the test would be
+	 * vacuous. */
+	CHECK_EQ(ntfs_getattr(f, &at), 0);
+	CHECK_EQ(at.compressed, 1);
+	buf = malloc(200 * 1024);
+	CHECK(buf != NULL);
+	if (!buf) { goto out; }
+	memset(buf, 'B', 200 * 1024);
+	{
+		ssize_t w = ntfs_write(f, buf, 200 * 1024, 0);
+
+		CHECK_EQ(w, 200 * 1024);
+		if (w != 200 * 1024) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	/* The file must come out compressed, not merely correct:
+	 * 200 KiB of one byte compresses to a few clusters. */
+	CHECK_EQ(ntfs_getattr(f, &at), 0);
+	CHECK_EQ(at.compressed, 1);
+	CHECK(at.alloc_size < at.size);
+	ntfs_inode_put(f);
+	f = NULL;
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	free(buf);
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (cdir) { ntfs_inode_put(cdir); cdir = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	if (vol) { ntfs_unmount(vol); vol = NULL; }
+	if (dev) { ntfs_bdev_close(dev); dev = NULL; }
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds only the create's records — the conversion
+	 * write wrote no client records at all. 16 live: 2 opens +
+	 * sizes + Initialize + 5x CreateAttribute + AddIndexEntryRoot
+	 * + SetBits + Commit + 3 dumps + Forget. The other two tests
+	 * pin the same create at 14 live because on a fresh mkntfs
+	 * image its two opens precede oldest_lsn; the fixture's log
+	 * starts clean, so nothing is trimmed and the opens count. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 16);
+	if (s.n == 16) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[2], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[3], LOP_InitializeFileRecordSegment);
+		CHECK_EQ(s.redo_op[9], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[10], LOP_SetBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[11], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+	}
+
+	/* Replay copy 1: the create's two redoable records only —
+	 * the $MFT $DATA size extension and the SetBits. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The converted file still reads back whole after the
+	 * replay, and it is clean. */
+	CHECK_EQ(size_after_mount2(snap1, "compressed", "inherit", "j.txt", &at.size), 0);
+	CHECK_EQ(at.size, 200u * 1024);
+	buf = malloc(200 * 1024);
+	got = malloc(200 * 1024);
+	if (buf && got) {
+		memset(buf, 'B', 200 * 1024);
+		CHECK_EQ(content_after_mount2(snap1, "compressed", "inherit", "j.txt",
+					     got, 200 * 1024, 0), 0);
+		CHECK_EQ(memcmp(got, buf, 200 * 1024), 0);
+	}
+	free(buf);
+	free(got);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -5889,6 +6780,9 @@ int main(void)
 	test_truncate_shrink_journaled();
 	test_truncate_extend_journaled();
 	test_truncate_resident_unjournaled();
+	test_cwrite_overwrite_journaled();
+	test_cwrite_append_journaled();
+	test_cwrite_convert_unjournaled();
 	test_setattr_journaled();
 	test_setattr_size_joins();
 	test_setattr_in_root_unjournaled();

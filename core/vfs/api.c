@@ -1226,15 +1226,38 @@ out:
 static ssize_t do_write(struct inode *vi, const void *buf, size_t count, loff_t pos)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_volume *vol = ni->vol;
 	loff_t end = pos + count, old_data_size, old_init_size, init_size;
 	unsigned long flags;
 	ssize_t ret;
 	int err;
+	/* The compressed-write transaction, or NULL when this write
+	 * is unjournaled (not compressed, resident at begin, no
+	 * writer). Owned here from begin to the done block. */
+	struct ntfs_journal_cwrite *cw = NULL;
 
 	old_data_size = ni->data_size;
 	old_init_size = ni->initialized_size;
 
 	if (NInoCompressed(ni)) {
+		/*
+		 * PORT: journal the compressed write (Phase 3).
+		 * Begin before the expand: the expand itself grows
+		 * the sizes and the run list the transaction
+		 * describes, and the WAL gate must be up before it
+		 * runs. A begin failure is not a write failure — the
+		 * driver wrote compressed files unjournaled for
+		 * years — so warn and proceed unjournaled with cw
+		 * NULL, the xattr class's rule.
+		 */
+		err = ntfs_journal_cwrite_begin(vol, ni, &cw);
+		if (err) {
+			ntfs_error(vol->sb,
+				   "journal begin failed (%d); writing compressed file unjournaled.\n",
+				   err);
+			err = 0;
+			cw = NULL;
+		}
 		/*
 		 * PORT: a fresh compressed file starts resident, and the
 		 * compressed writer only runs on non-resident attributes.
@@ -1272,6 +1295,11 @@ static ssize_t do_write(struct inode *vi, const void *buf, size_t count, loff_t 
 			ret = ntfs_compress_write(ni, pos, count, &from);
 			goto done;
 		}
+		/* Stayed resident: no compressed write happened, so
+		 * there is nothing to journal — drop the transaction
+		 * (it began NULL for a resident file anyway). */
+		ntfs_journal_cwrite_abort(cw);
+		cw = NULL;
 	}
 
 	/* Grow the attribute (may turn a resident one non-resident). */
@@ -1347,6 +1375,17 @@ static ssize_t do_write(struct inode *vi, const void *buf, size_t count, loff_t 
 	ret = count;
 done:
 	if (ret < 0) {
+		/* A failed compressed write is not journaled: abort
+		 * the transaction (it holds the lock and the gate)
+		 * before the rollback below runs — the rollback
+		 * restores the in-memory sizes the same way the
+		 * driver always has, and the on-disk state after
+		 * writeback is whatever it leaves, as before. Note
+		 * ntfs_attr_truncate refuses compressed attributes
+		 * (-EOPNOTSUPP), so a failed extending write keeps
+		 * its new data_size; pre-existing, not this class. */
+		if (cw)
+			ntfs_journal_cwrite_abort(cw);
 		/* Undo a size change of a failed write (upstream write_iter). */
 		if (ni->initialized_size != old_init_size && NInoNonResident(ni)) {
 			mutex_lock(&ni->mrec_lock);
@@ -1361,6 +1400,39 @@ done:
 		inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
 		NInoSetFileNameDirty(ni);
 		mark_inode_dirty(vi);
+		if (cw) {
+			/*
+			 * Stage the write's net effect and commit — or
+			 * abort when the stage failed or nothing was
+			 * staged. The finish maps the record, so it runs
+			 * under mrec_lock, the same order the xattr
+			 * finish uses; it runs after the mtime bump so
+			 * the $SI record carries the new times. A commit
+			 * failure marks the volume and fails the call:
+			 * the next mount's replay undoes the partial
+			 * transaction and restores the old pairs, sizes
+			 * and bitmap, so reporting the bytes written
+			 * would be a lie.
+			 */
+			struct mft_record *mrec;
+
+			mutex_lock(&ni->mrec_lock);
+			mrec = map_mft_record(ni);
+			if (IS_ERR(mrec)) {
+				ntfs_journal_cwrite_abort(cw);
+			} else {
+				err = ntfs_journal_cwrite_finish(cw, ni, mrec);
+				unmap_mft_record(ni);
+				if (err) {
+					NVolSetErrors(vol);
+					ret = err;
+				}
+			}
+			mutex_unlock(&ni->mrec_lock);
+		}
+	} else if (cw) {
+		/* Nothing written: nothing to stage. */
+		ntfs_journal_cwrite_abort(cw);
 	}
 	return ret;
 }

@@ -3873,3 +3873,483 @@ out_abort:
 	ntfs_journal_ea_abort(et);
 	return 0;
 }
+
+/* ---- compressed-write (Phase 3) -------------------------------------- */
+
+struct ntfs_journal_cwrite {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+	/* The $DATA sizes + mapping pairs as they stood at begin,
+	 * before the write. */
+	struct mft_attr_snapshot snap;
+	bool snap_ok;
+	/* The $STANDARD_INFORMATION's first 36 bytes (four times +
+	 * file_attributes) as they stood at begin, built from
+	 * in-memory vi/ni state — never from the mapped record,
+	 * which lags behind the log. */
+	u8 si_old[36];
+	u16 si_attr_off;
+	u16 si_value_off;
+	/* The $STANDARD_INFORMATION flags as they stood at begin,
+	 * from in-memory ni->flags — the parent $FILE_NAME old dup
+	 * takes its flags from here. NOT from the mapped record
+	 * (the truncate class's source): the flags handler updates
+	 * ni->flags but never the $SI record bytes, so the mapped
+	 * value lags and stages a wrong undo for handler-flagged
+	 * files. See cwrite_snapshot. */
+	u32 si_flags_old;
+	/* The parent $FILE_NAME's allocated size as it stood at
+	 * begin: ni->itype.compressed.size for a compressed file,
+	 * the same rule ntfs_inode_sync_filename applies. */
+	u64 fn_alloc_old;
+	/* The run list as it stood at begin: a copy of
+	 * ni->runlist.rl up to and including its length-0
+	 * terminator. The bitmap delta is the set difference
+	 * between this and the live run list. */
+	struct runlist_element *old_rl;
+	size_t old_count;
+};
+
+static void free_cwrite_snapshot(struct ntfs_journal_cwrite *t)
+{
+	if (!t)
+		return;
+	free_snapshot(&t->snap);
+	kfree(t->old_rl);
+	t->old_rl = NULL;
+	t->old_count = 0;
+}
+
+/*
+ * Snapshot the $DATA sizes + pairs, the $SI flags and 36 bytes, and
+ * the run list before a compressed write mutates them. Mirrors
+ * truncate_snapshot (same fields, same order, same window: the
+ * snapshot is taken before log_txn_lock, and the stage re-verifies
+ * the attribute offset before staging anything), plus the $SI 36
+ * bytes the write's mtime bump moves. A compressed file's $DATA is
+ * always non-resident here — the begin gate refuses resident files
+ * — so snapshot_mft_attr's non-resident requirement is met.
+ */
+static int cwrite_snapshot(struct ntfs_volume *vol,
+			   struct ntfs_inode *ni,
+			   struct ntfs_journal_cwrite *t)
+{
+	struct mft_record *m;
+	struct inode *vi = VFS_I(ni);
+	int err;
+
+	err = ntfs_attr_map_whole_runlist(ni);
+	if (err)
+		return err;
+	m = map_mft_record(ni);
+	if (IS_ERR(m))
+		return PTR_ERR(m);
+	err = snapshot_mft_attr(m, AT_DATA, NULL, 0, &t->snap);
+	if (!err) {
+		const struct attr_record *si;
+		u16 si_off = 0;
+
+		si = find_attr(m, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+		if (!si || si->non_resident ||
+		    le16_to_cpu(si->data.resident.value_offset) + 36 >
+			    le32_to_cpu(si->length))
+			err = -ENOENT;
+		else {
+			t->si_attr_off = si_off;
+			t->si_value_off =
+				le16_to_cpu(si->data.resident.value_offset);
+		}
+	}
+	if (!err) {
+		/* The parent's allocated size as it stands: the
+		 * compressed size for a compressed file, the
+		 * $DATA's allocated size otherwise — the rule
+		 * ntfs_inode_sync_filename applies when it
+		 * refreshes the parent's $FILE_NAME. */
+		if (NInoSparse(ni) || NInoCompressed(ni))
+			t->fn_alloc_old = ni->itype.compressed.size;
+		else
+			t->fn_alloc_old = t->snap.alloc;
+		/* The $STANDARD_INFORMATION flags from in-memory
+		 * ni->flags — NOT from the mapped record, where
+		 * the truncate class reads them. The flags
+		 * handler (ntfs_new_attr_flags) updates ni->flags
+		 * but never the $SI record bytes, so a file
+		 * flagged compressed through it carries 0x800 in
+		 * ni->flags and 0x0 in its mapped $SI; the
+		 * parent's entry is refreshed from ni->flags, so
+		 * the in-memory value is the entry's logical old
+		 * value and the mapped one stages a wrong undo
+		 * (it would clear COMPRESSED from the entry on
+		 * replay — the first version of this class did
+		 * exactly that, and the overwrite test caught it:
+		 * its $FILE_NAME undo carried flags 0x0 against a
+		 * live entry of 0x800). The setattr carrier
+		 * sources its flags the same way. A compressed
+		 * write never changes the flags, so the old and
+		 * new values agree; the $SI 36-byte record
+		 * carries them either way. */
+		t->si_flags_old = le32_to_cpu(ni->flags);
+		/* The $SI 36 bytes from in-memory state, the
+		 * setattr form: the mapped record lags behind the
+		 * log, so a mapped snapshot's undo would restore
+		 * the pre-previous state. */
+		si_build(vi, ni, t->si_old);
+	}
+	unmap_mft_record(ni);
+	if (err)
+		return err;
+	t->snap_ok = true;
+	{
+		struct runlist_element *rl;
+		size_t n = 0;
+
+		down_read(&ni->runlist.lock);
+		rl = ni->runlist.rl;
+		if (rl) {
+			while (rl[n].length)
+				n++;
+			n++; /* the length-0 terminator */
+			t->old_rl = kmalloc_array(n,
+						  sizeof(*t->old_rl),
+						  GFP_NOFS);
+			if (t->old_rl) {
+				memcpy(t->old_rl, rl,
+				       n * sizeof(*t->old_rl));
+				t->old_count = n;
+			}
+		}
+		up_read(&ni->runlist.lock);
+		if (!t->old_rl)
+			return -ENOMEM;
+	}
+	return 0;
+}
+
+int ntfs_journal_cwrite_begin(struct ntfs_volume *vol,
+			      struct ntfs_inode *ni,
+			      struct ntfs_journal_cwrite **out)
+{
+	struct ntfs_journal_cwrite *t;
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	/* Regular files only, non-resident $DATA only, compressed
+	 * only. A resident $DATA (which converts inside the write),
+	 * an attribute list (the $DATA may span extent records), an
+	 * attribute inode (ADS writes are the xattr class's
+	 * domain), or an encrypted file: unjournaled. */
+	if (!S_ISREG(VFS_I(ni)->i_mode) || !NInoNonResident(ni) ||
+	    ni->attr_list || NInoAttr(ni) || NInoEncrypted(ni) ||
+	    !NInoCompressed(ni))
+		return 0;
+	t = kmalloc(sizeof(*t), GFP_NOFS);
+	if (!t)
+		return -ENOMEM;
+	/* Initialize every field at begin: kmalloc does not zero
+	 * (round 25: an uninitialized txn field corrupted the
+	 * volume). */
+	t->vol = vol;
+	t->t = NULL;
+	t->snap.pairs = NULL;
+	t->snap_ok = false;
+	t->si_attr_off = 0;
+	t->si_value_off = 0;
+	t->si_flags_old = 0;
+	t->fn_alloc_old = 0;
+	t->old_rl = NULL;
+	t->old_count = 0;
+	err = cwrite_snapshot(vol, ni, t);
+	if (err)
+		goto out_free;
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &t->t);
+	if (err) {
+		mutex_unlock(&vol->log_txn_lock);
+		goto out_free;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = t;
+	return 0;
+
+out_free:
+	free_cwrite_snapshot(t);
+	kfree(t);
+	return err;
+}
+
+void ntfs_journal_cwrite_abort(struct ntfs_journal_cwrite *t)
+{
+	if (!t)
+		return;
+	(void)ntfs_log_txn_abort(t->t);
+	atomic_dec(&t->vol->log_txn_open);
+	mutex_unlock(&t->vol->log_txn_lock);
+	free_cwrite_snapshot(t);
+	kfree(t);
+}
+
+static int ntfs_journal_cwrite_commit(struct ntfs_journal_cwrite *t,
+				      struct ntfs_inode *ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!t)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(t->t, NULL, &last_lsn);
+	if (!err) {
+		/* Stamp MR_LSN into the file's record before the
+		 * metadata flush, as in the other commits. The
+		 * finish never commits an empty transaction, so
+		 * last_lsn is a real LSN here, never 0. */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&t->vol->log_txn_open);
+	mutex_unlock(&t->vol->log_txn_lock);
+	free_cwrite_snapshot(t);
+	kfree(t);
+	return err;
+}
+
+/*
+ * Stage one parent's $FILE_NAME dup update for a compressed write.
+ * Mirrors stage_truncate_filename_one: the new dup takes its sizes
+ * from the live $DATA (compressed.size for the alloc, the same rule
+ * ntfs_inode_sync_filename applies) and its flags from ni->flags;
+ * the old dup takes its sizes/flags from the begin snapshot, never
+ * from the entry (the parent's record in memory lags behind the
+ * log). Only the times come from the entry.
+ */
+static int stage_cwrite_filename_one(struct ntfs_journal_cwrite *t,
+				     struct ntfs_inode *ni,
+				     const struct attr_record *fn_attr,
+				     const struct attr_record *data_attr)
+{
+	u64 fn_alloc_new, fn_data_new;
+	u32 flags_new;
+
+	if (NInoSparse(ni) || NInoCompressed(ni))
+		fn_alloc_new = ni->itype.compressed.size;
+	else
+		fn_alloc_new = le64_to_cpu(
+			data_attr->data.non_resident.allocated_size);
+	fn_data_new = le64_to_cpu(data_attr->data.non_resident.data_size);
+	flags_new = le32_to_cpu(ni->flags);
+	return stage_filename_dup(t->vol, t->t, ni, fn_attr,
+				  t->fn_alloc_old, t->snap.data,
+				  t->si_flags_old,
+				  fn_alloc_new, fn_data_new, flags_new,
+				  NULL);
+}
+
+static int stage_cwrite_filename(struct ntfs_journal_cwrite *t,
+				 struct ntfs_inode *ni,
+				 const struct mft_record *mrec,
+				 const struct attr_record *data_attr)
+{
+	u16 off = le16_to_cpu(mrec->attrs_offset);
+	u32 used = le32_to_cpu(mrec->bytes_in_use);
+	int err = 0;
+
+	while (off + 8 <= used) {
+		const struct attr_record *at =
+			(const struct attr_record *)((const u8 *)mrec + off);
+		u32 len;
+
+		if (at->type == AT_END)
+			break;
+		len = le32_to_cpu(at->length);
+		if (len < 8 || off + len > used)
+			return -EINVAL;
+		if (at->type == AT_FILE_NAME) {
+			err = stage_cwrite_filename_one(t, ni, at,
+							data_attr);
+			if (err)
+				return err;
+		}
+		off += len;
+	}
+	return err;
+}
+
+int ntfs_journal_cwrite_finish(struct ntfs_journal_cwrite *t,
+			       struct ntfs_inode *ni,
+			       const struct mft_record *mrec)
+{
+	struct ntfs_volume *vol = t->vol;
+	ntfs_log_txn_t *txn = t->t;
+	const struct attr_record *a;
+	u16 off = 0, pairs_off;
+	u32 len;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	if (!t || !t->snap_ok)
+		goto out_abort;
+	a = find_attr(mrec, AT_DATA, NULL, 0, &off);
+	if (!a || !a->non_resident)
+		goto out_abort;
+	len = le32_to_cpu(a->length);
+	pairs_off = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+	/* The attribute itself must not have moved; the header
+	 * fields may legitimately change (a write that flips the
+	 * file sparse inserts the 8-byte compressed_size field and
+	 * moves name_offset and mapping_pairs_offset — the pairs
+	 * record carries the old and new header, so that flip is
+	 * journaled, not a reason to abort). */
+	if (off != t->snap.attr_off)
+		goto out_abort;
+	if (pairs_off >= len)
+		goto out_abort;
+	err = mft_coords(vol, ni->mft_no,
+			 &vcn, &cluster_off, &page_lcn);
+	if (err)
+		goto out_abort;
+
+	/* The $Bitmap delta first: the clusters the write freed or
+	 * allocated, from the set difference of the run lists.
+	 * Every rewritten block allocates fresh clusters and
+	 * punches the old ones, so a rewrite that changes nothing
+	 * in the sizes still moves bitmap bits. */
+	{
+		struct runlist_element *new_rl = NULL;
+		size_t new_count = 0, i;
+		struct lcn_range *freed = NULL, *allocd = NULL;
+		int n_freed, n_allocd;
+
+		down_read(&ni->runlist.lock);
+		if (ni->runlist.rl) {
+			size_t n = 0;
+
+			while (ni->runlist.rl[n].length)
+				n++;
+			n++;
+			new_rl = kmalloc_array(n, sizeof(*new_rl),
+					       GFP_NOFS);
+			if (new_rl) {
+				memcpy(new_rl, ni->runlist.rl,
+				       n * sizeof(*new_rl));
+				new_count = n;
+			}
+		}
+		up_read(&ni->runlist.lock);
+		if (!new_rl) {
+			err = -ENOMEM;
+			goto out_abort;
+		}
+		/* Upper bound: one result range per input run. */
+		freed = kmalloc_array(t->old_count + new_count,
+				      sizeof(*freed), GFP_NOFS);
+		allocd = kmalloc_array(t->old_count + new_count,
+				       sizeof(*allocd), GFP_NOFS);
+		if (!freed || !allocd) {
+			err = -ENOMEM;
+			goto out_rl;
+		}
+		n_freed = lcn_ranges_sub(t->old_rl, new_rl,
+					 freed, t->old_count + new_count);
+		n_allocd = lcn_ranges_sub(new_rl, t->old_rl,
+					  allocd, t->old_count + new_count);
+		if (n_freed < 0 || n_allocd < 0) {
+			err = -ENOSPC;
+			goto out_rl;
+		}
+		for (i = 0; i < (size_t)n_freed && !err; i++)
+			err = stage_bitmap_range_txn(vol, txn,
+						     freed[i].lcn,
+						     freed[i].len, false);
+		for (i = 0; i < (size_t)n_allocd && !err; i++)
+			err = stage_bitmap_range_txn(vol, txn,
+						     allocd[i].lcn,
+						     allocd[i].len, true);
+out_rl:
+		kfree(freed);
+		kfree(allocd);
+		kfree(new_rl);
+		if (err)
+			goto out_abort;
+	}
+
+	/* The mapping pairs next, when they changed — through the
+	 * dedicated op, before the sizes (redo order: extend the
+	 * runs, then the sizes that name them). A raw value update
+	 * on the pairs bytes leaves them disagreeing with the
+	 * sizes and the replay corrupts the attribute (the xattr
+	 * crash sweep caught it: "Corrupt mapping pairs array"). */
+	if (len - pairs_off != t->snap.pairs_len ||
+	    memcmp((const u8 *)a + pairs_off, t->snap.pairs,
+		   t->snap.pairs_len) != 0) {
+		err = ntfs_log_txn_update_mapping_pairs(
+			txn, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			off, pairs_off,
+			le16_to_cpu(a->flags), le16_to_cpu(a->name_offset),
+			(const u8 *)a + pairs_off, (u16)(len - pairs_off),
+			t->snap.flags, t->snap.name_off, t->snap.pairs_off,
+			t->snap.pairs, t->snap.pairs_len);
+		if (err)
+			goto out_abort;
+	}
+
+	/* The sizes last, when they changed. */
+	{
+		u64 alloc = le64_to_cpu(a->data.non_resident.allocated_size);
+		u64 valid = le64_to_cpu(a->data.non_resident.initialized_size);
+		u64 data = le64_to_cpu(a->data.non_resident.data_size);
+		u64 total = pairs_off >= 0x48 ?
+			le64_to_cpu(a->data.non_resident.compressed_size) : 0;
+
+		if (alloc != t->snap.alloc || valid != t->snap.valid ||
+		    data != t->snap.data || total != t->snap.total) {
+			err = ntfs_log_txn_set_attr_sizes(
+				txn, vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				off, alloc, valid, data, total,
+				t->snap.alloc, t->snap.valid,
+				t->snap.data, t->snap.total);
+			if (err)
+				goto out_abort;
+		}
+	}
+
+	/* The $STANDARD_INFORMATION times, which the write's mtime
+	 * bump moved. The flags cannot change on this path (the
+	 * file was already compressed), but the 36-byte record
+	 * covers them either way; stage_si_36 stages only on
+	 * change. The $SI attribute must still sit where begin
+	 * found it; anything else aborts. */
+	err = stage_si_36(vol, txn, t->si_old, t->si_attr_off,
+			  t->si_value_off, ni, mrec,
+			  vcn, cluster_off, page_lcn);
+	if (err)
+		goto out_abort;
+
+	/* The parent's $FILE_NAME, last: its duplicated sizes and
+	 * flags must agree with the written $DATA after the replay,
+	 * whatever instant the crash hits. A failure here aborts
+	 * the whole transaction (the write then proceeds
+	 * unjournaled). */
+	err = stage_cwrite_filename(t, ni, mrec, a);
+	if (err)
+		goto out_abort;
+
+	if (ntfs_log_txn_is_empty(txn))
+		goto out_abort;
+	return ntfs_journal_cwrite_commit(t, ni);
+
+out_abort:
+	ntfs_journal_cwrite_abort(t);
+	return 0;
+}

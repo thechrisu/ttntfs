@@ -719,4 +719,75 @@ int ntfs_journal_ea_finish(struct ntfs_journal_ea *et,
 			   struct ntfs_inode *ni,
 			   const struct mft_record *mrec);
 
+/* ---- compressed-write (Phase 3) -------------------------------------- */
+/*
+ * One transaction per do_write() call on a compressed file's $DATA.
+ * The write itself is not journaled — file data never is — but the
+ * metadata it moves is: every compression block the write rewrites
+ * allocates fresh clusters, writes the new compressed bytes there,
+ * and only then punches the old clusters (the upstream eb67671cd814
+ * order, ported in round 8), so one write changes the $Bitmap, the
+ * mapping pairs, the sizes (allocated, data, initialized, compressed
+ * total), the $SI times and the parent's $FILE_NAME dup, all at once.
+ * The transaction stages that net effect: $Bitmap delta first (set
+ * difference of the old and new run lists), then UpdateMappingPairs,
+ * then SetNewAttributeSizes, then the $SI 36 bytes, then the parent's
+ * $FILE_NAME — the truncate class's order, for the same reason: the
+ * pairs must name the runs before the sizes that count them, and the
+ * bitmap must agree with both.
+ *
+ * The hook is in do_write(), at the top of the compressed branch:
+ * begin before the expand (the expand itself grows the sizes and
+ * the run list, and the WAL gate must be up before it runs), stage
+ * + commit in the done block after the mtime bump (the $SI record
+ * carries the new times). A stage failure aborts and the write
+ * stands unjournaled; a commit failure marks the volume and the
+ * next mount's replay undoes the partial transaction.
+ *
+ * Scope, by design: the file must already be non-resident when the
+ * write begins. A file that starts resident converts inside the
+ * write (ntfs_attr_expand -> ntfs_attr_make_non_resident): the
+ * attribute changes shape — resident value bytes become a
+ * non-resident header plus runs, and every following attribute
+ * shifts — which the log's ops cannot describe without new
+ * machinery, so the conversion write proceeds unjournaled, exactly
+ * as a resident truncate does in the truncate class. A resident
+ * write that stays resident never begins either: plain data writes
+ * are no class's business. Attribute inodes (NInoAttr) never begin:
+ * ADS writes are the xattr class's domain.
+ *
+ * Crash contract: before commit → undo restores the old pairs,
+ * sizes, bitmap and $SI, and the old clusters still hold the old
+ * block bytes (the punch frees bitmap bits, it does not erase), so
+ * the file reads back all-old; after commit → redo applies the new
+ * pairs, sizes and bitmap, and the new clusters already hold the
+ * new bytes (written before the punch, before the commit), so the
+ * file reads back all-new; a second replay is a no-op. A crash
+ * between the commit and the parent's $FILE_NAME writeback still
+ * replays the dup record, so the parent agrees either way.
+ */
+struct ntfs_journal_cwrite;
+
+/* Begin a compressed-write transaction, or NULL (0) when there is
+ * nothing to journal: no writer, not a regular file, resident $DATA,
+ * attribute list, attribute inode, encrypted, or not compressed. On
+ * error the gate was never raised and the lock was never taken; the
+ * caller proceeds unjournaled. */
+int ntfs_journal_cwrite_begin(struct ntfs_volume *vol,
+			      struct ntfs_inode *ni,
+			      struct ntfs_journal_cwrite **out);
+
+/* Abort: write nothing, lower the WAL gate, release the lock. */
+void ntfs_journal_cwrite_abort(struct ntfs_journal_cwrite *t);
+
+/* Stage the write's net effect after ntfs_compress_write returned
+ * and the mtime bump ran, then commit — or abort when the stage
+ * fails or when nothing was staged. @mrec is the file's mapped
+ * record. Returns the commit error (the caller must set the volume
+ * error flag), or 0 when the transaction was committed or aborted
+ * unjournaled. */
+int ntfs_journal_cwrite_finish(struct ntfs_journal_cwrite *t,
+			       struct ntfs_inode *ni,
+			       const struct mft_record *mrec);
+
 #endif /* NTFS_JOURNAL_H */

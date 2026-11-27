@@ -1189,7 +1189,46 @@ reparse-set class to journal; the mkdir class never stages a $SI
 flags update at all, so a replayed directory's $SI carries the
 as-added flags instead of the final DUP_FILE_NAME_INDEX_PRESENT —
 the same shape, unasserted there.
-Next: the compressed-write class, then Phase 4.
+Phase 3, compressed-write — glue landed 2026-11-27 (commit, this
+round): the last Phase 3 class. One transaction per `do_write` on a
+compressed file that is already non-resident when the write begins,
+through a new `struct ntfs_journal_cwrite` carrier reusing the
+truncate patterns. Begin runs at the top of the compressed branch of
+`do_write`, before `ntfs_attr_expand`, and snapshots the `$DATA`
+sizes + pairs + runlist, the `$SI` 36 bytes from in-memory state, the
+`$SI` flags, `fn_alloc_old` and a runlist copy. Stage runs in
+`done:`, after the mtime bump, under `mrec_lock`: the `$Bitmap`
+delta first (`lcn_ranges_sub`), then `UpdateMappingPairs`, then
+`SetNewAttributeSizes`, then the `$SI` 36 bytes, then the parent
+`$FILE_NAME`; an empty transaction aborts instead of committing,
+and the commit stamps `MR_LSN` into the file's record. Begin gate:
+regular file, non-resident `$DATA`, compressed, no attribute list,
+not encrypted, not an attribute inode; a resident file at begin
+aborts to unjournaled, and a begin failure warns and proceeds
+unjournaled, never failing the write for journal reasons. The `$SI`
+flags come from in-memory `ni->flags`, not the mapped record: the
+flags handler updates `ni->flags` but never the `$SI` record bytes,
+so the first version staged a mapped 0x0 and the overwrite test
+caught the undo clearing COMPRESSED from the parent's entry (live
+0x800). Content is all-old/all-new on crash without journaling the
+data: the writer allocates NEW clusters for a rewritten block,
+writes the compressed data there, then punches the old clusters, so
+undo restores old pairs over old data and redo applies new pairs
+over new data. The resident-to-non-resident conversion inside a
+write is a documented limitation, not journaled: the attribute
+changes shape and every following attribute shifts. Evidence:
+`test_journal.c` 1816 checks, 0 failures (was 1586; three new
+tests: overwrite one 64 KiB block — walk 39 records, replay redoes
+7, `$FILE_NAME` undo/redo flags both 0x800; append one block at EOF
+— walk 39, the old 8 KiB tail block frees 3 clusters, replay redoes
+7; conversion — walk 16, the create only, replay redoes 2; content
+reads back whole after replay + mount in all three; `ntfsck`
+clean). Crash tests follow in the next commit of this round.
+Follow-ups, not this class: the truncate class shares the
+flags-source shape for handler-flagged sparse files (its mapped-`$SI`
+undo would clear SPARSE from the entry after a refresh); the mkdir
+class never stages a `$SI` flags update (see above).
+Next: Phase 4.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
