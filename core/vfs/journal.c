@@ -3307,3 +3307,386 @@ out_abort:
 	ntfs_journal_xattr_abort(xt);
 	return 0;
 }
+
+/* ---- EA (Phase 3, eighth class) -----------------------------------------
+ *
+ * One transaction per VFS xattr-handler set on the $EA path. The
+ * carrier snapshots, at begin, the $SI 36 bytes (from in-memory
+ * state, the setattr form) and whole-record copies of
+ * $EA_INFORMATION and $EA plus their offsets and presence. At
+ * stage it compares the live record against that snapshot and
+ * logs the pair's net effect. The resident values are staged
+ * whole, any length — the replay's length-change path, proven by
+ * the xattr class.
+ *
+ * The stage runs under the file's mrec_lock (ea.c holds it around
+ * the finish call), so the record cannot move under it. The commit
+ * stamps MR_LSN into the file's record only.
+ */
+
+struct ntfs_journal_ea {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+	u8 si_old[36];
+	u16 si_attr_off;
+	u16 si_value_off;
+	bool ea_info_present;
+	u16 ea_info_attr_off;
+	u8 *ea_info_old;	/* kmalloc'd copy of the attribute record */
+	u32 ea_info_old_len;
+	bool ea_present;
+	u16 ea_attr_off;
+	u8 *ea_old;		/* kmalloc'd copy of the attribute record */
+	u32 ea_old_len;
+};
+
+static void ea_free_snapshot(struct ntfs_journal_ea *et)
+{
+	kfree(et->ea_info_old);
+	et->ea_info_old = NULL;
+	kfree(et->ea_old);
+	et->ea_old = NULL;
+}
+
+int ntfs_journal_ea_begin(struct ntfs_volume *vol,
+			  struct ntfs_inode *ni,
+			  struct ntfs_journal_ea **out)
+{
+	struct ntfs_journal_ea *et;
+	struct mft_record *m;
+	struct inode *vi = VFS_I(ni);
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	/* Regular files and directories only, the create class's
+	 * scope. Symlinks and special files proceed unjournaled —
+	 * their $EA, if any, is a foreign-volume artifact. */
+	if (!S_ISREG(vi->i_mode) && !S_ISDIR(vi->i_mode))
+		return 0;
+	/* An attribute list means the $EA pair may live in an
+	 * extent, not in the base record — begin cannot tell
+	 * "absent" from "in an extent", so this op proceeds
+	 * unjournaled. */
+	if (ni->attr_list)
+		return 0;
+	et = kmalloc(sizeof(*et), GFP_NOFS);
+	if (!et)
+		return -ENOMEM;
+	/* Initialize every field at begin: kmalloc does not zero
+	 * (round 25: an uninitialized txn field corrupted the
+	 * volume). */
+	et->vol = vol;
+	et->t = NULL;
+	et->si_attr_off = 0;
+	et->si_value_off = 0;
+	et->ea_info_present = false;
+	et->ea_info_attr_off = 0;
+	et->ea_info_old = NULL;
+	et->ea_info_old_len = 0;
+	et->ea_present = false;
+	et->ea_attr_off = 0;
+	et->ea_old = NULL;
+	et->ea_old_len = 0;
+	/* The $SI snapshot is in-memory state: the mapped record
+	 * lags behind the log, and a mapped snapshot's undo would
+	 * restore the pre-previous state. */
+	si_build(vi, ni, et->si_old);
+	/* The $SI offsets and the $EA pair, from the mapped record.
+	 * A missing or too-short $SI is a begin failure (the op
+	 * then proceeds unjournaled); a non-resident $EA pair, a
+	 * wrong-length $EA_INFORMATION, or a half-pair means the
+	 * file never begins — this class cannot describe it. */
+	m = map_mft_record(ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+		goto out_free;
+	}
+	{
+		const struct attr_record *si;
+		u16 si_off = 0;
+
+		si = find_attr(m, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+		if (!si || si->non_resident ||
+		    le16_to_cpu(si->data.resident.value_offset) + 36 >
+			    le32_to_cpu(si->length)) {
+			err = -ENOENT;
+			goto out_unmap;
+		}
+		et->si_attr_off = si_off;
+		et->si_value_off =
+			le16_to_cpu(si->data.resident.value_offset);
+	}
+	{
+		const struct attr_record *ei, *ea;
+		u16 ei_off = 0, ea_off = 0;
+
+		ei = find_attr(m, AT_EA_INFORMATION, NULL, 0, &ei_off);
+		ea = find_attr(m, AT_EA, NULL, 0, &ea_off);
+		if (!!ei != !!ea)
+			goto out_nonresident;
+		if (ei) {
+			u32 alen;
+
+			if (ei->non_resident ||
+			    le16_to_cpu(ei->data.resident.value_length) !=
+				    sizeof(struct ea_information))
+				goto out_nonresident;
+			alen = le32_to_cpu(ei->length);
+			et->ea_info_old = kmemdup(ei, alen, GFP_NOFS);
+			if (!et->ea_info_old) {
+				err = -ENOMEM;
+				goto out_unmap;
+			}
+			et->ea_info_old_len = alen;
+			et->ea_info_attr_off = ei_off;
+			et->ea_info_present = true;
+		}
+		if (ea) {
+			u32 alen;
+
+			if (ea->non_resident)
+				goto out_nonresident;
+			alen = le32_to_cpu(ea->length);
+			et->ea_old = kmemdup(ea, alen, GFP_NOFS);
+			if (!et->ea_old) {
+				err = -ENOMEM;
+				goto out_unmap;
+			}
+			et->ea_old_len = alen;
+			et->ea_attr_off = ea_off;
+			et->ea_present = true;
+		}
+	}
+	unmap_mft_record(ni);
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &et->t);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "journal: EA transaction begin failed: %d",
+			   err);
+		mutex_unlock(&vol->log_txn_lock);
+		goto out_free;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = et;
+	return 0;
+
+out_nonresident:
+	/* A $EA pair this class cannot describe: proceed
+	 * unjournaled, by design, not a failure. */
+	unmap_mft_record(ni);
+	ea_free_snapshot(et);
+	kfree(et);
+	*out = NULL;
+	return 0;
+out_unmap:
+	unmap_mft_record(ni);
+out_free:
+	ea_free_snapshot(et);
+	kfree(et);
+	return err;
+}
+
+void ntfs_journal_ea_abort(struct ntfs_journal_ea *et)
+{
+	if (!et)
+		return;
+	(void)ntfs_log_txn_abort(et->t);
+	atomic_dec(&et->vol->log_txn_open);
+	mutex_unlock(&et->vol->log_txn_lock);
+	ea_free_snapshot(et);
+	kfree(et);
+}
+
+static int ntfs_journal_ea_commit(struct ntfs_journal_ea *et,
+				  struct ntfs_inode *ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!et)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(et->t, NULL, &last_lsn);
+	if (!err) {
+		/* Stamp MR_LSN into the file's record before the
+		 * metadata flush, as in the other commits. The
+		 * finish never commits an empty transaction, so
+		 * last_lsn is a real LSN here, never 0. */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&et->vol->log_txn_open);
+	mutex_unlock(&et->vol->log_txn_lock);
+	ea_free_snapshot(et);
+	kfree(et);
+	return err;
+}
+
+/*
+ * Stage the $EA_INFORMATION + $EA pair, net effect. The values are
+ * re-read from the mapped record at stage time — resident $EA
+ * writes land straight in the mapped record, so the stage sees the
+ * final bytes. Cases:
+ *
+ *   - absent at begin, present at stage: CreateAttribute for the
+ *     pair (the create_ea pattern), $EA_INFORMATION first;
+ *   - present at begin, absent at stage: DeleteAttribute for the
+ *     pair, $EA first (the live removal order), from the
+ *     begin-time bytes;
+ *   - present both times: UpdateResidentValue for each value that
+ *     changed, whole value, any length (the xattr-proven
+ *     length-change path). The attributes must still sit where
+ *     begin found them and keep their value offsets; a move
+ *     aborts.
+ *   - a half-pair at either end, or a non-resident $EA at stage:
+ *     -ENOENT (refusing to guess).
+ */
+static int stage_ea(struct ntfs_journal_ea *et,
+		    struct ntfs_inode *ni,
+		    const struct mft_record *mrec,
+		    u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	const struct attr_record *ei, *ea;
+	u16 ei_off = 0, ea_off = 0;
+	int err;
+
+	ei = find_attr(mrec, AT_EA_INFORMATION, NULL, 0, &ei_off);
+	ea = find_attr(mrec, AT_EA, NULL, 0, &ea_off);
+	if (!et->ea_info_present && !et->ea_present) {
+		if (!ei && !ea)
+			return 0;
+		if (!ei || !ea)
+			return -ENOENT;
+		/* The pair was created by this op: stage both as
+		 * CreateAttributes, $EA_INFORMATION first. */
+		err = stage_create_attr(et->t, et->vol, ni, mrec,
+					AT_EA_INFORMATION, NULL, 0, false);
+		if (err)
+			return err;
+		return stage_create_attr(et->t, et->vol, ni, mrec,
+					 AT_EA, NULL, 0, false);
+	}
+	if (!ei && !ea) {
+		/* The pair was removed by this op: stage both as
+		 * DeleteAttributes, $EA first (the live removal
+		 * order), from the begin-time bytes. */
+		err = ntfs_log_txn_delete_attr(
+			et->t, et->vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			et->ea_attr_off, et->ea_old, et->ea_old_len);
+		if (err)
+			return err;
+		return ntfs_log_txn_delete_attr(
+			et->t, et->vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			et->ea_info_attr_off, et->ea_info_old,
+			et->ea_info_old_len);
+	}
+	if (!ei || !ea)
+		return -ENOENT;
+	if (ei->non_resident || ea->non_resident)
+		return -ENOENT;
+	/* $EA_INFORMATION's value is always 8 bytes; anything else
+	 * is a record this class cannot describe. */
+	if (le16_to_cpu(ei->data.resident.value_length) !=
+	    sizeof(struct ea_information))
+		return -ENOENT;
+	if (ei_off != et->ea_info_attr_off || ea_off != et->ea_attr_off)
+		return -ENOENT;
+	{
+		const struct attr_record *old_ei =
+			(const struct attr_record *)et->ea_info_old;
+		u16 old_voff =
+			le16_to_cpu(old_ei->data.resident.value_offset);
+		u16 new_voff =
+			le16_to_cpu(ei->data.resident.value_offset);
+		const u8 *new_info = (const u8 *)ei + new_voff;
+		const u8 *old_info = (const u8 *)old_ei + old_voff;
+
+		if (new_voff != old_voff)
+			return -ENOENT;
+		if (memcmp(new_info, old_info,
+			   sizeof(struct ea_information)) != 0) {
+			err = ntfs_log_txn_update_resident(
+				et->t, et->vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ei_off, new_voff,
+				new_info, sizeof(struct ea_information),
+				old_info, sizeof(struct ea_information));
+			if (err)
+				return err;
+		}
+	}
+	{
+		const struct attr_record *old_ea =
+			(const struct attr_record *)et->ea_old;
+		u16 old_voff =
+			le16_to_cpu(old_ea->data.resident.value_offset);
+		u16 new_voff =
+			le16_to_cpu(ea->data.resident.value_offset);
+		u16 old_vlen =
+			le16_to_cpu(old_ea->data.resident.value_length);
+		u16 new_vlen =
+			le16_to_cpu(ea->data.resident.value_length);
+		const u8 *new_ea = (const u8 *)ea + new_voff;
+		const u8 *old_ea_val = (const u8 *)old_ea + old_voff;
+
+		if (new_voff != old_voff)
+			return -ENOENT;
+		if (new_vlen != old_vlen ||
+		    memcmp(new_ea, old_ea_val, old_vlen) != 0) {
+			err = ntfs_log_txn_update_resident(
+				et->t, et->vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ea_off, new_voff,
+				new_ea, new_vlen,
+				old_ea_val, old_vlen);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
+int ntfs_journal_ea_finish(struct ntfs_journal_ea *et,
+			   struct ntfs_inode *ni,
+			   const struct mft_record *mrec)
+{
+	struct ntfs_volume *vol = et->vol;
+	ntfs_log_txn_t *t = et->t;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	err = mft_coords(vol, ni->mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (err)
+		goto out_abort;
+
+	/* $SI first: the handler's success path only bumps ctime,
+	 * and ntfs_set_ea sets/clears the HasEA flag in ni->flags. */
+	err = stage_si_36(vol, t, et->si_old, et->si_attr_off,
+			  et->si_value_off, ni, mrec,
+			  vcn, cluster_off, page_lcn);
+	if (err)
+		goto out_abort;
+	err = stage_ea(et, ni, mrec, vcn, cluster_off, page_lcn);
+	if (err)
+		goto out_abort;
+	if (ntfs_log_txn_is_empty(t))
+		goto out_abort;
+	return ntfs_journal_ea_commit(et, ni);
+
+out_abort:
+	ntfs_journal_ea_abort(et);
+	return 0;
+}

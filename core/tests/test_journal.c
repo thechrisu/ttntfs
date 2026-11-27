@@ -143,6 +143,15 @@
 #include "ntfs_logfile.h"
 #include "ntfs_image.h"
 #include "logfile_layout.h"
+#include <linux/xattr.h>
+#include <linux/fs.h>
+
+/* $EA test hook: the VFS xattr handler table is exported from ea.c
+ * (see ea.h); the EA tests drive handlers[0]->set/get directly
+ * because the public ntfs_setxattr() stores xattrs as ADS and never
+ * reaches ntfs_set_ea(). Declared here rather than including ea.h,
+ * whose internal headers collide with ntfscore.h. */
+extern const struct xattr_handler *const ntfs_xattr_handlers[];
 
 static int failures, checks;
 #define CHECK(cond) do {						\
@@ -361,6 +370,29 @@ struct rec_seen {
 	uint16_t ads_value_redo_len, ads_value_undo_len;
 	uint64_t ads_value_lsn;
 	int sizes_count;
+	/* CreateAttribute for $EA_INFORMATION / $EA: the redo's first
+	 * 4 bytes are the attribute type (0xD0 / 0xE0). */
+	int ea_info_create_hits, ea_create_hits;
+	uint64_t ea_info_create_lsn, ea_create_lsn;
+	/* DeleteAttribute for $EA_INFORMATION / $EA: the undo's first
+	 * 4 bytes are the attribute type. */
+	int ea_info_delete_hits, ea_delete_hits;
+	uint64_t ea_info_delete_lsn, ea_delete_lsn;
+	/* UpdateResidentValue whose payload is the $EA stream: the
+	 * redo and undo bytes, up to 256 each. Matched when either
+	 * side contains the EA name (set_ea_name picks it); the last
+	 * such record wins. The 8-byte $EA_INFORMATION record never
+	 * matches (it carries no name). */
+	uint8_t ea_value_redo[256], ea_value_undo[256];
+	uint16_t ea_value_redo_len, ea_value_undo_len;
+	uint64_t ea_value_lsn;
+	/* UpdateResidentValue with an 8-byte payload: the
+	 * $EA_INFORMATION value (ea_length +0, need_ea_count +2,
+	 * ea_query_length +4, all little-endian). The last such
+	 * record wins. */
+	uint16_t ea_info_redo_len, ea_info_undo_len;
+	uint32_t ea_info_redo_query, ea_info_undo_query;
+	uint64_t ea_info_lsn;
 };
 
 /* $FILE_NAME create: its redo carries the name in UTF-16LE. The
@@ -402,6 +434,22 @@ static void set_ads_name(const char *name)
 		ads_name_pat[2 * i + 1] = 0;
 	}
 	ads_name_len = 2 * n;
+}
+
+/* The EA name pattern, mirroring set_ads_name() — but an EA name in
+ * the $EA stream is plain bytes, not UTF-16LE. Defaults to empty
+ * (no scan); a test calls set_ea_name() before walk_log(). */
+static uint8_t ea_name_pat[32];
+static size_t ea_name_len;
+
+static void set_ea_name(const char *name)
+{
+	size_t n = strlen(name);
+
+	if (n > 32)
+		n = 32;
+	memcpy(ea_name_pat, name, n);
+	ea_name_len = n;
 }
 
 static uint64_t rd64(const uint8_t *p)
@@ -506,6 +554,96 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 			s->ads_value_redo_len = (uint16_t)r->redo_len;
 			s->ads_value_undo_len = (uint16_t)r->undo_len;
 			s->ads_value_lsn = r->lsn;
+		}
+	}
+	/* The $EA pair's CreateAttribute: the redo's first 4 bytes
+	 * are the attribute type (0xD0 $EA_INFORMATION, 0xE0 $EA). */
+	if (r->redo_op == LOP_CreateAttribute && r->redo &&
+	    r->redo_len >= 4) {
+		const uint8_t *pr = r->redo;
+		uint32_t t = (uint32_t)pr[0] |
+			((uint32_t)pr[1] << 8) |
+			((uint32_t)pr[2] << 16) |
+			((uint32_t)pr[3] << 24);
+
+		if (t == 0xD0) {
+			s->ea_info_create_hits++;
+			s->ea_info_create_lsn = r->lsn;
+		}
+		if (t == 0xE0) {
+			s->ea_create_hits++;
+			s->ea_create_lsn = r->lsn;
+		}
+	}
+	/* The $EA pair's DeleteAttribute: the undo carries the
+	 * attribute bytes, so the type is read from there. */
+	if (r->redo_op == LOP_DeleteAttribute && r->undo &&
+	    r->undo_len >= 4) {
+		const uint8_t *pu = r->undo;
+		uint32_t t = (uint32_t)pu[0] |
+			((uint32_t)pu[1] << 8) |
+			((uint32_t)pu[2] << 16) |
+			((uint32_t)pu[3] << 24);
+
+		if (t == 0xD0) {
+			s->ea_info_delete_hits++;
+			s->ea_info_delete_lsn = r->lsn;
+		}
+		if (t == 0xE0) {
+			s->ea_delete_hits++;
+			s->ea_delete_lsn = r->lsn;
+		}
+	}
+	/* The $EA_INFORMATION value: an UpdateResidentValue with an
+	 * 8-byte payload (ea_length +0, need_ea_count +2,
+	 * ea_query_length +4). */
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->undo &&
+	    r->redo_len == 8 && r->undo_len == 8) {
+		const uint8_t *pr = r->redo, *pu = r->undo;
+
+		s->ea_info_redo_len = (uint16_t)pr[0] |
+			((uint16_t)pr[1] << 8);
+		s->ea_info_undo_len = (uint16_t)pu[0] |
+			((uint16_t)pu[1] << 8);
+		s->ea_info_redo_query = (uint32_t)pr[4] |
+			((uint32_t)pr[5] << 8) |
+			((uint32_t)pr[6] << 16) |
+			((uint32_t)pr[7] << 24);
+		s->ea_info_undo_query = (uint32_t)pu[4] |
+			((uint32_t)pu[5] << 8) |
+			((uint32_t)pu[6] << 16) |
+			((uint32_t)pu[7] << 24);
+		s->ea_info_lsn = r->lsn;
+	}
+	/* The $EA stream value: an UpdateResidentValue whose redo or
+	 * undo carries the EA name. Stores the whole redo/undo
+	 * bytes (up to 256 each); the last such record wins. */
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->undo &&
+	    ea_name_len && r->redo_len <= 256 && r->undo_len <= 256) {
+		bool hit = false;
+
+		for (i = 0; i + ea_name_len <= r->redo_len; i++) {
+			if (!memcmp(r->redo + i, ea_name_pat,
+				    ea_name_len)) {
+				hit = true;
+				break;
+			}
+		}
+		if (!hit) {
+			for (i = 0; i + ea_name_len <= r->undo_len; i++) {
+				if (!memcmp(r->undo + i, ea_name_pat,
+					    ea_name_len)) {
+					hit = true;
+					break;
+				}
+			}
+		}
+		if (hit) {
+			memcpy(s->ea_value_redo, r->redo, r->redo_len);
+			memcpy(s->ea_value_undo, r->undo, r->undo_len);
+			s->ea_value_redo_len = (uint16_t)r->redo_len;
+			s->ea_value_undo_len = (uint16_t)r->undo_len;
+			s->ea_value_lsn = r->lsn;
 		}
 	}
 	if (r->redo_op == LOP_SetBitsInNonresidentBitMap && r->redo && r->redo_len >= BR_SIZE) {
@@ -1017,6 +1155,102 @@ static int xattr_after_mount(const char *path, const char *parent,
 		goto out_d;
 	err = ntfs_getxattr(f, xname, buf, bufsz, len_out);
 	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* $EA test helpers: drive the VFS xattr handler directly, the
+ * test_links.c pattern — the public ntfs_setxattr() stores xattrs
+ * as ADS and never reaches ntfs_set_ea(). ea_remove passes
+ * XATTR_REPLACE with a NULL value, the handler's remove path. */
+static int ea_set(ntfs_inode_t *f, const char *name, const void *val,
+		  size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size, 0);
+}
+
+static int ea_set_flags(ntfs_inode_t *f, const char *name, const void *val,
+			size_t size, int flags)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, val, size,
+		      flags);
+}
+
+static int ea_remove(ntfs_inode_t *f, const char *name)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->set(h, NULL, NULL, (struct inode *)f, name, NULL, 0,
+		      XATTR_REPLACE);
+}
+
+static int ea_get(ntfs_inode_t *f, const char *name, void *buf, size_t size)
+{
+	const struct xattr_handler *h = ntfs_xattr_handlers[0];
+
+	return h->get(h, NULL, (struct inode *)f, name, buf, size);
+}
+
+/* Mount @path, read the EA @name off @file (@parent NULL and @file
+ * NULL means the root directory itself; @parent NULL and @file set
+ * means a file in the root) into @buf (@bufsz bytes, @len_out the
+ * length read), unmount. The same shape as xattr_after_mount, for
+ * the EA tests' post-replay checks. A missing EA returns -ENODATA. */
+static int ea_after_mount(const char *path, const char *parent,
+			  const char *file, const char *name,
+			  void *buf, size_t bufsz, size_t *len_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	if (file) {
+		err = ntfs_lookup(d, file, &f);
+		if (err)
+			goto out_d;
+	} else {
+		f = d;
+	}
+	/* ea_get returns the length on success, like getxattr(2);
+	 * normalize to 0 so callers read the length from len_out. */
+	err = ea_get(f, name, buf, bufsz);
+	if (err >= 0) {
+		if (len_out)
+			*len_out = (size_t)err;
+		err = 0;
+	}
+	if (file)
+		ntfs_inode_put(f);
 out_d:
 	if (d && d != root)
 		ntfs_inode_put(d);
@@ -4264,6 +4498,776 @@ out:
 	unlink(snap2);
 }
 
+/* ---- 23. setting an EA journals the $EA pair -----------------------------
+ *
+ * A driver-created file already carries the three $LX* entries
+ * ($LXUID/$LXGID/$LXMOD, 60-byte stream), so setting a user EA on
+ * it is a replace: the $EA_INFORMATION and $EA values are staged
+ * whole, the $EA value growing (the xattr-proven length-change
+ * path). The walk: the create's 14, then the EA transaction's 9
+ * (one open — $MFT:$DATA — the $SI ctime record, the
+ * $EA_INFORMATION record, the $EA record, Commit, three table
+ * dumps, Forget). No $Bitmap record: a resident $EA allocates no
+ * clusters. No $FILE_NAME record: EA sizes are not in the parent's
+ * dup. */
+
+static void test_ea_replace_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_replace_journaled\n");
+	scratch_path(orig, sizeof(orig), "eaorig");
+	scratch_path(snap, sizeof(snap), "easnap");
+	scratch_path(snap1, sizeof(snap1), "easnap1");
+	scratch_path(snap2, sizeof(snap2), "easnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_replace_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	/* Set a small EA: the pair exists ($LX*), so this grows the
+	 * stream from 60 bytes to 80. */
+	err = ea_set(f, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 23);
+	if (s.n == 23) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.redo_op[17], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[19], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[20], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_ForgetTransaction);
+		/* The $SI record (at [15]) names a later ctime than
+		 * the create's — the handler's success path only bumps
+		 * ctime — and undoes to the create's ctime. */
+		CHECK(s.si_redo_ctime > s.si_undo_ctime);
+		CHECK_EQ(s.si_lsn, s.lsn[15]);
+		/* The $EA_INFORMATION record (at [16]) carries the
+		 * new stream length as its ea_query_length and undoes
+		 * to the $LX*-only length; both agree with the $EA
+		 * value record's lengths (at [17]). */
+		CHECK_EQ(s.ea_info_lsn, s.lsn[16]);
+		CHECK_EQ(s.ea_info_redo_query, 80u);
+		CHECK_EQ(s.ea_info_undo_query, 60u);
+		CHECK_EQ(s.ea_value_lsn, s.lsn[17]);
+		CHECK_EQ(s.ea_value_redo_len, 80u);
+		CHECK_EQ(s.ea_value_undo_len, 60u);
+		CHECK_EQ(s.ea_info_redo_query, (uint32_t)s.ea_value_redo_len);
+		CHECK_EQ(s.ea_info_undo_query, (uint32_t)s.ea_value_undo_len);
+		/* The $EA value record carries the new stream whole
+		 * (with "user.a"/"abc") and undoes to the $LX*-only
+		 * stream (no "user.a"). */
+		CHECK(memcmp(s.ea_value_redo, s.ea_value_undo, 60) != 0 ||
+		      s.ea_value_redo_len != s.ea_value_undo_len);
+		{
+			bool redo_has = false, undo_has = false;
+			size_t i;
+
+			for (i = 0; i + 6 <= s.ea_value_redo_len; i++) {
+				if (!memcmp(s.ea_value_redo + i, "user.a", 6))
+					redo_has = true;
+			}
+			for (i = 0; i + 6 <= s.ea_value_undo_len; i++) {
+				if (!memcmp(s.ea_value_undo + i, "user.a", 6))
+					undo_has = true;
+			}
+			CHECK(redo_has);
+			CHECK(!undo_has);
+		}
+	}
+
+	/* Replay copy 1: only the create's two idempotent records
+	 * redo — the EA transaction's records are skipped on the file
+	 * record's MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The value reads back after a remount. */
+	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
+				buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot redoes the same two
+	 * records. Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+/* ---- 24. replacing an EA grows the stream ------------------------------ */
+
+static void test_ea_replace_grow_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_replace_grow_journaled\n");
+	scratch_path(orig, sizeof(orig), "eagorig");
+	scratch_path(snap, sizeof(snap), "eagsnap");
+	scratch_path(snap1, sizeof(snap1), "eagsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_replace_grow_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	err = ea_set(f, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	/* Replace with a longer value: the stream grows 80 -> 84,
+	 * one UpdateResidentValue for the whole value — the length
+	 * change the setattr class refused on $EA and the xattr
+	 * class proved. */
+	err = ea_set(f, "user.a", "abcdef", 6);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, the set transaction's 9, then
+	 * the replace transaction's 9. */
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 32);
+	if (s.n == 32) {
+		CHECK_EQ(s.redo_op[23], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[25], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
+		/* The value record (at [26]) carries the new stream
+		 * whole ("abcdef") and undoes to the old stream whole
+		 * ("abc"); the lengths differ, the length-change path. */
+		CHECK_EQ(s.ea_value_lsn, s.lsn[26]);
+		CHECK_EQ(s.ea_value_redo_len, 84u);
+		CHECK_EQ(s.ea_value_undo_len, 80u);
+		{
+			bool redo_has_new = false, undo_has_new = false;
+			bool undo_has_old = false;
+			size_t i;
+
+			for (i = 0; i + 6 <= s.ea_value_redo_len; i++) {
+				if (!memcmp(s.ea_value_redo + i, "abcdef", 6))
+					redo_has_new = true;
+			}
+			for (i = 0; i + 6 <= s.ea_value_undo_len; i++) {
+				if (!memcmp(s.ea_value_undo + i, "abcdef", 6))
+					undo_has_new = true;
+			}
+			/* "abc" sits at the very end of the undo stream,
+			 * so its scan needs the 3-byte bound, not the
+			 * 6-byte one above. */
+			for (i = 0; i + 3 <= s.ea_value_undo_len; i++) {
+				if (!memcmp(s.ea_value_undo + i, "abc", 3))
+					undo_has_old = true;
+			}
+			CHECK(redo_has_new);
+			CHECK(!undo_has_new);
+			CHECK(undo_has_old);
+		}
+		CHECK_EQ(s.ea_info_lsn, s.lsn[25]);
+		CHECK_EQ(s.ea_info_redo_query, 84u);
+		CHECK_EQ(s.ea_info_undo_query, 80u);
+	}
+
+	/* Replay: only the create's two idempotent records redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	/* The new value reads back after a remount. */
+	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
+				buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 6u);
+	CHECK_EQ(memcmp(buf, "abcdef", 6), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 25. removing an EA shrinks the stream, pair remains --------------- */
+
+static void test_ea_remove_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_remove_journaled\n");
+	scratch_path(orig, sizeof(orig), "earorig");
+	scratch_path(snap, sizeof(snap), "earsnap");
+	scratch_path(snap1, sizeof(snap1), "earsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_remove_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	err = ea_set(f, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	/* Remove it: the stream shrinks 80 -> 60, back to $LX*
+	 * only; the pair itself stays (it is not the last entry). */
+	err = ea_remove(f, "user.a");
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, the set transaction's 9, then
+	 * the remove transaction's 9. */
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 32);
+	if (s.n == 32) {
+		CHECK_EQ(s.redo_op[23], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[25], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
+		/* The value record (at [26]) carries the $LX*-only
+		 * stream (no "user.a") and undoes to the stream with
+		 * "user.a"; the remove's record matches because its
+		 * undo carries the name. */
+		CHECK_EQ(s.ea_value_lsn, s.lsn[26]);
+		CHECK_EQ(s.ea_value_redo_len, 60u);
+		CHECK_EQ(s.ea_value_undo_len, 80u);
+		{
+			bool redo_has = false, undo_has = false;
+			size_t i;
+
+			for (i = 0; i + 6 <= s.ea_value_redo_len; i++) {
+				if (!memcmp(s.ea_value_redo + i, "user.a", 6))
+					redo_has = true;
+			}
+			for (i = 0; i + 6 <= s.ea_value_undo_len; i++) {
+				if (!memcmp(s.ea_value_undo + i, "user.a", 6))
+					undo_has = true;
+			}
+			CHECK(!redo_has);
+			CHECK(undo_has);
+		}
+		CHECK_EQ(s.ea_info_lsn, s.lsn[25]);
+		CHECK_EQ(s.ea_info_redo_query, 60u);
+		CHECK_EQ(s.ea_info_undo_query, 80u);
+	}
+
+	/* Replay: only the create's two idempotent records redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	/* The EA is gone after a remount. */
+	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
+				buf, sizeof(buf), &len), -ENODATA);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 26. creating the pair on the root directory -----------------------
+ *
+ * The root is the only inode a driver-made volume guarantees has
+ * no $EA pair (ntfs_create writes the three $LX* entries into
+ * every file it makes), so the root is where the CreateAttribute
+ * case is tested: setting the first EA stages CreateAttribute
+ * for $EA_INFORMATION and for $EA. The walk holds just the EA
+ * transaction's 9 records. */
+
+static void test_ea_create_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_create_journaled\n");
+	scratch_path(orig, sizeof(orig), "eacorig");
+	scratch_path(snap, sizeof(snap), "eacsnap");
+	scratch_path(snap1, sizeof(snap1), "eacsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_create_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ea_set(root, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 9);
+	if (s.n == 9) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[2], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[3], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[5], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The two CreateAttributes are the pair, $EA_INFORMATION
+		 * first: the redo's first 4 bytes are the type. */
+		CHECK_EQ(s.ea_info_create_hits, 1);
+		CHECK_EQ(s.ea_info_create_lsn, s.lsn[2]);
+		CHECK_EQ(s.ea_create_hits, 1);
+		CHECK_EQ(s.ea_create_lsn, s.lsn[3]);
+		CHECK(s.si_redo_ctime > s.si_undo_ctime);
+		CHECK_EQ(s.si_lsn, s.lsn[1]);
+	}
+
+	/* Replay: nothing redoes — every record targets the root's
+	 * own record and is skipped on its MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
+
+	/* The value reads back after a remount, off the root. */
+	CHECK_EQ(ea_after_mount(snap1, NULL, NULL, "user.a",
+				buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 27. removing the last EA tears the pair down ----------------------
+ *
+ * On the root, removing the only EA empties the stream, so
+ * ntfs_set_ea removes $EA and then $EA_INFORMATION: the remove
+ * transaction stages DeleteAttribute for both, $EA first (the
+ * live removal order), from the begin-time bytes. */
+
+static void test_ea_remove_last_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_remove_last_journaled\n");
+	scratch_path(orig, sizeof(orig), "ealorig");
+	scratch_path(snap, sizeof(snap), "ealsnap");
+	scratch_path(snap1, sizeof(snap1), "ealsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_remove_last_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ea_set(root, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	err = ea_remove(root, "user.a");
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create transaction's 9, then the remove
+	 * transaction's 9 — but the walk sees 17, not 18. The
+	 * create's Open record precedes the restart area's oldest
+	 * LSN (the remove's checkpoint pins oldest at the create's
+	 * $SI record, the dirty-page table's oldest for the root's
+	 * record), so the walk starts after it; the remove's Open
+	 * is after oldest and is visible. The Open is in the log —
+	 * the single-transaction create test shows it — and replay
+	 * does not need it here: the checkpoint's open-attribute
+	 * dump registers $MFT:$DATA. */
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 17);
+	if (s.n == 17) {
+		/* The create transaction, minus its Open: $SI, the
+		 * two CreateAttributes, Commit, three dumps, Forget. */
+		CHECK_EQ(s.redo_op[0], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[1], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[2], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		/* The remove transaction, whole: Open, $SI, the two
+		 * DeleteAttributes, Commit, three dumps, Forget. */
+		CHECK_EQ(s.redo_op[8], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[10], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[11], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[12], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[13], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[15], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[16], LOP_ForgetTransaction);
+		/* The two DeleteAttributes are the pair, $EA first:
+		 * the undo's first 4 bytes are the type. */
+		CHECK_EQ(s.ea_delete_hits, 1);
+		CHECK_EQ(s.ea_delete_lsn, s.lsn[10]);
+		CHECK_EQ(s.ea_info_delete_hits, 1);
+		CHECK_EQ(s.ea_info_delete_lsn, s.lsn[11]);
+		/* The create transaction made the pair once. */
+		CHECK_EQ(s.ea_create_hits, 1);
+		CHECK_EQ(s.ea_create_lsn, s.lsn[2]);
+		CHECK_EQ(s.ea_info_create_hits, 1);
+		CHECK_EQ(s.ea_info_create_lsn, s.lsn[1]);
+	}
+
+	/* Replay: nothing redoes. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
+
+	/* The EA is gone after a remount, and the pair with it. */
+	CHECK_EQ(ea_after_mount(snap1, NULL, NULL, "user.a",
+				buf, sizeof(buf), &len), -ENODATA);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 28. an EA on a file in the volume root ---------------------------- */
+
+static void test_ea_in_root_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_in_root_journaled\n");
+	scratch_path(orig, sizeof(orig), "eaiorig");
+	scratch_path(snap, sizeof(snap), "eaisnap");
+	scratch_path(snap1, sizeof(snap1), "eaisnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_in_root_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* The create in root is itself unjournaled (the root's index
+	 * lives in $INDEX_ALLOCATION), so the walk is empty before
+	 * the EA set — the same baseline the root-xattr test pins. */
+	err = ntfs_create(root, "r.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	/* An EA on the root file journals: only its own record is
+	 * touched, no parent $FILE_NAME. */
+	err = ea_set(f, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds just the EA transaction's 9 records. */
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 9);
+	if (s.n == 9) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[5], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		CHECK_EQ(s.ea_value_redo_len, 80u);
+		CHECK_EQ(s.ea_value_undo_len, 60u);
+		CHECK_EQ(s.ea_info_redo_query, 80u);
+		CHECK_EQ(s.ea_info_undo_query, 60u);
+	}
+
+	/* Replay: nothing redoes — every record targets the file's
+	 * own record and is skipped on its MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
+
+	/* The value reads back after a remount. */
+	CHECK_EQ(ea_after_mount(snap1, NULL, "r.txt", "user.a",
+				buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	return;
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	unlink(orig);
+	unlink(snap);
+}
+
+/* ---- 29. a failed EA set logs nothing (negative control) --------------- */
+
+static void test_ea_failed_set_unjournaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_ea_failed_set_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "eafrorig");
+	scratch_path(snap, sizeof(snap), "eafrsnap");
+	scratch_path(snap1, sizeof(snap1), "eafrsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_ea_failed_set_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	err = ea_set(f, "user.a", "abc", 3);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	/* XATTR_CREATE on an existing EA fails with -EEXIST: the
+	 * transaction aborts and no records are written for it. A
+	 * failed set changes nothing, so no second sync is needed. */
+	err = ea_set_flags(f, "user.a", "xyz", 3, XATTR_CREATE);
+	CHECK_EQ(err, -EEXIST);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err != -EEXIST) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14 plus the one successful set's 9
+	 * — the failed set added nothing. */
+	set_ea_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 23);
+
+	/* Replay: only the create's two idempotent records redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	/* The old value is untouched after a remount. */
+	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
+				buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
 static void test_symlink_journaled(void)
 {
 	symlink_journaled_case("test_symlink_journaled", "ln.txt",
@@ -4468,6 +5472,13 @@ int main(void)
 	test_xattr_big_create_journaled();
 	test_xattr_big_replace_remove_journaled();
 	test_xattr_in_root_journaled();
+	test_ea_replace_journaled();
+	test_ea_replace_grow_journaled();
+	test_ea_remove_journaled();
+	test_ea_create_journaled();
+	test_ea_remove_last_journaled();
+	test_ea_in_root_journaled();
+	test_ea_failed_set_unjournaled();
 	test_symlink_journaled();
 	test_symlink_wsl_journaled();
 	test_symlink_dir_journaled();

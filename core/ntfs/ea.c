@@ -18,6 +18,7 @@
 #include "index.h"
 #include "dir.h"
 #include "ea.h"
+#include "../vfs/journal.h"	/* PORT: Phase 3 EA journaling */
 
 static int ntfs_write_ea(struct ntfs_inode *ni, __le32 type, char *value, s64 ea_off,
 		s64 ea_size, bool need_truncate)
@@ -1058,14 +1059,26 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 		size_t size, int flags)
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_journal_ea *et = NULL;
 	int err;
 	__le32 fattr;
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 
-	if (ntfs_is_reserved_lxattr(name) && !ntfs_caller_is_privileged())
-		return -EPERM;
+	/* PORT: Phase 3 EA journaling — the whole handler runs under
+	 * inode_lock (the api.c ntfs_setxattr convention; no caller
+	 * holds it when entering the handler, which only the tests
+	 * drive). The transaction below is begun on the $EA path
+	 * only: the flags path above (system.ntfs_attrib /
+	 * system.ntfs_dos_attrib) changes $SI flags, no $EA, and
+	 * belongs to the setattr class. */
+	inode_lock(inode);
+
+	if (ntfs_is_reserved_lxattr(name) && !ntfs_caller_is_privileged()) {
+		err = -EPERM;
+		goto out;
+	}
 
 	if (!strcmp(name, SYSTEM_DOS_ATTRIB)) {
 		if (sizeof(u8) != size) {
@@ -1114,6 +1127,22 @@ set_fattr:
 		goto out;
 	}
 
+	/* The $EA path. One transaction per set: the hook is here,
+	 * not inside ntfs_set_ea — ntfs_set_ea is also called from
+	 * inside the ambient create/setattr transactions, which
+	 * stage $LX* through their own carriers, and a begin inside
+	 * it would nest the WAL gate and the log_txn_lock. Lock
+	 * order: inode_lock -> log_txn_lock -> mrec_lock, the xattr
+	 * class's order. */
+	if (!(ni->vol->vol_flags & VOLUME_IS_DIRTY))
+		ntfs_set_volume_flags(ni->vol, VOLUME_IS_DIRTY);
+	err = ntfs_journal_ea_begin(ni->vol, ni, &et);
+	if (err) {
+		ntfs_error(ni->vol->sb,
+			   "journal: EA transaction begin failed: %d", err);
+		err = 0;
+		et = NULL;
+	}
 	mutex_lock(&ni->mrec_lock);
 	err = ntfs_set_ea(inode, name, strlen(name), value, size, flags, NULL);
 	mutex_unlock(&ni->mrec_lock);
@@ -1126,6 +1155,34 @@ out:
 		inode_set_ctime_current(inode);
 		mark_inode_dirty(inode);
 	}
+	if (et) {
+		/* Stage the $SI and $EA pair records from the live
+		 * record and commit — or abort when the setxattr
+		 * failed, the stage failed, or nothing was staged.
+		 * The finish maps the record, so it runs under
+		 * mrec_lock, the same order the xattr commit uses.
+		 * A commit failure marks the volume: the next
+		 * mount's replay undoes the partial transaction and
+		 * restores the old pair. */
+		struct mft_record *mrec;
+
+		mutex_lock(&ni->mrec_lock);
+		if (err) {
+			ntfs_journal_ea_abort(et);
+		} else {
+			mrec = map_mft_record(ni);
+			if (IS_ERR(mrec)) {
+				ntfs_journal_ea_abort(et);
+			} else {
+				err = ntfs_journal_ea_finish(et, ni, mrec);
+				unmap_mft_record(ni);
+				if (err)
+					NVolSetErrors(ni->vol);
+			}
+		}
+		mutex_unlock(&ni->mrec_lock);
+	}
+	inode_unlock(inode);
 	return err;
 }
 

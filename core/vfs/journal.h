@@ -380,6 +380,7 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
 struct ntfs_journal_truncate;
 struct ntfs_journal_setattr;
 struct ntfs_journal_xattr;
+struct ntfs_journal_ea;
 
 /* Begin a truncate transaction, or NULL (0) when there is nothing to
  * journal: no writer, not a regular file, $DATA resident, in an
@@ -596,5 +597,95 @@ void ntfs_journal_xattr_abort(struct ntfs_journal_xattr *xt);
 int ntfs_journal_xattr_finish(struct ntfs_journal_xattr *xt,
 			      struct ntfs_inode *ni,
 			      const struct mft_record *mrec);
+
+/* ---- EA (Phase 3, eighth class) -----------------------------------------
+ *
+ * One transaction per VFS xattr-handler set on the $EA path
+ * (ntfs_setxattr in core/ntfs/ea.c — the handler the tests drive
+ * and the path a VFS setxattr takes; the public ntfs_setxattr in
+ * api.c stores xattrs as ADS and is the xattr class). The hook is
+ * in the handler, NOT inside ntfs_set_ea itself: ntfs_set_ea is
+ * also called from inside ambient transactions — the create
+ * transaction stages $LXUID/$LXGID/$LXMOD via
+ * ntfs_journal_create_ea, the setattr transaction via
+ * stage_setattr_ea — and a begin inside it would nest the WAL gate
+ * and the log_txn_lock. The handler's flags path
+ * (system.ntfs_attrib / system.ntfs_dos_attrib, via
+ * ntfs_new_attr_flags) is NOT journaled here: it changes $SI flags
+ * only, no $EA, and belongs to the setattr class's domain.
+ *
+ * ACL: CONFIG_NTFS_FS_POSIX_ACL is not defined in this port — no
+ * ntfs_set_acl / ntfs_init_acl symbols in the archive — so
+ * ntfs_set_acl_ex (which also writes $EA, via ntfs_set_ea) is
+ * compiled out and there is no ACL hook. When §2.2 enables ACLs,
+ * its sets will need the same treatment (they call ntfs_set_ea
+ * directly, not the handler).
+ *
+ * It stages, in order:
+ *
+ *   - an UpdateResidentValue for the $STANDARD_INFORMATION's first
+ *     36 bytes (four times + file_attributes), built from in-memory
+ *     vi/ni state — the handler's success path only bumps ctime,
+ *     and ntfs_set_ea sets/clears the HasEA flag in ni->flags.
+ *     The $SI snapshot is built from in-memory state at begin
+ *     (the setattr form): the mapped record lags behind the log,
+ *     so a mapped-record snapshot would restore the pre-previous
+ *     state on undo. The xattr class snapshots $SI from the mapped
+ *     record instead — a latent one-step-too-far undo on $SI
+ *     ctime/flags when two xattr transactions run without a sync
+ *     between them; a follow-up, not this class.
+ *   - the $EA_INFORMATION + $EA pair, net effect: CreateAttribute
+ *     ×2 ($EA_INFORMATION first) when absent at begin and present
+ *     at stage; DeleteAttribute ×2 ($EA first, the live removal
+ *     order) when present at begin and absent at stage — the last
+ *     entry's removal tears the pair down; one
+ *     UpdateResidentValue, whole value, for each that stayed
+ *     present and changed, any length (the replay's length-change
+ *     path, proven by the xattr class). A half-pair at either end,
+ *     a non-resident $EA or $EA_INFORMATION at either end, or an
+ *     attribute that moved (offset or value offset changed)
+ *     aborts the transaction and the op proceeds unjournaled.
+ *
+ * Lifetime: begin snapshots the $SI bytes (in-memory state) and
+ * whole-record copies of $EA_INFORMATION and $EA plus their
+ * offsets and presence, from the mapped base record, before
+ * raising the WAL gate. Only regular files and directories begin;
+ * an attribute list aborts to unjournaled (begin cannot tell
+ * "absent" from "in an extent"). A file in the volume root is
+ * journalable (only its own record is touched), and so is the root
+ * directory itself — it is the only inode a driver-made volume
+ * guarantees has no $EA pair (ntfs_create writes the three $LX*
+ * entries into every file it makes), so the root is where the
+ * create/teardown cases are tested. A no-op (nothing staged)
+ * aborts instead of committing — no log churn. The commit stamps
+ * MR_LSN into the file's record only. No $FILE_NAME record is
+ * staged: EA sizes are not in the parent's dup, and the live
+ * driver never updates $FILE_NAME times on setattr/xattr.
+ *
+ * Crash contract: before commit → undo (old EA pair, old $SI);
+ * after commit → redo (new pair, new $SI); second replay no-op.
+ * The $EA value is resident, so it redoes whole — all-old or
+ * all-new, never a half-written stream.
+ */
+
+/* Begin an EA transaction, or NULL (0) when there is nothing to
+ * journal: no writer, not a regular file or directory, attribute
+ * list. On error the gate was never raised and the lock was never
+ * taken; the caller proceeds unjournaled. */
+int ntfs_journal_ea_begin(struct ntfs_volume *vol,
+			  struct ntfs_inode *ni,
+			  struct ntfs_journal_ea **out);
+
+/* Abort: write nothing, lower the WAL gate, release the lock. */
+void ntfs_journal_ea_abort(struct ntfs_journal_ea *et);
+
+/* Stage the $SI and $EA pair records after ntfs_set_ea returned,
+ * then commit — or abort when the stage fails or when nothing was
+ * staged. @mrec is the file's mapped record. Returns the commit
+ * error (the caller must set the volume error flag), or 0 when the
+ * transaction was committed or aborted unjournaled. */
+int ntfs_journal_ea_finish(struct ntfs_journal_ea *et,
+			   struct ntfs_inode *ni,
+			   const struct mft_record *mrec);
 
 #endif /* NTFS_JOURNAL_H */

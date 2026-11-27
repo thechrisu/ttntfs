@@ -1059,7 +1059,38 @@ agrees with the link (0 when absent, 1 when present);
 this class: $SI ctime on rename; parent $SI mtime on
 create/unlink/rename (Phase 2 gap); mknod (devices also carry
 reparse data but never begin).
-Next: the EA class.
+Phase 3, EA — glue landed 2026-11-27 (commit, this round): one
+transaction per VFS xattr-handler set on the $EA path
+(`ntfs_setxattr` in core/ntfs/ea.c). The hook is in the handler,
+NOT inside `ntfs_set_ea`: that function is also called from inside
+the ambient create/setattr transactions, which stage $LX* through
+their own carriers, and a begin inside it would nest the WAL gate
+and the `log_txn_lock`. The handler's flags path
+(system.ntfs_attrib / system.ntfs_dos_attrib) is NOT journaled
+here — it changes $SI flags only, no $EA, and belongs to the
+setattr class. ACL is compiled out (`CONFIG_NTFS_FS_POSIX_ACL`
+never defined, no `ntfs_set_acl` symbols in the archive), so there
+is no ACL hook; §2.2 will need one when ACLs are enabled. Begin
+snapshots the $SI 36 bytes from in-memory state (the setattr form,
+not the xattr class's mapped-record snapshot) plus whole-record
+copies of $EA_INFORMATION and $EA; stage logs the pair's net
+effect — CreateAttribute ×2, DeleteAttribute ×2, or one
+whole-value UpdateResidentValue per changed value at any length
+(the xattr-proven length-change path). A half-pair, a non-resident
+$EA, or a moved attribute aborts to unjournaled. The commit stamps
+MR_LSN into the file's record only. Evidence: `test_journal.c`
+1418 checks, 0 failures (was 1177; 7 new tests: replace,
+replace-grow, remove, create on root, teardown on root, in-root,
+failed-set negative control; walk counts + op sequence, $EA stream
+redo/undo whole values, $EA_INFORMATION ea_query_length agreeing
+with the stream lengths, replay redoes only the idempotent
+records; values correct after replay + mount; `ntfsck` clean).
+Crash tests in the follow-up commit. Follow-ups, not this class:
+the xattr class's $SI snapshot comes from the mapped record, a
+latent one-step-too-far undo on $SI ctime/flags when two xattr
+transactions run without a sync between them; the handler's flags
+path is still unjournaled.
+Next: the reparse class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
