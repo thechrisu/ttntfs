@@ -14,6 +14,7 @@ tools/
   mkfixtures/          generates tools/images/*.img + *.manifest.json with libntfs-3g
   ntfscli/             CLI harness over ntfscore.h (probe/ls/cat/cp-in/mkdir/mv/rm/xattr/verify/bench)
   ntfscli-shim.sh      fake ntfscli answered by ntfs-3g; self-test of run-tests.sh
+  perf-bench.sh        repeatable perf baseline (bench + randread + host ceiling); see docs/PERF-BASELINE.md
   run-tests.sh         the differential test runner (verify / ground-truth / write)
   .local/              build products of build-ntfsprogs.sh          (ignored, never committed)
   images/              generated fixtures                             (ignored, never committed)

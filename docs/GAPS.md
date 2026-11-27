@@ -1406,7 +1406,12 @@ alignment, fewer syncs per write). Same rule as §3.1: measured
 numbers in the commit message, not assertions — and the same safety
 constraint: random-write work touches the write path, so §1.3 gates
 it and every change needs torn-write / power-loss evidence, not
-just a faster number.
+just a faster number. Baseline (Linux core, 2026-11-27):
+`docs/PERF-BASELINE.md` — the repeatable harness is
+`tools/perf-bench.sh`; the headline finding is the fsync split
+(random-write pass: 1.2 ms writing, 95.1 ms fsync when quiet), and
+cold reads are not measurable on the shared VM. The macOS gap table
+in that doc stands until a macOS re-measurement runs.
 
 ## 4. macOS integration
 
