@@ -37,6 +37,15 @@
  *                        Checked directly against the on-disk bitmap, not via
  *                        ntfsck, so the failure mode is named rather than
  *                        inferred.
+ *   journaled_create_cut_points
+ *                        the same cut-point sweep, but through a create the
+ *                        journal covers (a file in a driver-made
+ *                        subdirectory; a root create is unjournaled by
+ *                        design). The crash leaves the log dirty, so replay
+ *                        runs first and the same verdicts apply afterwards.
+ *                        The raw pre-replay state is recorded too: some cut
+ *                        points must be inconsistent before replay and none
+ *                        after, or the journal proved nothing.
  *
  * Every crashed image is also re-mounted, because an image ntfsck likes but
  * the driver cannot open is no better than a corrupt one.
@@ -900,12 +909,14 @@ struct aftermath {
 	u64 size, alloc;
 };
 
-static struct aftermath remount(const char *path, const char *name)
+/* @parent NULL looks @name up under the root; otherwise under @parent. */
+static struct aftermath remount(const char *path, const char *parent,
+				const char *name)
 {
 	struct aftermath a = { 0 };
 	struct ntfs_bdev *dev;
 	ntfs_volume_t *vol;
-	ntfs_inode_t *root, *f;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
 
 	dev = ntfs_bdev_open_path(path, true);
 	if (!dev)
@@ -916,7 +927,10 @@ static struct aftermath remount(const char *path, const char *name)
 	}
 	a.mounts = true;
 	if (name && ntfs_volume_root(vol, &root) == 0) {
-		if (ntfs_lookup(root, name, &f) == 0) {
+		d = root;
+		if (parent && ntfs_lookup(root, parent, &d) != 0)
+			d = NULL;
+		if (d && ntfs_lookup(d, name, &f) == 0) {
 			struct ntfs_attr at;
 
 			if (ntfs_getattr(f, &at) == 0) {
@@ -926,7 +940,10 @@ static struct aftermath remount(const char *path, const char *name)
 			}
 			ntfs_inode_put(f);
 		}
-		ntfs_inode_put(root);
+		if (d && d != root)
+			ntfs_inode_put(d);
+		if (root)
+			ntfs_inode_put(root);
 	}
 	ntfs_unmount(vol);
 	ntfs_bdev_close(dev);
@@ -1017,7 +1034,7 @@ static void test_cut_points(void)
 				cov = allocation_covered(&g, &bad_ino, &bad_lcn);
 				geometry_close(&g);
 			}
-			a = remount(work, watch);
+			a = remount(work, NULL, watch);
 
 			printf("  %-10s %7ld %4ld %-9s %-8s %s%s\n",
 			       ops[oi].name, total, cut, verdict_name[v],
@@ -1169,7 +1186,7 @@ static void test_data_before_metadata(void)
 			geometry_close(&g);
 		}
 
-		a = remount(work, "new.bin");
+		a = remount(work, NULL, "new.bin");
 		checks++;
 		if (!a.mounts) {
 			failures++;
@@ -1198,6 +1215,337 @@ static void test_data_before_metadata(void)
 	printf("test_data_before_metadata\n");
 }
 
+/* ---- 4. the journaled create, cut at every phase ----------------------- */
+
+/*
+ * Phase 2 step 3 (docs/JOURNAL-DESIGN.md §5): the same cut-point sweep as
+ * test_cut_points, but through the one operation class the journal covers
+ * — a regular-file create in a driver-made subdirectory (a create in the
+ * volume root is unjournaled by design: its entry lands in the root's
+ * $INDEX_ALLOCATION block, which Phase 2 cannot describe).
+ *
+ * The crash leaves the log dirty, so replay runs before anything else is
+ * asked of the image — that is the next mount's job, per the per-volume
+ * instruction rule, and it is what this test drives explicitly through
+ * ntfs_logfile_replay_device(). The raw pre-replay state is recorded
+ * first, because a sweep in which no cut point is inconsistent before
+ * replay would prove nothing about the journal: the ordering alone might
+ * have saved every one. The assertions after replay are the crash
+ * contract for a journaled create:
+ *
+ *   - replay succeeds and needs no chkdsk at every cut point;
+ *   - the file is either fully present or fully absent — never an index
+ *     entry without a record, a record without its bitmap bits, or a
+ *     size past what is allocated;
+ *   - ntfsck -n is clean and no record references unallocated clusters;
+ *   - a second replay is a no-op: the first one marked the log clean.
+ *
+ * The crash window starts at the operation, not at the mount: the mount's
+ * own writes (log format, dirty flag) are not part of the create's cut
+ * points, so crash_run_journaled() opens the device unlimited and arms
+ * the limit only once the volume is mounted.
+ */
+
+/* A volume with one driver-made subdirectory "d", clean on disk. */
+static int make_base_with_dir(const char *path)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root, *d;
+	int err;
+
+	if (make_image(path) != 0)
+		return -EIO;
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) { ntfs_bdev_close(dev); return err; }
+	err = ntfs_volume_root(vol, &root);
+	if (!err) {
+		err = ntfs_mkdir(root, "d", 0100755, &d);
+		if (!err)
+			ntfs_inode_put(d);
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* Create "d/j.txt" with the device dying after @limit writes, counting
+ * only from the moment the volume is mounted. Returns the number of
+ * writes the operation, sync and unmount attempted. */
+static long crash_run_journaled(const char *path, long limit)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_create(d, "j.txt", 0100644, &f) == 0)
+				ntfs_inode_put(f);
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+static int replay_image(const char *path, struct ntfs_logfile_analysis *out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_logfile_replay_device(dev, out);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+static void test_journaled_create_cut_points(void)
+{
+	char base[1024], work[1024];
+	struct geometry g;
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_present = 0, n_absent = 0;
+
+	scratch_path(base, sizeof(base), "jc-base");
+	scratch_path(work, sizeof(work), "jc-work");
+	if (make_base_with_dir(base) != 0) {
+		fprintf(stderr, "SKIP test_journaled_create_cut_points: "
+				"mkntfs unavailable\n");
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_create_cut_points: "
+				"ntfsck unavailable at '%s'\n", ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_journaled(work, LONG_MAX);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-uncrashed.img", tmpdir);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled create made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  j.txt\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- ------\n");
+
+	step = total / 16;
+	if (step < 1)
+		step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct aftermath a;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		bool pre_bad, post_bad;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_journaled(work, cut);
+
+		/* Debug aid (cf. NTFS_CRASH_TRACE): keep the crashed image for
+		 * one cut point so the log and the records can be inspected
+		 * with ntfslog/ntfsinfo instead of re-running the sweep. */
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-cut-%ld.img",
+					 tmpdir, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-replayed-%ld.img",
+					 tmpdir, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = remount(work, "d", "j.txt");
+		if (a.file_present)
+			n_present++;
+		else
+			n_absent++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.file_present ? "present" : "absent");
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+				cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+				cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+				cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+				cut, (unsigned long long)bad_ino,
+				(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: the "
+					"volume no longer mounts after replay\n",
+				cut);
+		}
+		checks++;
+		if (a.file_present && a.size > a.alloc) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: j.txt "
+					"has size %llu but only %llu bytes "
+					"allocated after replay\n",
+				cut, (unsigned long long)a.size,
+				(unsigned long long)a.alloc);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled create cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+				cut, err_rep2, an2.records_redone,
+				an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- ------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; j.txt present %d times, absent %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_present, n_absent);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_create_cut_points\n");
+}
+
 int main(void)
 {
 	tool_paths();
@@ -1205,6 +1553,7 @@ int main(void)
 	test_ordering_invariant();
 	test_data_before_metadata();
 	test_cut_points();
+	test_journaled_create_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

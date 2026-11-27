@@ -556,7 +556,20 @@ the better copy; chkdsk owns it) and a mirror write failure is
 counted, not returned (the volume is consistent, only its backup
 is stale). The crash sweep is now fully green: 379 checks, 0
 failures — 19 cut points, 2 inconsistent before replay, 0 still bad
-after it. Step 3 lands with the crash test itself, next.
+after it. Step 3 landed 2026-11-27 (commit, this round): the crash test
+itself — `test_journaled_create_cut_points` in
+`core/tests/test_crash.c`, 379 checks, 0 failures. It sweeps 19
+sampled cut points through one journaled create (`d/j.txt`): per
+cut pre-replay `ntfsck` + allocation coverage, replay via
+`ntfs_logfile_replay_device()`, post-replay `ntfsck` + coverage +
+remount lookup of the file + second replay no-op. The sweep is
+green end to end: 2 cuts inconsistent before replay, 0 still bad
+after it; `j.txt` present 11 times, absent 8 times. The four bugs
+it found are fixed in the four commits above (open records,
+`$MFT` size extension + the short-form `compressed_size` overlap,
+phantom active from table dumps, `$MFTMirr` heal). Phase 2 step 3
+is complete; a journaled create is 16 records (2 open + 9 data +
+Commit + 3 dumps + Forget).
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
