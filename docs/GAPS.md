@@ -735,8 +735,8 @@ across the three journaled tests, including an ntfsck exit 4
 on the rename-over replay — the target's freed record bit
 resurrected by the create's SetBits redo, the same failure mode
 the unlink's free-in-transaction fix closed.
-Crash tests (`core/tests/test_crash.c`, this round, land as
-their own commit next): `test_journaled_rename_cut_points`
+Crash tests (`core/tests/test_crash.c`, this round, landed as
+their own commit): `test_journaled_rename_cut_points`
 (same-directory rename, 42 cut points sampled at every write —
 the 21-sample sweep missed the torn window entirely, 0
 pre-bad; 3 inconsistent before replay, 0 still bad after it;
