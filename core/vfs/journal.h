@@ -364,6 +364,7 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
 
 struct ntfs_journal_truncate;
 struct ntfs_journal_setattr;
+struct ntfs_journal_xattr;
 
 /* Begin a truncate transaction, or NULL (0) when there is nothing to
  * journal: no writer, not a regular file, $DATA resident, in an
@@ -514,5 +515,71 @@ void ntfs_journal_setattr_mark_truncate_unjournaled(
 int ntfs_journal_setattr_finish(struct ntfs_journal_setattr *st,
 				struct ntfs_inode *ni,
 				const struct mft_record *mrec);
+
+/* ---- Xattr (Phase 3, sixth class) ---------------------------------------
+ *
+ * One transaction per ntfs_setxattr / ntfs_removexattr call (the ADS
+ * named-$DATA path in core/vfs/api.c — the path FSKit calls; the $EA
+ * path in core/ntfs/ea.c is the separate EA class). Begun in api.c
+ * after inode_lock(vi) and before the mutation, staged + committed
+ * after the op returns (ntfs_journal_xattr_finish), or aborted on
+ * any error. It stages, in order:
+ *
+ *   - an UpdateResidentValue for the $STANDARD_INFORMATION's first
+ *     36 bytes (four times + file_attributes), built from in-memory
+ *     vi/ni state — the setxattr success path only bumps ctime;
+ *   - the ADS itself, net effect: CreateAttribute when it was
+ *     absent at begin and present at stage (plus SetBits for the
+ *     clusters a non-resident create allocated); DeleteAttribute
+ *     when it was present at begin and absent at stage (plus
+ *     ClearBits for the freed clusters); one UpdateResidentValue,
+ *     whole value, when it stayed resident (any length — the
+ *     replay's length-change path, left unproven by the setattr
+ *     class, is what this proves); DeleteAttribute + CreateAttribute
+ *     plus the bitmap delta when it flipped resident/non-resident
+ *     either way; sizes + mapping pairs + bitmap delta when it
+ *     stayed non-resident (the truncate machinery, named).
+ *
+ * The value bytes of a non-resident ADS live in clusters — data,
+ * never journaled; only the sizes, pairs and bitmap are. A crash
+ * after the commit but before the pagecache flush leaves the ADS
+ * with new sizes and stale value bytes: the same as a regular file
+ * write crash, metadata consistent and ntfsck clean. A resident
+ * value IS the record bytes, so it is journaled whole and comes
+ * back all-old or all-new.
+ *
+ * Lifetime: begin snapshots the $SI bytes and the ADS (a copy of the
+ * whole attribute record plus its decoded runlist when non-resident)
+ * as they stand. Only regular files and directories begin; an
+ * attribute list, a compressed/encrypted ADS, a moved ADS, or
+ * undecodable pairs aborts the transaction and the op proceeds
+ * unjournaled. A no-op (nothing staged) aborts instead of
+ * committing — no log churn. The commit stamps MR_LSN into the
+ * file's record only. No $FILE_NAME record is staged: ADS sizes are
+ * not in the parent's dup, and the live driver never updates
+ * $FILE_NAME times on setattr/xattr.
+ */
+
+/* Begin an xattr transaction, or NULL (0) when there is nothing to
+ * journal: no writer, not a regular file or directory, attribute
+ * list. @uname/@ulen name the ADS (UTF-16, as xattr_uname builds
+ * it). On error the gate was never raised and the lock was never
+ * taken; the caller proceeds unjournaled. */
+int ntfs_journal_xattr_begin(struct ntfs_volume *vol,
+			     struct ntfs_inode *ni,
+			     const __le16 *uname, u8 ulen,
+			     struct ntfs_journal_xattr **out);
+
+/* Abort: write nothing, lower the WAL gate, release the lock. */
+void ntfs_journal_xattr_abort(struct ntfs_journal_xattr *xt);
+
+/* Stage the $SI and ADS records after the setxattr/removexattr
+ * returned, then commit — or abort when the stage fails or when
+ * nothing was staged. @mrec is the file's mapped record. Returns
+ * the commit error (the caller must set the volume error flag), or
+ * 0 when the transaction was committed or aborted unjournaled. */
+int ntfs_journal_xattr_finish(struct ntfs_journal_xattr *xt,
+			      struct ntfs_inode *ni,
+			      const struct mft_record *mrec);
 
 #endif /* NTFS_JOURNAL_H */

@@ -44,6 +44,7 @@
 #include "mft.h"
 #include "time.h"
 #include "journal.h"
+#include "../ntfs/runlist.h"
 #include "../logfile/ntfs_logfile.h"
 #include "../logfile/logfile_layout.h"
 
@@ -180,9 +181,12 @@ static const struct attr_record *find_attr(const struct mft_record *m,
  * mapping pairs) into @snap. The caller maps record 0; this only reads
  * it. The compressed size lives at offset 0x40 and is present only
  * when the attribute is at least 0x48 long (AT_NONRESIDENT_EX_SIZE);
- * shorter attributes carry 0 there.
+ * shorter attributes carry 0 there. @name/@name_len select a named
+ * attribute (the xattr class's ADS); NULL/0 selects the unnamed one
+ * (the truncate class's $DATA).
  */
 static int snapshot_mft_attr(const struct mft_record *m0, __le32 type,
+			     const __le16 *name, u8 name_len,
 			     struct mft_attr_snapshot *snap)
 {
 	const struct attr_record *a;
@@ -190,7 +194,7 @@ static int snapshot_mft_attr(const struct mft_record *m0, __le32 type,
 	u32 len;
 	u16 pairs_off;
 
-	a = find_attr(m0, type, NULL, 0, &off);
+	a = find_attr(m0, type, name, name_len, &off);
 	if (!a || !a->non_resident)
 		return -ENOENT;
 	len = le32_to_cpu(a->length);
@@ -271,9 +275,9 @@ int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 		if (IS_ERR(m0))
 			err = PTR_ERR(m0);
 		else {
-			err = snapshot_mft_attr(m0, AT_DATA, &jt->snap_data);
+			err = snapshot_mft_attr(m0, AT_DATA, NULL, 0, &jt->snap_data);
 			if (!err)
-				err = snapshot_mft_attr(m0, AT_BITMAP,
+				err = snapshot_mft_attr(m0, AT_BITMAP, NULL, 0,
 							&jt->snap_bmp);
 			unmap_mft_record(NTFS_I(vol->mft_ino));
 		}
@@ -1337,7 +1341,7 @@ static int truncate_snapshot(struct ntfs_volume *vol,
 	m = map_mft_record(ni);
 	if (IS_ERR(m))
 		return PTR_ERR(m);
-	err = snapshot_mft_attr(m, AT_DATA, &t->snap);
+	err = snapshot_mft_attr(m, AT_DATA, NULL, 0, &t->snap);
 	if (!err) {
 		/* Snapshot the $STANDARD_INFORMATION flags too: a
 		 * resize that flips the file sparse changes them, and
@@ -1637,12 +1641,15 @@ static int lcn_ranges_sub(const struct runlist_element *a,
  * (set = false) records, split at bitmap-page boundaries: one
  * record addresses one page, and a range crossing into the next
  * page would stage bits the replay applies to the wrong page.
- * A bitmap page holds cluster_size * 8 bits.
+ * A bitmap page holds cluster_size * 8 bits. The txn-taking form
+ * is shared by the truncate class and the xattr class (which
+ * stages the clusters a named $DATA stream allocates or frees).
  */
-static int stage_bitmap_range(struct ntfs_journal_truncate *t,
-			      u64 bit, u64 nbits, bool set)
+static int stage_bitmap_range_txn(struct ntfs_volume *vol,
+				  ntfs_log_txn_t *txn,
+				  u64 bit, u64 nbits, bool set)
 {
-	u64 page_bits = (u64)t->vol->cluster_size * 8;
+	u64 page_bits = (u64)vol->cluster_size * 8;
 	int err = 0;
 
 	while (nbits && !err) {
@@ -1653,18 +1660,24 @@ static int stage_bitmap_range(struct ntfs_journal_truncate *t,
 
 		if (chunk > nbits)
 			chunk = nbits;
-		err = cluster_bitmap_coords(t->vol, bit,
-					 &vcn, &cluster_off, &page_lcn);
+		err = cluster_bitmap_coords(vol, bit,
+					    &vcn, &cluster_off, &page_lcn);
 		if (err)
 			break;
-		err = ntfs_log_txn_set_bitmap(t->t,
-					      t->vol->log_lcn_bitmap_attr,
+		err = ntfs_log_txn_set_bitmap(txn,
+					      vol->log_lcn_bitmap_attr,
 					      vcn, cluster_off, page_lcn,
 					      (u32)bit, (u32)chunk, set);
 		bit += chunk;
 		nbits -= chunk;
 	}
 	return err;
+}
+
+static int stage_bitmap_range(struct ntfs_journal_truncate *t,
+			      u64 bit, u64 nbits, bool set)
+{
+	return stage_bitmap_range_txn(t->vol, t->t, bit, nbits, set);
 }
 
 /*
@@ -2285,33 +2298,45 @@ void ntfs_journal_setattr_mark_truncate_unjournaled(
 }
 
 /*
- * Stage the $STANDARD_INFORMATION record: the 36 bytes built from
- * current in-memory state against the begin snapshot. The $SI must
+ * Stage one $STANDARD_INFORMATION record: the 36 bytes built from
+ * current in-memory state against a begin snapshot. The $SI must
  * still sit where begin found it; anything else aborts. Stages
- * only on change.
+ * only on change. Shared by the setattr class (which stages its
+ * own snapshot) and the xattr class.
  */
-static int stage_setattr_si(struct ntfs_journal_setattr *st,
-			    struct ntfs_inode *ni,
-			    const struct mft_record *mrec,
-			    u64 vcn, u16 cluster_off, u64 page_lcn)
+static int stage_si_36(struct ntfs_volume *vol, ntfs_log_txn_t *t,
+		       const u8 si_old[36], u16 si_attr_off,
+		       u16 si_value_off, struct ntfs_inode *ni,
+		       const struct mft_record *mrec,
+		       u64 vcn, u16 cluster_off, u64 page_lcn)
 {
 	u8 si_new[36];
 	const struct attr_record *si;
 	u16 si_off = 0;
 
 	si_build(VFS_I(ni), ni, si_new);
-	if (!memcmp(si_new, st->si_old, sizeof(si_new)))
+	if (!memcmp(si_new, si_old, sizeof(si_new)))
 		return 0;
 	si = find_attr(mrec, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
-	if (!si || si->non_resident || si_off != st->si_attr_off ||
+	if (!si || si->non_resident || si_off != si_attr_off ||
 	    le16_to_cpu(si->data.resident.value_offset) !=
-		    st->si_value_off)
+		    si_value_off)
 		return -ENOENT;
 	return ntfs_log_txn_update_resident(
-		st->t, st->vol->log_mft_data_attr,
+		t, vol->log_mft_data_attr,
 		vcn, cluster_off, page_lcn,
-		si_off, st->si_value_off,
-		si_new, sizeof(si_new), st->si_old, sizeof(st->si_old));
+		si_off, si_value_off,
+		si_new, sizeof(si_new), si_old, 36);
+}
+
+static int stage_setattr_si(struct ntfs_journal_setattr *st,
+			    struct ntfs_inode *ni,
+			    const struct mft_record *mrec,
+			    u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	return stage_si_36(st->vol, st->t, st->si_old, st->si_attr_off,
+			   st->si_value_off, ni, mrec,
+			   vcn, cluster_off, page_lcn);
 }
 
 /*
@@ -2555,5 +2580,486 @@ int ntfs_journal_setattr_finish(struct ntfs_journal_setattr *st,
 
 out_abort:
 	ntfs_journal_setattr_abort(st);
+	return 0;
+}
+
+/* ---- Xattr (Phase 3, sixth class) --------------------------------------
+ *
+ * One transaction per ntfs_setxattr / ntfs_removexattr call. The
+ * carrier snapshots, at begin, the $SI 36 bytes and the ADS: a copy
+ * of the whole attribute record plus its decoded runlist when
+ * non-resident. At stage it compares the live record against that
+ * snapshot and logs the net effect. The resident value is staged
+ * whole, any length — this is the class that proves the replay's
+ * UpdateResidentValue length-change path (the setattr class
+ * refused length changes on $EA for exactly this reason).
+ *
+ * The stage runs under the file's mrec_lock (api.c holds it around
+ * the finish call), so the record cannot move under it. The commit
+ * stamps MR_LSN into the file's record only.
+ */
+
+struct ntfs_journal_xattr {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+	u8 si_old[36];
+	u16 si_attr_off;
+	u16 si_value_off;
+	__le16 *uname;		/* kmalloc'd copy of the ADS name */
+	u8 ulen;
+	bool ads_present;
+	u16 ads_attr_off;
+	u8 *ads_old;		/* kmalloc'd copy of the attribute record */
+	u32 ads_old_len;
+	struct mft_attr_snapshot ads_snap;
+	struct runlist_element *old_rl;
+	size_t old_count;
+};
+
+static void xattr_free_snapshot(struct ntfs_journal_xattr *xt)
+{
+	kfree(xt->ads_snap.pairs);
+	xt->ads_snap.pairs = NULL;
+	kvfree(xt->old_rl);
+	xt->old_rl = NULL;
+	kfree(xt->ads_old);
+	xt->ads_old = NULL;
+	kfree(xt->uname);
+	xt->uname = NULL;
+}
+
+int ntfs_journal_xattr_begin(struct ntfs_volume *vol,
+			     struct ntfs_inode *ni,
+			     const __le16 *uname, u8 ulen,
+			     struct ntfs_journal_xattr **out)
+{
+	struct ntfs_journal_xattr *xt;
+	const struct mft_record *m;
+	const struct attr_record *si, *a;
+	u16 si_off = 0, ads_off = 0;
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer || !(S_ISREG(VFS_I(ni)->i_mode) ||
+				  S_ISDIR(VFS_I(ni)->i_mode)))
+		return 0;
+	/* An attribute list means the ADS may live in an extent, not
+	 * in the base record — begin cannot tell "absent" from "in an
+	 * extent", so this op proceeds unjournaled. */
+	if (ni->attr_list)
+		return 0;
+	xt = kzalloc(sizeof(*xt), GFP_KERNEL);
+	if (!xt)
+		return -ENOMEM;
+	xt->vol = vol;
+	xt->ulen = ulen;
+	xt->uname = kmemdup(uname, sizeof(__le16) * ulen, GFP_KERNEL);
+	if (!xt->uname) {
+		err = -ENOMEM;
+		goto out_free;
+	}
+	/* Snapshot $SI and the ADS from the mapped base record, before
+	 * raising the WAL gate — the setattr class's order. */
+	m = map_mft_record(ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+		goto out_free;
+	}
+	si = find_attr(m, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+	if (!si || si->non_resident ||
+	    le16_to_cpu(si->data.resident.value_offset) + 36 >
+		    le32_to_cpu(si->length)) {
+		err = -ENOENT;
+		goto out_unmap;
+	}
+	xt->si_attr_off = si_off;
+	xt->si_value_off =
+		le16_to_cpu(si->data.resident.value_offset);
+	memcpy(xt->si_old,
+	       (const u8 *)si + xt->si_value_off, sizeof(xt->si_old));
+	a = find_attr(m, AT_DATA, uname, ulen, &ads_off);
+	if (a) {
+		u32 alen = le32_to_cpu(a->length);
+
+		xt->ads_present = true;
+		xt->ads_attr_off = ads_off;
+		xt->ads_old = kmemdup(a, alen, GFP_KERNEL);
+		if (!xt->ads_old) {
+			err = -ENOMEM;
+			goto out_unmap;
+		}
+		xt->ads_old_len = alen;
+		if (a->non_resident) {
+			err = snapshot_mft_attr(m, AT_DATA, uname, ulen,
+						&xt->ads_snap);
+			if (err)
+				goto out_unmap;
+			xt->old_rl = ntfs_mapping_pairs_decompress(
+				vol, a, NULL, &xt->old_count);
+			if (IS_ERR(xt->old_rl)) {
+				err = PTR_ERR(xt->old_rl);
+				xt->old_rl = NULL;
+				goto out_unmap;
+			}
+		}
+	}
+	unmap_mft_record(ni);
+	/* Raise the WAL gate and start the transaction. The lock
+	 * serializes whole transactions; the gate holds the file's
+	 * record (and $Bitmap) off the disk until the commit. */
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &xt->t);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "journal: xattr transaction begin failed: %d",
+			   err);
+		mutex_unlock(&vol->log_txn_lock);
+		goto out_free;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = xt;
+	return 0;
+
+out_unmap:
+	unmap_mft_record(ni);
+out_free:
+	xattr_free_snapshot(xt);
+	kfree(xt);
+	return err;
+}
+
+void ntfs_journal_xattr_abort(struct ntfs_journal_xattr *xt)
+{
+	if (!xt)
+		return;
+	(void)ntfs_log_txn_abort(xt->t);
+	atomic_dec(&xt->vol->log_txn_open);
+	mutex_unlock(&xt->vol->log_txn_lock);
+	xattr_free_snapshot(xt);
+	kfree(xt);
+}
+
+static int ntfs_journal_xattr_commit(struct ntfs_journal_xattr *xt,
+				     struct ntfs_inode *ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!xt)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(xt->t, NULL, &last_lsn);
+	if (!err) {
+		/* Stamp MR_LSN into the file's record before the
+		 * metadata flush, as in the other commits. The
+		 * finish never commits an empty transaction, so
+		 * last_lsn is a real LSN here, never 0. */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&xt->vol->log_txn_open);
+	mutex_unlock(&xt->vol->log_txn_lock);
+	xattr_free_snapshot(xt);
+	kfree(xt);
+	return err;
+}
+
+/*
+ * Stage the ADS net effect. @a is the live ADS at stage (NULL when
+ * absent), @ads_off its offset. The old state comes from the begin
+ * snapshot. Returns 0 or -ENOENT (stage refuses to guess) / -EIO.
+ * A compressed or encrypted ADS at either end aborts: the $EA
+ * class owns those, and a compressed ADS's value bytes are not
+ * what the record shows.
+ */
+static int stage_xattr_ads(struct ntfs_journal_xattr *xt,
+			   struct ntfs_inode *ni,
+			   const struct mft_record *mrec,
+			   const struct attr_record *a, u16 ads_off,
+			   u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	struct ntfs_volume *vol = xt->vol;
+	ntfs_log_txn_t *t = xt->t;
+	int err;
+
+	if (!xt->ads_present && !a)
+		return -ENOENT;
+	if (a && (a->flags & (ATTR_IS_COMPRESSED | ATTR_IS_ENCRYPTED)))
+		return -ENOENT;
+	if (xt->ads_present) {
+		const struct attr_record *old =
+			(const struct attr_record *)xt->ads_old;
+
+		if (old->flags & (ATTR_IS_COMPRESSED | ATTR_IS_ENCRYPTED))
+			return -ENOENT;
+	}
+	if (!xt->ads_present) {
+		/* Create: stage the final attribute bytes, plus the
+		 * clusters a non-resident create allocated. */
+		err = stage_create_attr(t, vol, ni, mrec, AT_DATA,
+					xt->uname, xt->ulen, false);
+		if (err)
+			return err;
+		if (a->non_resident) {
+			struct runlist_element *new_rl;
+			size_t new_count = 0, i;
+
+			new_rl = ntfs_mapping_pairs_decompress(
+				vol, a, NULL, &new_count);
+			if (IS_ERR(new_rl))
+				return PTR_ERR(new_rl);
+			for (i = 0; new_rl[i].length; i++) {
+				if (new_rl[i].lcn < 0)
+					continue;
+				err = stage_bitmap_range_txn(
+					vol, t, (u64)new_rl[i].lcn,
+					new_rl[i].length, true);
+				if (err)
+					break;
+			}
+			kvfree(new_rl);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+	if (!a) {
+		/* Remove: delete the begin-time attribute bytes, plus
+		 * the clusters it held. */
+		size_t i;
+
+		err = ntfs_log_txn_delete_attr(
+			t, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			xt->ads_attr_off, xt->ads_old, xt->ads_old_len);
+		if (err)
+			return err;
+		if (!xt->old_rl)
+			return 0;
+
+		for (i = 0; xt->old_rl[i].length; i++) {
+			if (xt->old_rl[i].lcn < 0)
+				continue;
+			err = stage_bitmap_range_txn(
+				vol, t, (u64)xt->old_rl[i].lcn,
+				xt->old_rl[i].length, false);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+	/* Present both times. */
+	if (!((const struct attr_record *)xt->ads_old)->non_resident &&
+	    !a->non_resident) {
+		/* Resident -> resident: one UpdateResidentValue for
+		 * the whole value, any length. The attribute must
+		 * still sit where begin found it; a move aborts. */
+		const struct attr_record *old =
+			(const struct attr_record *)xt->ads_old;
+		u16 old_voff =
+			le16_to_cpu(old->data.resident.value_offset);
+		u16 new_voff =
+			le16_to_cpu(a->data.resident.value_offset);
+		u16 old_vlen =
+			le16_to_cpu(old->data.resident.value_length);
+		u16 new_vlen =
+			le16_to_cpu(a->data.resident.value_length);
+
+		if (ads_off != xt->ads_attr_off || new_voff != old_voff)
+			return -ENOENT;
+		return ntfs_log_txn_update_resident(
+			t, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			ads_off, new_voff,
+			(const u8 *)a + new_voff, new_vlen,
+			(const u8 *)old + old_voff, old_vlen);
+	}
+	if (!((const struct attr_record *)xt->ads_old)->non_resident ||
+	    !a->non_resident) {
+		/* Flipped resident/non-resident either way: delete
+		 * the old attribute and create the new one, plus the
+		 * bitmap delta (set for a new non-resident, clear
+		 * for a freed one). */
+		const struct attr_record *old =
+			(const struct attr_record *)xt->ads_old;
+		size_t i;
+
+		err = ntfs_log_txn_delete_attr(
+			t, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			xt->ads_attr_off, xt->ads_old, xt->ads_old_len);
+		if (err)
+			return err;
+		err = stage_create_attr(t, vol, ni, mrec, AT_DATA,
+					xt->uname, xt->ulen, false);
+		if (err)
+			return err;
+		if (old->non_resident) {
+			for (i = 0; xt->old_rl[i].length; i++) {
+				if (xt->old_rl[i].lcn < 0)
+					continue;
+				err = stage_bitmap_range_txn(
+					vol, t, (u64)xt->old_rl[i].lcn,
+					xt->old_rl[i].length, false);
+				if (err)
+					return err;
+			}
+		} else {
+			struct runlist_element *new_rl;
+			size_t new_count = 0;
+
+			new_rl = ntfs_mapping_pairs_decompress(
+				vol, a, NULL, &new_count);
+			if (IS_ERR(new_rl))
+				return PTR_ERR(new_rl);
+			for (i = 0; new_rl[i].length; i++) {
+				if (new_rl[i].lcn < 0)
+					continue;
+				err = stage_bitmap_range_txn(
+					vol, t, (u64)new_rl[i].lcn,
+					new_rl[i].length, true);
+				if (err)
+					break;
+			}
+			kvfree(new_rl);
+			if (err)
+				return err;
+		}
+		return 0;
+	}
+	/* Non-resident -> non-resident: sizes + mapping pairs +
+	 * bitmap delta, the truncate machinery, named. */
+	{
+		struct mft_attr_snapshot new_snap;
+		struct runlist_element *new_rl = NULL;
+		struct lcn_range *freed = NULL, *allocd = NULL;
+		size_t new_count = 0, i;
+
+		if (ads_off != xt->ads_attr_off)
+			return -ENOENT;
+		err = snapshot_mft_attr(mrec, AT_DATA, xt->uname,
+					xt->ulen, &new_snap);
+		if (err) {
+			return err;
+		}
+		new_rl = ntfs_mapping_pairs_decompress(vol, a, NULL,
+						       &new_count);
+		if (IS_ERR(new_rl)) {
+			err = PTR_ERR(new_rl);
+			new_rl = NULL;
+			goto out_free;
+		}
+		if (new_snap.alloc != xt->ads_snap.alloc ||
+		    new_snap.valid != xt->ads_snap.valid ||
+		    new_snap.data != xt->ads_snap.data ||
+		    new_snap.total != xt->ads_snap.total) {
+			err = ntfs_log_txn_set_attr_sizes(
+				t, vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ads_off, new_snap.alloc, new_snap.valid,
+				new_snap.data, new_snap.total,
+				xt->ads_snap.alloc, xt->ads_snap.valid,
+				xt->ads_snap.data, xt->ads_snap.total);
+			if (err) {
+				goto out_free;
+			}
+		}
+		if (new_snap.pairs_len != xt->ads_snap.pairs_len ||
+		    memcmp(new_snap.pairs, xt->ads_snap.pairs,
+			   new_snap.pairs_len)) {
+			err = ntfs_log_txn_update_resident(
+				t, vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ads_off, new_snap.pairs_off,
+				new_snap.pairs, new_snap.pairs_len,
+				xt->ads_snap.pairs, xt->ads_snap.pairs_len);
+			if (err) {
+				goto out_free;
+			}
+		}
+		freed = kmalloc_array(xt->old_count + new_count,
+				      sizeof(*freed), GFP_KERNEL);
+		allocd = kmalloc_array(xt->old_count + new_count,
+				       sizeof(*allocd), GFP_KERNEL);
+		if (!freed || !allocd) {
+			err = -ENOMEM;
+			goto out_free;
+		}
+		/* lcn_ranges_sub returns the range COUNT (>= 0) or
+		 * -ENOSPC: a positive count is success, not an error
+		 * (the truncate class stages the same way). */
+		{
+			int n_freed, n_allocd;
+
+			n_freed = lcn_ranges_sub(xt->old_rl, new_rl, freed,
+						 xt->old_count + new_count);
+			n_allocd = lcn_ranges_sub(new_rl, xt->old_rl, allocd,
+						  xt->old_count + new_count);
+			if (n_freed < 0 || n_allocd < 0) {
+				err = -ENOSPC;
+				goto out_free;
+			}
+			for (i = 0; i < (size_t)n_freed && !err; i++)
+				err = stage_bitmap_range_txn(vol, t,
+							       freed[i].lcn,
+							       freed[i].len,
+						       false);
+			for (i = 0; i < (size_t)n_allocd && !err; i++)
+				err = stage_bitmap_range_txn(vol, t,
+							       allocd[i].lcn,
+							       allocd[i].len,
+						       true);
+			if (err)
+				goto out_free;
+		}
+	out_free:
+		kfree(new_snap.pairs);
+		kvfree(new_rl);
+		kfree(freed);
+		kfree(allocd);
+		return err;
+	}
+}
+
+int ntfs_journal_xattr_finish(struct ntfs_journal_xattr *xt,
+			      struct ntfs_inode *ni,
+			      const struct mft_record *mrec)
+{
+	struct ntfs_volume *vol = xt->vol;
+	ntfs_log_txn_t *t = xt->t;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	const struct attr_record *a;
+	u16 ads_off = 0;
+	int err;
+
+	err = mft_coords(vol, ni->mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (err)
+		goto out_abort;
+
+	/* $SI first: the setxattr success path only bumps ctime. */
+	err = stage_si_36(vol, t, xt->si_old, xt->si_attr_off,
+			  xt->si_value_off, ni, mrec,
+			  vcn, cluster_off, page_lcn);
+	if (err)
+		goto out_abort;
+	a = find_attr(mrec, AT_DATA, xt->uname, xt->ulen, &ads_off);
+	err = stage_xattr_ads(xt, ni, mrec, a, ads_off,
+			      vcn, cluster_off, page_lcn);
+	if (err)
+		goto out_abort;
+	if (ntfs_log_txn_is_empty(t))
+		goto out_abort;
+	return ntfs_journal_xattr_commit(xt, ni);
+
+out_abort:
+	ntfs_journal_xattr_abort(xt);
 	return 0;
 }

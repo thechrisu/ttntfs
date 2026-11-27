@@ -1621,6 +1621,7 @@ int ntfs_setxattr(ntfs_inode_t *h, const char *name, const void *buf,
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 	__le16 *uname;
+	struct ntfs_journal_xattr *xt = NULL;
 	int ulen, err = 0;
 
 	if (!h || (!buf && size))
@@ -1641,6 +1642,24 @@ int ntfs_setxattr(ntfs_inode_t *h, const char *name, const void *buf,
 	inode_lock(vi);
 	if (!(vol->vol_flags & VOLUME_IS_DIRTY))
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+
+	/*
+	 * PORT: journal the xattr (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Begin before the mutation: the begin snapshots the $SI
+	 * 36 bytes and the ADS as they stand before this call. A
+	 * begin failure is not a setxattr failure — the driver set
+	 * xattrs unjournaled for years — so warn and proceed
+	 * unjournaled with xt NULL. An attribute list, a symlink,
+	 * a special file or no writer also begins NULL and proceeds
+	 * unjournaled.
+	 */
+	err = ntfs_journal_xattr_begin(vol, ni, uname, ulen, &xt);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "journal begin failed (%d); setting xattr unjournaled.\n",
+			   err);
+		err = 0;
+	}
 
 	avi = ntfs_attr_iget(vi, AT_DATA, uname, ulen);
 	if (!IS_ERR(avi)) {
@@ -1706,6 +1725,34 @@ int ntfs_setxattr(ntfs_inode_t *h, const char *name, const void *buf,
 		inode_set_ctime_current(vi);
 		mark_inode_dirty(vi);
 	}
+	if (xt) {
+		/*
+		 * Stage the $SI and ADS records from the live record
+		 * and commit — or abort when the setxattr failed, the
+		 * stage failed, or nothing was staged. The finish maps
+		 * the record, so it runs under mrec_lock, the same order
+		 * the setattr commit uses. A commit failure marks the
+		 * volume: the next mount's replay undoes the partial
+		 * transaction and restores the old value.
+		 */
+		struct mft_record *mrec;
+
+		mutex_lock(&ni->mrec_lock);
+		if (err) {
+			ntfs_journal_xattr_abort(xt);
+		} else {
+			mrec = map_mft_record(ni);
+			if (IS_ERR(mrec)) {
+				ntfs_journal_xattr_abort(xt);
+			} else {
+				err = ntfs_journal_xattr_finish(xt, ni, mrec);
+				unmap_mft_record(ni);
+				if (err)
+					NVolSetErrors(ni->vol);
+			}
+		}
+		mutex_unlock(&ni->mrec_lock);
+	}
 	inode_unlock(vi);
 free:
 	kmem_cache_free(ntfs_name_cache, uname);
@@ -1718,6 +1765,7 @@ int ntfs_removexattr(ntfs_inode_t *h, const char *name)
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 	__le16 *uname;
+	struct ntfs_journal_xattr *xt = NULL;
 	int ulen, err;
 
 	if (!h)
@@ -1735,6 +1783,20 @@ int ntfs_removexattr(ntfs_inode_t *h, const char *name)
 	inode_lock(vi);
 	if (!(vol->vol_flags & VOLUME_IS_DIRTY))
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+	/*
+	 * PORT: journal the xattr removal (docs/JOURNAL-DESIGN.md
+	 * Phase 3) — same transaction as ntfs_setxattr, one per
+	 * call. A begin failure is not a removexattr failure, so
+	 * warn and proceed unjournaled with xt NULL.
+	 */
+	err = ntfs_journal_xattr_begin(vol, ni, uname, ulen, &xt);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "journal begin failed (%d); removing xattr unjournaled.\n",
+			   err);
+		err = 0;
+	}
+
 	avi = ntfs_attr_iget(vi, AT_DATA, uname, ulen);
 	if (IS_ERR(avi)) {
 		err = PTR_ERR(avi) == -ENOENT ? -ENOATTR : PTR_ERR(avi);
@@ -1754,6 +1816,32 @@ int ntfs_removexattr(ntfs_inode_t *h, const char *name)
 			inode_set_ctime_current(vi);
 			mark_inode_dirty(vi);
 		}
+	}
+	if (xt) {
+		/* Stage the $SI and ADS records from the live record
+		 * and commit — or abort when the removexattr failed,
+		 * the stage failed, or nothing was staged. The finish
+		 * maps the record, so it runs under mrec_lock, the same
+		 * order the setattr commit uses. A commit failure marks
+		 * the volume: the next mount's replay undoes the partial
+		 * transaction and restores the old value. */
+		struct mft_record *mrec;
+
+		mutex_lock(&ni->mrec_lock);
+		if (err) {
+			ntfs_journal_xattr_abort(xt);
+		} else {
+			mrec = map_mft_record(ni);
+			if (IS_ERR(mrec)) {
+				ntfs_journal_xattr_abort(xt);
+			} else {
+				err = ntfs_journal_xattr_finish(xt, ni, mrec);
+				unmap_mft_record(ni);
+				if (err)
+					NVolSetErrors(ni->vol);
+			}
+		}
+		mutex_unlock(&ni->mrec_lock);
 	}
 	inode_unlock(vi);
 	kmem_cache_free(ntfs_name_cache, uname);

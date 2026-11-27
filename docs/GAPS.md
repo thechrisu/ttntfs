@@ -987,7 +987,33 @@ during writeback (still unjournaled). Pre-existing edge, not fixed
 here: a same-size standalone truncate can commit an empty transaction
 and stamp MR_LSN = 0, clearing the record's stamp; the setattr
 finish avoids it via the empty-transaction check.
-Next: the xattr class.
+Xattr class — landed 2026-11-27 (fork commit, this round): one
+transaction per `ntfs_setxattr` / `ntfs_removexattr` call, begin in
+`api.c` after `inode_lock`, stage + commit under `mrec_lock` after the
+ctime bump; begin snapshots `$SI` 36 bytes + ADS whole-record copy +
+decoded runlist when non-resident. Create stages `CreateAttribute` +
+`SetBits`; remove stages `DeleteAttribute` (begin-time bytes/offset) +
+`ClearBits`; resident→resident replace stages one whole-value
+`UpdateResidentValue` (first class to prove the replay length-change
+path); non-resident→non-resident stages sizes + pairs +
+bitmap delta via `lcn_ranges_sub`; flip either way stages
+Delete+Create+bitmap delta. Aborts to unjournaled on attribute list,
+compressed/encrypted ADS, moved ADS, `$SI` missing/too short,
+non-regular file/directory. No `$FILE_NAME` record (ADS sizes are not
+in the parent dup). Bug fixed en route: `lcn_ranges_sub` returns the
+range COUNT (>= 0) — the first implementation treated any nonzero
+return as an error and scanned for a zero terminator the function
+never writes, so every non-resident replace aborted unjournaled;
+fixed to the truncate pattern (n_freed/n_allocd, < 0 -> -ENOSPC,
+loop by count). Evidence: `test_journal.c` 899 checks, 0 failures
+(5 new tests: create, replace, big create, big replace+remove, root;
+walk 45 records in the big test: create 14, big-create 10, replace
+11, remove 10; replay redoes 5, 2 dirty overlay clusters written
+back). Crash tests in the follow-up commit. Follow-ups, not this
+class: the `$EA` class reuses the resident-replace pattern proven
+here; `$FILE_NAME` times never update on setattr/xattr (live-driver
+bug); extending writes during writeback (still unjournaled).
+Next: the symlink class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

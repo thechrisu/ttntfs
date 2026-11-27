@@ -87,6 +87,38 @@
  *                        same-directory rename, split across the two
  *                        parents; the walk holds 24.
  *
+ *   xattr_create_journaled
+ *                        setting a small resident xattr writes exactly
+ *                        one transaction (one open — $MFT:$DATA — the
+ *                        $SI ctime record, CreateAttribute for the ADS,
+ *                        Commit, three table dumps, Forget); the walk
+ *                        holds 22 with the create's 14. Replay redoes
+ *                        only the create's two idempotent records —
+ *                        the xattr's records are skipped on the
+ *                        file record's MR_LSN stamp — and the value
+ *                        reads back after a remount.
+ *   xattr_replace_journaled
+ *                        replacing a resident xattr stages one
+ *                        UpdateResidentValue for the whole value, any
+ *                        length — the replay's length-change path,
+ *                        which the setattr class left unproven. The
+ *                        walk holds 30 (create 14 + create-xattr 8 +
+ *                        replace 8); the redo/undo carry the new/old
+ *                        values whole.
+ *   xattr_big_journaled  setting an 8 KiB xattr (non-resident) stages
+ *                        CreateAttribute plus SetBits for its clusters,
+ *                        replacing it with 16 KiB stages sizes, mapping
+ *                        pairs and the bitmap delta, and removing it
+ *                        stages DeleteAttribute plus ClearBits. Replay
+ *                        redoes the create's records plus the
+ *                        non-resident bitmap records; the ADS is gone
+ *                        after a remount and ntfsck -n is clean.
+ *   xattr_in_root_journaled
+ *                        a file in the volume root IS journalable for
+ *                        xattr — only its own record and $Bitmap are
+ *                        touched, no parent $FILE_NAME — so the walk
+ *                        holds just the xattr transaction's 8 records.
+ *
  * The snapshot is copied after create+sync while the original is still
  * mounted, so the copy holds the flushed metadata and the still-dirty
  * log: exactly what a crash at that instant would leave. The original
@@ -316,6 +348,18 @@ struct rec_seen {
 	uint64_t sizes_redo_data, sizes_undo_data;
 	uint64_t sizes_redo_total;
 	uint64_t sizes_lsn;
+	/* $DATA create: its redo carries the ADS name in UTF-16LE.
+	 * set_ads_name() picks the name; a test that does not call it
+	 * scans nothing. */
+	int ads_create_hits;
+	uint64_t ads_create_lsn;
+	/* UpdateResidentValue whose payload is an ADS value: the redo
+	 * and undo bytes, up to 64 each (a resident replace). The last
+	 * such record wins. The $SI 36-byte record, the 4-byte $SI
+	 * flags record and $LXMOD records never match. */
+	uint8_t ads_value_redo[64], ads_value_undo[64];
+	uint16_t ads_value_redo_len, ads_value_undo_len;
+	uint64_t ads_value_lsn;
 	int sizes_count;
 };
 
@@ -338,6 +382,26 @@ static void set_fn_name(const char *name)
 		fn_name_pat[2 * i + 1] = 0;
 	}
 	fn_name_len = 2 * n;
+}
+
+/* The ADS name pattern, mirroring set_fn_name(): the UTF-16LE
+ * bytes of the name, for scanning CreateAttribute redo payloads.
+ * Defaults to empty (no scan); a test calls set_ads_name() before
+ * walk_log(). */
+static uint8_t ads_name_pat[2 * 32];
+static size_t ads_name_len;
+
+static void set_ads_name(const char *name)
+{
+	size_t i, n = strlen(name);
+
+	if (n > 32)
+		n = 32;
+	for (i = 0; i < n; i++) {
+		ads_name_pat[2 * i] = (uint8_t)name[i];
+		ads_name_pat[2 * i + 1] = 0;
+	}
+	ads_name_len = 2 * n;
 }
 
 static uint64_t rd64(const uint8_t *p)
@@ -413,6 +477,35 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 				s->fn_lsn = r->lsn;
 				break;
 			}
+		}
+	}
+	if (r->redo_op == LOP_CreateAttribute && r->redo && ads_name_len &&
+	    r->redo_len >= ads_name_len) {
+		const uint8_t *p = r->redo;
+		for (i = 0; i + ads_name_len <= r->redo_len; i++) {
+			if (!memcmp(p + i, ads_name_pat, ads_name_len)) {
+				s->ads_create_hits++;
+				s->ads_create_lsn = r->lsn;
+				break;
+			}
+		}
+	}
+	/* The ADS value: an UpdateResidentValue whose payload is neither
+	 * the 36-byte $SI nor the 4-byte $SI flags nor an $LXMOD $EA
+	 * value. Stores the whole redo/undo bytes (up to 64 each). */
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->undo &&
+	    r->redo_len <= 64 && r->undo_len <= 64 &&
+	    r->redo_len != 36 && r->undo_len != 36 &&
+	    r->redo_len != 4 && r->undo_len != 4) {
+		uint32_t dummy;
+
+		if (!find_lxmod(r->redo, r->redo_len, &dummy) &&
+		    !find_lxmod(r->undo, r->undo_len, &dummy)) {
+			memcpy(s->ads_value_redo, r->redo, r->redo_len);
+			memcpy(s->ads_value_undo, r->undo, r->undo_len);
+			s->ads_value_redo_len = (uint16_t)r->redo_len;
+			s->ads_value_undo_len = (uint16_t)r->undo_len;
+			s->ads_value_lsn = r->lsn;
 		}
 	}
 	if (r->redo_op == LOP_SetBitsInNonresidentBitMap && r->redo && r->redo_len >= BR_SIZE) {
@@ -876,6 +969,53 @@ static int attr_after_mount(const char *path, const char *parent,
 	if (err)
 		goto out_d;
 	err = ntfs_getattr(f, at_out);
+	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* Mount @path, look @name up under @parent (NULL: the root), read the
+ * xattr @xname into @buf (@bufsz bytes, @len_out the length read),
+ * unmount. The same shape as attr_after_mount, for the xattr tests'
+ * post-replay checks. A missing xattr returns -ENOATTR. */
+static int xattr_after_mount(const char *path, const char *parent,
+			    const char *name, const char *xname,
+			    void *buf, size_t bufsz, size_t *len_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	err = ntfs_lookup(d, name, &f);
+	if (err)
+		goto out_d;
+	err = ntfs_getxattr(f, xname, buf, bufsz, len_out);
 	ntfs_inode_put(f);
 out_d:
 	if (d && d != root)
@@ -3102,6 +3242,559 @@ out:
 	unlink(snap);
 }
 
+/* ---- 19. a small resident xattr journals ------------------------------ */
+
+static void test_xattr_create_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_xattr_create_journaled\n");
+	scratch_path(orig, sizeof(orig), "xaorig");
+	scratch_path(snap, sizeof(snap), "xasnap");
+	scratch_path(snap1, sizeof(snap1), "xasnap1");
+	scratch_path(snap2, sizeof(snap2), "xasnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_xattr_create_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	/* Set a small resident xattr: one transaction, 8 records. */
+	err = ntfs_setxattr(f, "user.a", "abc", 3, 0);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, then the xattr transaction's 8
+	 * (one open — $MFT:$DATA — the $SI ctime record, the ADS
+	 * CreateAttribute, Commit, three table dumps, Forget). No
+	 * $Bitmap record and no second open: a resident create
+	 * allocates no clusters. No $FILE_NAME record: ADS sizes are
+	 * not in the parent's dup. */
+	set_ads_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 22);
+	if (s.n == 22) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_CreateAttribute);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.redo_op[17], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[18], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[19], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[20], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_ForgetTransaction);
+		/* The $SI record (at [15]) names a later ctime than
+		 * the create's — the setxattr success path only bumps
+		 * ctime — and undoes to the create's ctime. */
+		CHECK(s.si_redo_ctime > s.si_undo_ctime);
+		CHECK_EQ(s.si_lsn, s.lsn[15]);
+		/* The ADS create is the only CreateAttribute carrying
+		 * "user.a"; the $FILE_NAME create is the only one
+		 * carrying "j.txt". */
+		CHECK_EQ(s.ads_create_hits, 1);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[16]);
+		CHECK_EQ(s.fn_name_hits, 1);
+	}
+
+	/* Replay copy 1: only the create's two idempotent records
+	 * redo — the xattr's records are skipped on the file
+	 * record's MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The value reads back after a remount. */
+	CHECK_EQ(xattr_after_mount(snap1, "sub", "j.txt", "user.a",
+				   buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot redoes the same two
+	 * records. Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+/* ---- 20. replacing a resident xattr journals the whole value ----------- */
+
+static void test_xattr_replace_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_xattr_replace_journaled\n");
+	scratch_path(orig, sizeof(orig), "xroorig");
+	scratch_path(snap, sizeof(snap), "xrosnap");
+	scratch_path(snap1, sizeof(snap1), "xrosnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_xattr_replace_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	err = ntfs_setxattr(f, "user.a", "abc", 3, 0);
+	CHECK_EQ(err, 0);
+	/* Replace with a longer value: one UpdateResidentValue for
+	 * the whole value, any length — the replay's length-change
+	 * path, which the setattr class left unproven. */
+	err = ntfs_setxattr(f, "user.a", "abcdef", 6, 0);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, the create-xattr transaction's
+	 * 8, then the replace transaction's 8 (one open, the $SI
+	 * record, the value record, Commit, three dumps, Forget). */
+	set_ads_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 30);
+	if (s.n == 30) {
+		CHECK_EQ(s.redo_op[22], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[22], 0x18u);
+		CHECK_EQ(s.redo_op[23], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[23], 0x18u);
+		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[24], 0x18u);
+		CHECK_EQ(s.redo_op[25], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[26], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[27], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[28], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[29], LOP_ForgetTransaction);
+		/* The value record (at [24]) carries the new value
+		 * whole and undoes to the old value whole. */
+		CHECK_EQ(s.ads_value_redo_len, 6u);
+		CHECK_EQ(memcmp(s.ads_value_redo, "abcdef", 6), 0);
+		CHECK_EQ(s.ads_value_undo_len, 3u);
+		CHECK_EQ(memcmp(s.ads_value_undo, "abc", 3), 0);
+		CHECK_EQ(s.ads_value_lsn, s.lsn[24]);
+		/* The ADS was created once, in the first xattr
+		 * transaction. */
+		CHECK_EQ(s.ads_create_hits, 1);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[16]);
+	}
+
+	/* Replay: only the create's two idempotent records redo. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	/* The new value reads back after a remount. */
+	CHECK_EQ(xattr_after_mount(snap1, "sub", "j.txt", "user.a",
+				   buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 6u);
+	CHECK_EQ(memcmp(buf, "abcdef", 6), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 21. a large non-resident xattr journals its clusters ------------- */
+
+static void test_xattr_big_create_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char big[8 * 1024], buf[8 * 1024];
+	size_t len = 0;
+	int err;
+
+	printf("test_xattr_big_create_journaled\n");
+	scratch_path(orig, sizeof(orig), "xbcorig");
+	scratch_path(snap, sizeof(snap), "xbcsnap");
+	scratch_path(snap1, sizeof(snap1), "xbcsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_xattr_big_create_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	/* 8 KiB does not fit resident: the ADS goes non-resident. */
+	memset(big, 'B', sizeof(big));
+	err = ntfs_setxattr(f, "user.big", big, sizeof(big), 0);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, then the xattr transaction's 10
+	 * (two opens — $MFT:$DATA then $MFT:$BITMAP, in first-use
+	 * order — the $SI record, the ADS CreateAttribute, the
+	 * SetBits for its two clusters, Commit, three dumps,
+	 * Forget). */
+	set_ads_name("user.big");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 24);
+	if (s.n == 24) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x68u);
+		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.redo_op[17], LOP_CreateAttribute);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_SetBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[18], 0x68u);
+		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+		/* The SetBits names two clusters: 8 KiB at 4 KiB per
+		 * cluster. */
+		CHECK_EQ(s.bits_target_attr, 0x68u);
+		CHECK_EQ(s.bits_count, 2u);
+		CHECK_EQ(s.bits_lsn, s.lsn[18]);
+		CHECK_EQ(s.ads_create_hits, 1);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[17]);
+	}
+
+	/* Replay: the create's two records plus the xattr's SetBits
+	 * (the $Bitmap is never MR_LSN-stamped). The CreateAttribute
+	 * and $SI are skipped on the file record's stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The value reads back after a remount. */
+	CHECK_EQ(xattr_after_mount(snap1, "sub", "j.txt", "user.big",
+				   buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, sizeof(big));
+	CHECK_EQ(memcmp(buf, big, sizeof(big)), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 22. replacing and removing a non-resident xattr ------------------- */
+
+static void test_xattr_big_replace_remove_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0;
+	char big[8 * 1024], big2[16 * 1024], buf[16 * 1024];
+	size_t len = 0;
+	int err;
+
+	printf("test_xattr_big_replace_remove_journaled\n");
+	scratch_path(orig, sizeof(orig), "xbrorig");
+	scratch_path(snap, sizeof(snap), "xbrsnap");
+	scratch_path(snap1, sizeof(snap1), "xbrsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_xattr_big_replace_remove_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+
+	memset(big, 'B', sizeof(big));
+	err = ntfs_setxattr(f, "user.big", big, sizeof(big), 0);
+	CHECK_EQ(err, 0);
+	/* Replace 8 KiB with 16 KiB: the ADS stays non-resident, so
+	 * the transaction stages sizes, mapping pairs and the bitmap
+	 * delta — the truncate machinery, named. */
+	memset(big2, 'C', sizeof(big2));
+	err = ntfs_setxattr(f, "user.big", big2, sizeof(big2), 0);
+	CHECK_EQ(err, 0);
+	/* Remove it: DeleteAttribute plus ClearBits for its clusters. */
+	err = ntfs_removexattr(f, "user.big");
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, the create-xattr transaction's
+	 * 10, the replace transaction's 11 (two opens, the $SI
+	 * record, sizes, pairs, SetBits, Commit, three dumps,
+	 * Forget), then the remove transaction's 10 (two opens, the
+	 * $SI record, DeleteAttribute, ClearBits, Commit, three
+	 * dumps, Forget). */
+	set_ads_name("user.big");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 45);
+	if (s.n == 45) {
+		/* Replace transaction: opens, $SI, sizes, pairs. */
+		CHECK_EQ(s.redo_op[24], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[24], 0x18u);
+		CHECK_EQ(s.redo_op[25], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[25], 0x68u);
+		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[26], 0x18u);
+		CHECK_EQ(s.redo_op[27], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[27], 0x18u);
+		CHECK_EQ(s.redo_op[28], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[28], 0x18u);
+		CHECK_EQ(s.redo_op[29], LOP_SetBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[29], 0x68u);
+		CHECK_EQ(s.redo_op[30], LOP_CommitTransaction);
+		/* The sizes record names the 8 KiB -> 16 KiB growth. */
+		/* Two sizes records: the create (0 -> 256 KiB) and the
+		 * replace (8 KiB -> 16 KiB). */
+		CHECK_EQ(s.sizes_count, 2);
+		CHECK_EQ(s.sizes_redo_data, 16u * 1024u);
+		CHECK_EQ(s.sizes_undo_data, 8u * 1024u);
+		/* Remove transaction: opens, $SI, DeleteAttribute,
+		 * ClearBits. */
+		CHECK_EQ(s.redo_op[35], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[35], 0x18u);
+		CHECK_EQ(s.redo_op[36], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[36], 0x68u);
+		CHECK_EQ(s.redo_op[37], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[37], 0x18u);
+		CHECK_EQ(s.redo_op[38], LOP_DeleteAttribute);
+		CHECK_EQ(s.target_attr[38], 0x18u);
+		CHECK_EQ(s.redo_op[39], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[39], 0x68u);
+		CHECK_EQ(s.redo_op[40], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[44], LOP_ForgetTransaction);
+		/* The ClearBits frees the four 16 KiB clusters. */
+		CHECK_EQ(s.clear_bits_target_attr, 0x68u);
+		CHECK_EQ(s.clear_bits_count, 4u);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[39]);
+	}
+
+	/* Replay: the create's two records, the big-create SetBits,
+	 * the replace SetBits and the remove ClearBits — the
+	 * $Bitmap records are never MR_LSN-stamped. The sizes,
+	 * pairs, CreateAttribute, DeleteAttribute and $SI records
+	 * are skipped on the file record's stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 5u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	/* Two distinct dirty overlay clusters are written back:
+	 * the MFT record cluster and the $Bitmap cluster. */
+	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The ADS is gone after a remount. */
+	CHECK_EQ(xattr_after_mount(snap1, "sub", "j.txt", "user.big",
+				   buf, sizeof(buf), &len), -ENOATTR);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 23. an xattr on a file in the volume root journals --------------- */
+
+static void test_xattr_in_root_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	char buf[64];
+	size_t len = 0;
+	int err;
+
+	printf("test_xattr_in_root_journaled\n");
+	scratch_path(orig, sizeof(orig), "xirorig");
+	scratch_path(snap, sizeof(snap), "xirsnap");
+	scratch_path(snap1, sizeof(snap1), "xirsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_xattr_in_root_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* The create in root is itself unjournaled (the root's index
+	 * lives in $INDEX_ALLOCATION), so the walk is empty before
+	 * the xattr — the same baseline the root-create test pins. */
+	err = ntfs_create(root, "r.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	/* An xattr on the root file journals: only its own record
+	 * and $Bitmap are touched, no parent $FILE_NAME. */
+	err = ntfs_setxattr(f, "user.a", "abc", 3, 0);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds just the xattr transaction's 8 records. */
+	set_ads_name("user.a");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 8);
+	if (s.n == 8) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_CreateAttribute);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		CHECK_EQ(s.ads_create_hits, 1);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[2]);
+	}
+
+	/* Replay: nothing redoes — every record targets the file's
+	 * own record and is skipped on its MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
+
+	/* The value reads back after a remount. */
+	CHECK_EQ(xattr_after_mount(snap1, NULL, "r.txt", "user.a",
+				   buf, sizeof(buf), &len), 0);
+	CHECK_EQ(len, 3u);
+	CHECK_EQ(memcmp(buf, "abc", 3), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	return;
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	unlink(orig);
+	unlink(snap);
+}
+
+
 int main(void)
 {
 	tool_paths();
@@ -3123,6 +3816,11 @@ int main(void)
 	test_setattr_journaled();
 	test_setattr_size_joins();
 	test_setattr_in_root_unjournaled();
+	test_xattr_create_journaled();
+	test_xattr_replace_journaled();
+	test_xattr_big_create_journaled();
+	test_xattr_big_replace_remove_journaled();
+	test_xattr_in_root_journaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
