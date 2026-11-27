@@ -3347,6 +3347,149 @@ static void test_journal_create_commit(void)
 	free(buf);
 }
 
+
+/* UpdateFileNameRoot: a committed transaction that only rewrites the
+ * duplicated $FILE_NAME fields (alloc/data sizes, flags) of an entry
+ * in the parent's $INDEX_ROOT replays to the new values, and an
+ * uncommitted one undoes to the old values. The first transaction is
+ * a create (it puts the entry there); the second updates its dup
+ * bytes; the third, uncommitted, updates them again and is undone.
+ * The dup payload is FN_DUP_SIZE bytes at FN_DUP_OFFSET in the key:
+ * times, allocated_size at +0x20, data_size at +0x28, flags at +0x30.
+ * This is the record the truncate class stages so a committed resize
+ * and the parent's $FILE_NAME agree after a crash. */
+static void test_update_filename_root(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct rec_seen s;
+	uint64_t first_lsn, first_lsn2;
+	uint8_t got[VRS];
+	uint8_t old_dup[FN_DUP_SIZE], new_dup[FN_DUP_SIZE],
+		new_dup2[FN_DUP_SIZE];
+	uint64_t pvcn = DIR_REC * VRS / VCS;	/* 8 */
+	uint64_t ppage_lcn = MFT_LCN + pvcn;	/* 24 */
+	uint16_t dir_ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+	int err;
+
+	printf("test_update_filename_root\n");
+	/* The create's $FILE_NAME has alloc/data 0 and flags ARCHIVE
+	 * (0x20) at value offset 0x38 — dup offset 0x30. */
+	memset(old_dup, 0, sizeof(old_dup));
+	lf_put32(old_dup + 0x30, 0x20);
+	memset(new_dup, 0, sizeof(new_dup));
+	lf_put64(new_dup + 0x20, 0x10000);	/* allocated_size */
+	lf_put64(new_dup + 0x28, 0x8000);	/* data_size */
+	lf_put32(new_dup + 0x30, 0x220);	/* ARCHIVE | SPARSE */
+	memset(new_dup2, 0, sizeof(new_dup2));
+	lf_put64(new_dup2 + 0x20, 0x20000);
+	lf_put64(new_dup2 + 0x28, 0x10000);
+	lf_put32(new_dup2 + 0x30, 0x20);
+
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+
+	/* The update: one open ($MFT:$DATA) + the filename record +
+	 * Commit + 3 dumps + Forget = 7 records. */
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(ntfs_log_txn_update_filename_root(t, 0x18, pvcn, 0,
+						  ppage_lcn, dir_ir_off, 56,
+						  new_dup, old_dup), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn2, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn2, collect_rec, &s), 0);
+	CHECK_EQ(s.n, 7);
+	if (s.n == 7) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[3], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[4], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_ForgetTransaction);
+	}
+	ntfs_logfile_close(log);
+
+	/* Replay both transactions: 7 create records + 1 filename
+	 * record redo; 2 MFT records + 1 bitmap cluster written. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 8);
+	CHECK_EQ(res.mft_records_written, 2);
+	CHECK_EQ(res.clusters_written, 1);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* The entry's dup bytes are the new values: alloc 0x10000,
+	 * data 0x8000, flags 0x220. The entry sits at attribute
+	 * offset 56 in the parent's $INDEX_ROOT; its key starts at
+	 * entry + IE_KEY (0x10) and the dup at key + FN_DUP_OFFSET. */
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	{
+		const uint8_t *entry = got + dir_ir_off + 56;
+		const uint8_t *dup = entry + 0x10 + FN_DUP_OFFSET;
+		CHECK_EQ(lf_get64(dup + 0x20), 0x10000);
+		CHECK_EQ(lf_get64(dup + 0x28), 0x8000);
+		CHECK_EQ(lf_get32(dup + 0x30), 0x220);
+	}
+
+	/* An uncommitted update undoes: the entry keeps the committed
+	 * values. Append a third transaction that stages new_dup2
+	 * (old = new_dup) and abort it, then replay again. */
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_log_writer_open(log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(ntfs_log_txn_update_filename_root(t, 0x18, pvcn, 0,
+						  ppage_lcn, dir_ir_off, 56,
+						  new_dup2, new_dup), 0);
+	CHECK_EQ(ntfs_log_txn_abort(t), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* ASan: vol_init() callocs a fresh disk; re-init without
+	 * freeing the first one leaked 256 KiB (same pattern as
+	 * test_logfile_replay_torn_page). */
+	free(v.disk);
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 8);
+	ntfs_logfile_close(log);
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	{
+		const uint8_t *entry = got + dir_ir_off + 56;
+		const uint8_t *dup = entry + 0x10 + FN_DUP_OFFSET;
+		CHECK_EQ(lf_get64(dup + 0x20), 0x10000);
+		CHECK_EQ(lf_get64(dup + 0x28), 0x8000);
+		CHECK_EQ(lf_get32(dup + 0x30), 0x220);
+	}
+
+	free(v.disk);
+	free(buf);
+}
+
 /* A SetNewAttributeSizes + UpdateMappingPairs pair replays to a grown
  * $DATA, and the sizes record must not clobber the pairs: the $DATA
  * attribute is short-form (pairs at 0x40, length exactly 0x48), so
@@ -4346,6 +4489,7 @@ int main(void)
 	test_writer_wrap_readback();
 	test_writer_clean_close();
 	test_journal_create_commit();
+	test_update_filename_root();
 	test_journal_create_mft_sizes();
 	test_journal_create_close_dumps_no_phantom();
 	test_journal_create_abort();

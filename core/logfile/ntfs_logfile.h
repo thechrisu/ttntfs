@@ -415,6 +415,11 @@ int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
 				 uint16_t attr_off, const void *new_val,
 				 uint16_t new_len, const void *old_val,
 				 uint16_t old_len);
+int ntfs_log_txn_update_filename_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				      uint64_t target_vcn, uint16_t cluster_off,
+				      uint64_t page_lcn, uint16_t record_off,
+				      uint16_t attr_off, const void *new_dup,
+				      const void *old_dup);
 int ntfs_log_txn_set_bitmap(ntfs_log_txn_t *t, uint32_t bitmap_attr,
 			    uint64_t target_vcn, uint16_t cluster_off,
 			    uint64_t page_lcn, uint32_t bit, uint32_t nbits,

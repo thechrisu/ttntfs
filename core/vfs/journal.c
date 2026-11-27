@@ -44,6 +44,7 @@
 #include "mft.h"
 #include "journal.h"
 #include "../logfile/ntfs_logfile.h"
+#include "../logfile/logfile_layout.h"
 
 struct mft_attr_snapshot {
 	u64 alloc, valid, data, total;
@@ -770,10 +771,17 @@ int ntfs_journal_unlink_check(struct ntfs_journal_unlink *u,
 
 /*
  * Find the index entry whose key is the $FILE_NAME value @fn (@fn_len
- * bytes) in @dir_mrec's $INDEX_ROOT. Match by the whole $FILE_NAME
- * value, not by mref: a hard link in the same directory has the same
- * parent and the same target record, but a different name. The entry
- * key is the $FILE_NAME value; key length first, then bytes.
+ * bytes) in @dir_mrec's $INDEX_ROOT. Match by the NAME (bytes and
+ * type), not by the whole $FILE_NAME value and not by mref: a hard
+ * link in the same directory has the same parent and the same target
+ * record, but a different name, and the name is what the $I30 index
+ * is ordered by. The rest of the $FILE_NAME is payload, and the two
+ * copies of it legitimately disagree: the file's record carries the
+ * packed EA size in the union field at offset 60 (0x2d, the packed
+ * size of $LXUID/$LXGID/$LXMOD), while the index copy carries the
+ * reparse tag there (0x00 for an ordinary file) — see the PORT note
+ * in ntfs_create(). A whole-value match therefore misses the entry
+ * for every file with EAs, which is every file this driver creates.
  * On success fills @attr_off_out (the $INDEX_ROOT's offset in the
  * record), @entry_off_out (the entry's offset from the attribute
  * record's start — the aoff the log records carry), @len_out and
@@ -817,8 +825,21 @@ static int find_index_entry_by_key(const struct mft_record *dir_mrec,
 			return -EINVAL;
 		if (e->flags & INDEX_ENTRY_END)
 			break;
+		/* The name is the key: same length, same type, same
+		 * bytes. The name length bounds the memcmp — the value
+		 * length is 66 + 2 * name_length, so key_length == fn_len
+		 * plus a matching length already bounds both sides. */
 		if (le16_to_cpu(e->key_length) == fn_len &&
-		    !memcmp((const u8 *)e + 16, fn, fn_len)) {
+		    fn_len >= offsetof(struct file_name_attr, file_name) +
+				fn->file_name_length * sizeof(__le16) &&
+		    ((const struct file_name_attr *)((const u8 *)e + 16))
+			    ->file_name_length == fn->file_name_length &&
+		    ((const struct file_name_attr *)((const u8 *)e + 16))
+			    ->file_name_type == fn->file_name_type &&
+		    !memcmp(((const struct file_name_attr *)
+			     ((const u8 *)e + 16))->file_name,
+			    fn->file_name,
+			    fn->file_name_length * sizeof(__le16))) {
 			if (attr_off_out)
 				*attr_off_out = attr_off;
 			if (entry_off_out)
@@ -1242,6 +1263,15 @@ struct ntfs_journal_truncate {
 	u32 si_flags_old;
 	u16 si_attr_off;
 	u16 si_value_off;
+	/* The parent $FILE_NAME's allocated size as it stood at begin.
+	 * It is NOT snap.alloc: for a sparse/compressed file the
+	 * parent carries ni->itype.compressed.size (the real clusters),
+	 * not the $DATA's allocated_size (which counts the hole) —
+	 * the same rule ntfs_inode_sync_filename applies. The
+	 * parent's record in memory lags behind the log (it is only
+	 * refreshed at parent writeback), so the stage cannot read
+	 * the old value from the entry; it takes it from here. */
+	u64 fn_alloc_old;
 	/* The run list as it stood at begin: a copy of ni->runlist.rl
 	 * up to and including its length-0 terminator. The bitmap delta
 	 * is the set difference between this and the live run list. */
@@ -1331,6 +1361,14 @@ int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
 						 file_attributes)));
 		}
 	}
+	/* The parent's allocated size as it stands: the compressed
+	 * size for a sparse/compressed file, the $DATA's allocated
+	 * size otherwise — the rule ntfs_inode_sync_filename
+	 * applies when it refreshes the parent's $FILE_NAME. */
+	if (NInoSparse(ni) || NInoCompressed(ni))
+		t->fn_alloc_old = ni->itype.compressed.size;
+	else
+		t->fn_alloc_old = t->snap.alloc;
 	unmap_mft_record(ni);
 	if (err)
 		goto out_free;
@@ -1493,6 +1531,188 @@ static int stage_bitmap_range(struct ntfs_journal_truncate *t,
 					      (u32)bit, (u32)chunk, set);
 		bit += chunk;
 		nbits -= chunk;
+	}
+	return err;
+}
+
+/*
+ * Stage one parent's $FILE_NAME update for a truncate. The parent's
+ * index entry duplicates the file's allocated/data sizes and flags,
+ * and the live driver refreshes them at parent writeback
+ * (ntfs_inode_sync_filename) — after the commit, so a crash between
+ * the commit and the parent's writeback leaves the entry stale and
+ * ntfsck flags the file ("Allocated size is different with
+ * IDX/$FN(...), MFT/$DATA(...)"). Staging the update here makes the
+ * replay apply it with the transaction (redo) or restore it (undo),
+ * so the two agree whatever instant the crash hits.
+ *
+ * The entry is found by key (the whole $FILE_NAME value) in the
+ * parent's $INDEX_ROOT, via ntfs_iget — the same route
+ * ntfs_inode_sync_filename takes, and the same lock order (the
+ * file's mrec_lock is held by the caller; the parent's is taken
+ * nested, NTFS_INODE_MUTEX_PARENT). Every $FILE_NAME in the file's
+ * record is staged, so hard links update every parent. When the
+ * entry lives in an $INDEX_ALLOCATION block, or the parent cannot
+ * be reached, this returns -ENOENT and the whole transaction aborts
+ * to unjournaled — the resize stands, unjournaled, as before.
+ * The record is staged only when the duplicated bytes actually
+ * change (a no-op truncate stages nothing).
+ */
+static int stage_truncate_filename_one(struct ntfs_journal_truncate *t,
+				       struct ntfs_inode *ni,
+				       const struct attr_record *fn_attr,
+				       const struct attr_record *data_attr)
+{
+	struct ntfs_volume *vol = t->vol;
+	const struct file_name_attr *fn;
+	u32 fn_len, vlen;
+	u64 parent;
+	struct inode *index_vi;
+	struct ntfs_inode *index_ni;
+	struct mft_record *dir_mrec;
+	const struct index_entry *e = NULL;
+	u16 attr_off = 0, entry_off = 0;
+	u32 len = 0;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	u8 old_dup[FN_DUP_SIZE], new_dup[FN_DUP_SIZE];
+	u32 old_flags, new_flags;
+	__le64 v64;
+	__le32 v32;
+	int err;
+
+	/* The duplicated fields live at FN_DUP_OFFSET in the $FILE_NAME
+	 * value: times, then allocated_size, data_size, flags. The
+	 * offsets below are relative to the dup payload start. */
+	const u16 dup_alloc = offsetof(struct file_name_attr,
+				       allocated_size) - FN_DUP_OFFSET;
+	const u16 dup_data = offsetof(struct file_name_attr,
+				      data_size) - FN_DUP_OFFSET;
+	const u16 dup_flags = offsetof(struct file_name_attr,
+				       file_attributes) - FN_DUP_OFFSET;
+
+	fn_len = le32_to_cpu(fn_attr->data.resident.value_length);
+	vlen = le16_to_cpu(fn_attr->data.resident.value_offset) + fn_len;
+	if (fn_attr->non_resident || fn_len < FN_DUP_OFFSET + FN_DUP_SIZE ||
+	    vlen > le32_to_cpu(fn_attr->length))
+		return -ENOENT;
+	fn = (const struct file_name_attr *)((const u8 *)fn_attr +
+		le16_to_cpu(fn_attr->data.resident.value_offset));
+	parent = MREF_LE(fn->parent_directory);
+	if (parent == ni->mft_no)
+		return 0;	/* self-parented ("."), no index entry */
+	if (!vol->sb)
+		return -ENOENT;
+	index_vi = ntfs_iget(vol->sb, parent);
+	if (IS_ERR(index_vi))
+		return -ENOENT;
+	index_ni = NTFS_I(index_vi);
+	mutex_lock_nested(&index_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
+	dir_mrec = map_mft_record(index_ni);
+	if (IS_ERR(dir_mrec)) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	err = find_index_entry_by_key(dir_mrec, fn, fn_len, &attr_off,
+				       &entry_off, &len, &e);
+	if (err)
+		goto out_unmap;
+	/* The entry's dup bytes carry the times (unchanged by a
+	 * truncate) — but NOT the old sizes/flags: the parent's
+	 * record in memory lags behind the log, because it is only
+	 * refreshed at parent writeback, so the entry still holds
+	 * the values from before the previous transaction. The old
+	 * payload therefore takes its sizes/flags from the begin
+	 * snapshot (the state the previous transaction left), and
+	 * the new payload from the file's current state — the same
+	 * rule ntfs_inode_sync_filename applies. Getting the old
+	 * value from the entry would make an undo restore the
+	 * pre-previous state: a committed shrink followed by a
+	 * loser's extend would leave the entry at the pre-shrink
+	 * size. */
+	memcpy(old_dup, (const u8 *)e + IE_KEY + FN_DUP_OFFSET,
+	       FN_DUP_SIZE);
+	memcpy(new_dup, old_dup, FN_DUP_SIZE);
+	/* Old: the snapshot's sizes and $SI flags. */
+	v64 = cpu_to_le64(t->fn_alloc_old);
+	memcpy(old_dup + dup_alloc, &v64, sizeof(v64));
+	v64 = cpu_to_le64(t->snap.data);
+	memcpy(old_dup + dup_data, &v64, sizeof(v64));
+	memcpy(&v32, old_dup + dup_flags, sizeof(v32));
+	old_flags = le32_to_cpu(v32);
+	new_flags = (old_flags & ~le32_to_cpu(FILE_ATTR_VALID_FLAGS)) |
+		    (t->si_flags_old & le32_to_cpu(FILE_ATTR_VALID_FLAGS));
+	v32 = cpu_to_le32(new_flags);
+	memcpy(old_dup + dup_flags, &v32, sizeof(v32));
+	/* New: the file's current sizes and flags. The allocated
+	 * size is the compressed size for a sparse/compressed
+	 * file — the $DATA's allocated_size counts the hole. */
+	if (NInoSparse(ni) || NInoCompressed(ni))
+		v64 = cpu_to_le64(ni->itype.compressed.size);
+	else
+		v64 = cpu_to_le64(le64_to_cpu(
+			data_attr->data.non_resident.allocated_size));
+	memcpy(new_dup + dup_alloc, &v64, sizeof(v64));
+	v64 = cpu_to_le64(le64_to_cpu(
+		data_attr->data.non_resident.data_size));
+	memcpy(new_dup + dup_data, &v64, sizeof(v64));
+	memcpy(&v32, new_dup + dup_flags, sizeof(v32));
+	old_flags = le32_to_cpu(v32);
+	new_flags = (old_flags & ~le32_to_cpu(FILE_ATTR_VALID_FLAGS)) |
+		    (le32_to_cpu(ni->flags) &
+		     le32_to_cpu(FILE_ATTR_VALID_FLAGS));
+	v32 = cpu_to_le32(new_flags);
+	memcpy(new_dup + dup_flags, &v32, sizeof(v32));
+	if (!memcmp(new_dup, old_dup, FN_DUP_SIZE)) {
+		err = 0;
+		goto out_unmap;	/* nothing changed, no record needed */
+	}
+	err = mft_coords(vol, parent, &vcn, &cluster_off, &page_lcn);
+	if (!err)
+		err = ntfs_log_txn_update_filename_root(
+			t->t, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			attr_off, entry_off, new_dup, old_dup);
+out_unmap:
+	unmap_mft_record(index_ni);
+out_unlock:
+	mutex_unlock(&index_ni->mrec_lock);
+	iput(index_vi);
+	return err;
+}
+
+/*
+ * Stage the $FILE_NAME updates for a truncate: one UpdateFileNameRoot
+ * per $FILE_NAME in the file's record (hard links update every
+ * parent). The scan mirrors find_attr's bounds — attributes are
+ * contiguous from attrs_offset to bytes_in_use, ending at AT_END.
+ */
+static int stage_truncate_filename(struct ntfs_journal_truncate *t,
+				   struct ntfs_inode *ni,
+				   const struct mft_record *mrec,
+				   const struct attr_record *data_attr)
+{
+	u16 off = le16_to_cpu(mrec->attrs_offset);
+	u32 used = le32_to_cpu(mrec->bytes_in_use);
+	int err = 0;
+
+	while (off + 8 <= used) {
+		const struct attr_record *at =
+			(const struct attr_record *)((const u8 *)mrec + off);
+		u32 len;
+
+		if (at->type == AT_END)
+			break;
+		len = le32_to_cpu(at->length);
+		if (len < 8 || off + len > used)
+			return -EINVAL;
+		if (at->type == AT_FILE_NAME) {
+			err = stage_truncate_filename_one(t, ni, at,
+							  data_attr);
+			if (err)
+				return err;
+		}
+		off += len;
 	}
 	return err;
 }
@@ -1660,6 +1880,14 @@ out_rl:
 		if (err)
 			goto out;
 	}
+
+	/* The parent's $FILE_NAME, last: its duplicated sizes and flags
+	 * must agree with the resized $DATA after the replay, whatever
+	 * instant the crash hits. A failure here aborts the whole
+	 * transaction (the resize then proceeds unjournaled). */
+	err = stage_truncate_filename(t, ni, mrec, a);
+	if (err)
+		goto out;
 
 out:
 	return err;

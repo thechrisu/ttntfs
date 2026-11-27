@@ -818,11 +818,51 @@ first, with a logfile-level redo/undo test). A journaled shrink
 is 10 records (2 open + ClearBits + pairs + sizes + Commit + 3
 dumps + Forget); a journaled extend is 8 (1 open + pairs + sizes
 + Commit + 3 dumps + Forget — no $Bitmap record, so $BITMAP
-never opens). The parent index entry's duplicated $FILE_NAME
-data_size is not staged (refreshed by `ntfs_inode_sync_filename`
-at parent writeback; the WAL gate holds the file record until
-commit). fallocate and extending writes during writeback are not
+never opens). fallocate and extending writes during writeback are not
 in this class.
+Crash-test fix (2026-11-27, this round): the truncate did not
+journal the parent's $FILE_NAME. The parent directory's $FILE_NAME
+(in sub/d's $INDEX_ROOT) still carried the old sizes, because the
+live driver refreshes it via ntfs_inode_sync_filename at parent
+writeback — which the torn sync can cut. The WAL gate defers the
+parent's record writeback while the transaction is open; the
+commit lands, then the parent's writeback proceeds with the new
+$FILE_NAME — a crash between the commit and the parent's
+writeback leaves file = new size (committed, replayed) but parent
+= old size (stale), and ntfsck reports "Allocated size is
+different with IDX/$FN(262144), MFT/$DATA(65536)". A crash before
+the commit is consistent (parent still old, undo restores file to
+old). The fix stages an UpdateFileNameRoot record (new builder
+ntfs_log_txn_update_filename_root, op 0x13, FN_DUP_SIZE bytes
+each way; the replay already handled the op) for each resident
+$FILE_NAME in the file's record, addressed through $MFT:$DATA
+with the parent's mft_coords — no new open attribute needed.
+Two subtleties the first version got wrong. First, the entry's
+dup bytes cannot be the old payload: the parent's record in
+memory lags behind the log (only refreshed at parent writeback),
+so the entry still holds the values from before the previous
+transaction — using them as the undo payload would make an undo
+restore the pre-previous state (a committed shrink followed by a
+loser's extend leaves the entry at the pre-shrink size). The old
+dup takes its sizes/flags from the begin snapshot (fn_alloc_old,
+snap.data, si_flags_old); only the times come from the entry.
+Second, for a sparse file the parent's $FILE_NAME alloc must be
+ni->itype.compressed.size (the real clusters, 64K), not the
+$DATA's allocated_size (which counts the hole, 256K) — the same
+rule ntfs_inode_sync_filename applies. The record is staged only
+when the new dup differs from the old (a no-op truncate stages
+nothing); any staging failure aborts the whole transaction to
+unjournaled. The fix also changed find_index_entry_by_key to
+match by NAME (bytes + type), not the whole $FILE_NAME value:
+the file's record and the index entry legitimately disagree in
+exactly one byte — value offset 60 (0x3c), the ea_size/reparse
+union, which the create writes as the packed EA size (45, the
+packed size of $LXUID/$LXGID/$LXMOD) while the index copy holds
+the real reparse tag (0x00). The name is what the $I30 index is
+ordered by; the rest is payload. This affects the unlink and
+rename callers too, but they pass the $FILE_NAME from the VFS
+lookup (the entry's own key), so they match the same entry as
+before.
 Crash-test fix (2026-11-27, this round): the truncate did not
 journal the file's $STANDARD_INFORMATION flags. The live driver
 sets BOTH the $DATA flag and the $SI flags when a resize flips
@@ -868,16 +908,22 @@ opened first and NOT the create's SetBits attribute, and the
 replayed shrink writes two clusters (the $MFT:$BITMAP cluster
 for the create's SetBits and the volume $Bitmap's cluster for the
 truncate's ClearBits), not one.
-Driver tests (`core/tests/test_journal.c`, suite 545 checks, 0
-failures): `test_truncate_shrink_journaled` (walk 24: create 14
-+ shrink 10; replay redoes 3 — the create's sizes + SetBits and
-the shrink's ClearBits; the shrink's pairs and sizes are skipped
-by the file record's MR_LSN stamp) and
-`test_truncate_extend_journaled` (walk 33: create 14 + shrink 10
-+ extend 9 — the extend gains a $SI flags record when the hole
-path flips the file sparse; replay still redoes 3 — the extend's
-pairs, sizes and $SI are skipped by the same stamp and it has no
-$Bitmap record; the file is 256 KiB after replay and ntfsck-clean). Negative control
+Driver tests (`core/tests/test_journal.c`, suite 563 checks, 0
+failures): `test_truncate_shrink_journaled` (walk 25: create 14
++ shrink 11 — the shrink gains a $FILE_NAME record for the
+parent's $FILE_NAME; replay redoes 4 — the create's sizes +
+SetBits, the shrink's ClearBits and the shrink's $FILE_NAME
+(the $FILE_NAME record redoes because the commit stamps MR_LSN
+only into the file's record, not the parent's; the redo is
+idempotent); the shrink's pairs and sizes are skipped by the
+file record's MR_LSN stamp) and
+`test_truncate_extend_journaled` (walk 35: create 14 + shrink 11
++ extend 10 — the extend gains a $SI flags record and a
+$FILE_NAME record; replay redoes 5 — the create's sizes +
+SetBits, the shrink's ClearBits and $FILE_NAME, and the extend's
+$FILE_NAME; the extend's pairs, sizes and $SI are skipped by the
+same stamp and it has no $Bitmap record; the file is 256 KiB
+after replay and ntfsck-clean). Negative control
 (truncate staging stubbed to -ENOENT): the truncates still
 succeed, sizes right, ntfsck clean — only the walk counts and
 redo counts fail, as designed. One nuance the control exposed:

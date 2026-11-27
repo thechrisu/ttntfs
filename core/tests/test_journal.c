@@ -288,6 +288,13 @@ struct rec_seen {
 	 * flags the truncate stages when the file flips sparse). */
 	uint32_t res_redo, res_undo;
 	uint64_t res_lsn;
+	/* UpdateFileNameRoot: the duplicated sizes/flags from the
+	 * redo/undo dup payloads (alloc at +0x20, data at +0x28,
+	 * flags at +0x30). The last such record wins. */
+	uint64_t fn_redo_alloc, fn_undo_alloc;
+	uint64_t fn_redo_data, fn_undo_data;
+	uint32_t fn_redo_flags, fn_undo_flags;
+	uint64_t fnupd_lsn;
 	/* SetNewAttributeSizes: the $DATA size from redo/undo. */
 	uint64_t sizes_redo_data, sizes_undo_data;
 	uint64_t sizes_redo_total;
@@ -374,6 +381,54 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 		s->res_undo = (uint32_t)pu[0] | ((uint32_t)pu[1] << 8) |
 			((uint32_t)pu[2] << 16) | ((uint32_t)pu[3] << 24);
 		s->res_lsn = r->lsn;
+	}
+	if (r->redo_op == LOP_UpdateFileNameRoot && r->redo &&
+	    r->redo_len == FN_DUP_SIZE && r->undo &&
+	    r->undo_len == FN_DUP_SIZE) {
+		const uint8_t *pr = r->redo, *pu = r->undo;
+		/* Dup payload: allocated_size at +0x20, data_size at
+		 * +0x28, flags at +0x30. */
+		s->fn_redo_alloc = (uint64_t)pr[0x20] |
+			((uint64_t)pr[0x21] << 8) |
+			((uint64_t)pr[0x22] << 16) |
+			((uint64_t)pr[0x23] << 24) |
+			((uint64_t)pr[0x24] << 32) |
+			((uint64_t)pr[0x25] << 40) |
+			((uint64_t)pr[0x26] << 48) |
+			((uint64_t)pr[0x27] << 56);
+		s->fn_undo_alloc = (uint64_t)pu[0x20] |
+			((uint64_t)pu[0x21] << 8) |
+			((uint64_t)pu[0x22] << 16) |
+			((uint64_t)pu[0x23] << 24) |
+			((uint64_t)pu[0x24] << 32) |
+			((uint64_t)pu[0x25] << 40) |
+			((uint64_t)pu[0x26] << 48) |
+			((uint64_t)pu[0x27] << 56);
+		s->fn_redo_data = (uint64_t)pr[0x28] |
+			((uint64_t)pr[0x29] << 8) |
+			((uint64_t)pr[0x2a] << 16) |
+			((uint64_t)pr[0x2b] << 24) |
+			((uint64_t)pr[0x2c] << 32) |
+			((uint64_t)pr[0x2d] << 40) |
+			((uint64_t)pr[0x2e] << 48) |
+			((uint64_t)pr[0x2f] << 56);
+		s->fn_undo_data = (uint64_t)pu[0x28] |
+			((uint64_t)pu[0x29] << 8) |
+			((uint64_t)pu[0x2a] << 16) |
+			((uint64_t)pu[0x2b] << 24) |
+			((uint64_t)pu[0x2c] << 32) |
+			((uint64_t)pu[0x2d] << 40) |
+			((uint64_t)pu[0x2e] << 48) |
+			((uint64_t)pu[0x2f] << 56);
+		s->fn_redo_flags = (uint32_t)pr[0x30] |
+			((uint32_t)pr[0x31] << 8) |
+			((uint32_t)pr[0x32] << 16) |
+			((uint32_t)pr[0x33] << 24);
+		s->fn_undo_flags = (uint32_t)pu[0x30] |
+			((uint32_t)pu[0x31] << 8) |
+			((uint32_t)pu[0x32] << 16) |
+			((uint32_t)pu[0x33] << 24);
+		s->fnupd_lsn = r->lsn;
 	}
 	if (r->redo_op == LOP_SetNewAttributeSizes && r->redo && r->redo_len >= NAS_SIZE &&
 	    r->undo && r->undo_len >= NAS_SIZE) {
@@ -2101,7 +2156,6 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(err, 0);
 	if (err) { unlink(orig); return; }
 	CHECK(ino > 16);
-
 	/* Shrink 256 KiB -> 64 KiB: 48 clusters freed, one run. */
 	err = ntfs_truncate(f, 64 * 1024);
 	CHECK_EQ(err, 0);
@@ -2119,15 +2173,17 @@ static void test_truncate_shrink_journaled(void)
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* The walk: the create's 14 still-live records, then the
-	 * truncate's 10 (2 open + 3 data + Commit + 3 dumps +
-	 * Forget). The three data records are the $Bitmap ClearBits
+	 * truncate's 11 (2 open + 4 data + Commit + 3 dumps +
+	 * Forget). The four data records are the $Bitmap ClearBits
 	 * for the freed run, the UpdateMappingPairs for the shorter
-	 * run list, and the SetNewAttributeSizes for the new sizes —
-	 * in that order: clusters first, then the pairs that name
-	 * them, then the sizes. */
+	 * run list, the SetNewAttributeSizes for the new sizes, and
+	 * the UpdateFileNameRoot for the parent's $FILE_NAME — in
+	 * that order: clusters first, then the pairs that name
+	 * them, then the sizes, then the parent's duplicated
+	 * sizes. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 24);
-	if (s.n == 24) {
+	CHECK_EQ(s.n, 25);
+	if (s.n == 25) {
 		/* The opens come in first-use order: the truncate
 		 * stages the $Bitmap record first, so the volume
 		 * $Bitmap ($Bitmap:$DATA) opens before $MFT:$DATA —
@@ -2147,11 +2203,22 @@ static void test_truncate_shrink_journaled(void)
 		CHECK_EQ(s.target_attr[17], 0x18u);
 		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
 		CHECK_EQ(s.target_attr[18], 0x18u);
-		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
+		/* The $FILE_NAME record names the new sizes (64 KiB)
+		 * and undoes to the old ones (256 KiB); the parent's
+		 * record is addressed through $MFT:$DATA, like the
+		 * file's own. */
+		CHECK_EQ(s.fn_redo_data, 64u * 1024u);
+		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
+		CHECK_EQ(s.fn_redo_alloc, 64u * 1024u);
+		CHECK_EQ(s.fn_undo_alloc, 256u * 1024u);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[19]);
 		/* The ClearBits frees 48 clusters, one run. (The
 		 * SetBits fields still hold the create's 1-bit record;
 		 * the clear has its own capture.) */
@@ -2181,20 +2248,28 @@ static void test_truncate_shrink_journaled(void)
 	}
 	(void)i;
 
-	/* Replay copy 1: three records redo — the create's sizes
-	 * and SetBits, and the truncate's ClearBits. The truncate's
-	 * sizes record is skipped by the file record's MR_LSN stamp
-	 * (the commit stamped it and the sync flushed it), as is the
-	 * pairs record. Two clusters are written, not one: the
-	 * create's SetBits lands on the $MFT:$BITMAP cluster and the
+	/* Replay copy 1: four records redo — the create's sizes
+	 * and SetBits, the truncate's ClearBits, and the truncate's
+	 * $FILE_NAME record. The truncate's sizes record is skipped
+	 * by the file record's MR_LSN stamp (the commit stamped it
+	 * and the sync flushed it), as is the pairs record — but
+	 * the $FILE_NAME record is NOT skipped: the commit stamps
+	 * MR_LSN only into the file's record, not the parent's, so
+	 * the parent's record carries no stamp to skip on (the same
+	 * as record 0, whose stamp the replay applies itself).
+	 * The redo is idempotent — it writes the same duplicated
+	 * sizes the sync already flushed — and it writes the
+	 * parent's record, so two MFT records are written, not
+	 * one. Two clusters are written, not one: the create's
+	 * SetBits lands on the $MFT:$BITMAP cluster and the
 	 * truncate's ClearBits on the volume $Bitmap's own cluster
 	 * — before the bitmap fix both landed on the same (wrong)
 	 * cluster and the count was 1. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.records_redone, 4u);
+	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
@@ -2205,12 +2280,12 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * three records. Replay is idempotent. */
+	 * four records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.records_redone, 4u);
+	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 
 	unlink(orig);
@@ -2247,13 +2322,19 @@ static void test_truncate_extend_journaled(void)
 	CHECK(ino > 16);
 
 	/* Shrink journaled, then extend back to 256 KiB journaled: the
-	 * walk then holds the create (14) + shrink (10) + extend (8)
-	 * = 32. The extend is what this test reads. It allocates
+	 * walk then holds the create (14) + shrink (11) + extend (10)
+	 * = 35. The extend is what this test reads. It allocates
 	 * nothing: the expand takes the hole path (HOLES_OK), so the
 	 * run list gains a 48-cluster hole and the file flips sparse
 	 * — the pairs record carries the old and new header (flags,
 	 * name_off, pairs_off 0x40 -> 0x48) and there is no $Bitmap
-	 * record at all, so the extend has a single open ($DATA). */
+	 * record at all, so the extend has a single open ($DATA).
+	 * The flip also sets the sparse bit in the $STANDARD_
+	 * INFORMATION flags, which the truncate stages as a fourth
+	 * data record (UpdateResidentValue) so the replay keeps the
+	 * $DATA and $SI in agreement — and a fifth, the parent's
+	 * $FILE_NAME, so the replay keeps the duplicated sizes in
+	 * agreement too. */
 	err = ntfs_truncate(f, 64 * 1024);
 	CHECK_EQ(err, 0);
 	if (err)
@@ -2277,32 +2358,52 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 33);
-	if (s.n == 33) {
-		/* The extend's records sit at [24..32]: one open
+	CHECK_EQ(s.n, 35);
+	if (s.n == 35) {
+		/* The extend's records sit at [25..34]: one open
 		 * ($DATA — no $Bitmap record, so $BITMAP never
-		 * opens), then pairs, sizes, the $SI flags record,
-		 * Commit, dumps, Forget. The extend gains the $SI
-		 * record because the hole path flips the file sparse. */
-		CHECK_EQ(s.redo_op[24], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[24], 0x18u);
-		CHECK_EQ(s.redo_op[25], LOP_UpdateMappingPairs);
+		 * opens), then pairs, sizes, the $SI flags, the
+		 * parent's $FILE_NAME, Commit, dumps, Forget. The
+		 * shrink's records sit at [14..24] (its $FILE_NAME
+		 * at [19], as in the shrink test). */
+		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.redo_op[25], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[25], 0x18u);
-		CHECK_EQ(s.redo_op[26], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[26], LOP_UpdateMappingPairs);
 		CHECK_EQ(s.target_attr[26], 0x18u);
-		CHECK_EQ(s.redo_op[27], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[27], LOP_SetNewAttributeSizes);
 		CHECK_EQ(s.target_attr[27], 0x18u);
-		CHECK_EQ(s.redo_op[28], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[29], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[30], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[31], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[32], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[28], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[28], 0x18u);
+		CHECK_EQ(s.redo_op[29], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[29], 0x18u);
+		CHECK_EQ(s.redo_op[30], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[31], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[32], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[33], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[34], LOP_ForgetTransaction);
+		/* The extend's $FILE_NAME record (the last one the
+		 * collector saw) names the new sizes (256 KiB) and
+		 * undoes to the old ones (64 KiB); the sparse flag
+		 * flips with it (0x200 set, 0x0 undone). */
+		CHECK_EQ(s.fn_redo_data, 256u * 1024u);
+		CHECK_EQ(s.fn_undo_data, 64u * 1024u);
+		CHECK_EQ(s.fn_redo_alloc, 64u * 1024u);
+		CHECK_EQ(s.fn_undo_alloc, 64u * 1024u);
+		/* The flags flip sparse (0x200) with no ARCHIVE bit:
+		 * this driver never sets ARCHIVE on the file, so the
+		 * undo is 0x00 — the entry's flags, like the $SI's,
+		 * carry only the sparse bit. */
+		CHECK_EQ(s.fn_redo_flags, 0x200u);
+		CHECK_EQ(s.fn_undo_flags, 0u);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[29]);
 		/* The $SI record sets the sparse bit (0x200) and
 		 * undoes to clear (0x0) — the $DATA flag flips in
 		 * step, so the two agree after replay either way. */
 		CHECK_EQ(s.res_redo, 0x200u);
 		CHECK_EQ(s.res_undo, 0u);
-		CHECK_EQ(s.res_lsn, s.lsn[27]);
+		CHECK_EQ(s.res_lsn, s.lsn[28]);
 		/* No bitmap record in the extend: the ClearBits
 		 * fields still hold the shrink's 48-cluster free. */
 		CHECK_EQ(s.clear_bits_count, 48u);
@@ -2310,22 +2411,27 @@ out:
 		/* The sizes record names the new data size. */
 		CHECK_EQ(s.sizes_redo_data, 256u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 64u * 1024u);
-		CHECK_EQ(s.sizes_lsn, s.lsn[26]);
+		CHECK_EQ(s.sizes_lsn, s.lsn[27]);
 		/* The pairs record is the $DATA attribute, at the
 		 * same record offset as the sizes record. */
-		CHECK_EQ(s.record_off[25], s.record_off[26]);
+		CHECK_EQ(s.record_off[26], s.record_off[27]);
 	}
 
-	/* Replay: three records redo — the create's sizes and SetBits
-	 * and the shrink's ClearBits. The extend adds none: its pairs
-	 * and sizes are skipped by the file record's MR_LSN stamp
-	 * (the commit stamped it and the sync flushed it), and it has
-	 * no $Bitmap record to redo. */
+	/* Replay: five records redo — the create's sizes and SetBits,
+	 * the shrink's ClearBits, and the two $FILE_NAME records
+	 * (shrink's and extend's). The extend adds no pairs, sizes or
+	 * $SI redo: those are skipped by the file record's MR_LSN
+	 * stamp (the commit stamped it and the sync flushed it), and
+	 * it has no $Bitmap record to redo. The $FILE_NAME records
+	 * redo because the commit stamps MR_LSN only into the file's
+	 * record, not the parent's (see the shrink test) — the redo
+	 * is idempotent and writes the parent's record, so two MFT
+	 * records are written, not one. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.records_redone, 5u);
+	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);

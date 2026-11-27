@@ -1344,6 +1344,31 @@ int ntfs_log_txn_update_resident(ntfs_log_txn_t *t, uint32_t mft_attr,
 		       old_len);
 }
 
+/*
+ * UpdateFileNameRoot: the duplicated $FILE_NAME values (FN_DUP_SIZE
+ * bytes at FN_DUP_OFFSET into the index entry's key, at @attr_off in
+ * the $INDEX_ROOT attribute at @record_off in the parent's record)
+ * take @new_dup on redo and @old_dup on undo. The redo and undo ops
+ * are the same (LOP_UpdateFileNameRoot); the payload is the dup
+ * bytes only, not the whole entry — the name and times are not
+ * touched. The replay writes the payload at the entry's dup offset
+ * (see logfile_replay.c), so the caller must pass the entry's offset
+ * in the attribute, not the record.
+ */
+int ntfs_log_txn_update_filename_root(ntfs_log_txn_t *t, uint32_t mft_attr,
+				      uint64_t target_vcn, uint16_t cluster_off,
+				      uint64_t page_lcn, uint16_t record_off,
+				      uint16_t attr_off, const void *new_dup,
+				      const void *old_dup)
+{
+	if (!new_dup || !old_dup)
+		return -EINVAL;
+	return txn_add(t, LOP_UpdateFileNameRoot, LOP_UpdateFileNameRoot,
+		       mft_attr, 1, record_off, attr_off, cluster_off,
+		       target_vcn, &page_lcn, new_dup, FN_DUP_SIZE, old_dup,
+		       FN_DUP_SIZE);
+}
+
 int ntfs_log_txn_set_bitmap(ntfs_log_txn_t *t, uint32_t bitmap_attr,
 			    uint64_t target_vcn, uint16_t cluster_off,
 			    uint64_t page_lcn, uint32_t bit, uint32_t nbits,
