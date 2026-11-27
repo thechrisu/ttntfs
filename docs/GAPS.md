@@ -412,10 +412,10 @@ semantics above. The test walks the log from the oldest LSN,
 not 0 — 0 starts at the current checkpoint, which the commit's
 own checkpoint moved past the data records, so the walk saw
 only the dumps and the Forget.
-Tests: new `core/tests/test_journal.c` (80 checks, 0
+Tests: new `core/tests/test_journal.c` (84 checks, 0
 failures) — `test_create_journaled` (create `sub/j.txt` in a
-driver-made directory: walk shows exactly 13 records — 8
-data in order, Commit, 3 dumps, Forget; `$FILE_NAME` create
+driver-made directory: walk shows exactly 15 records — 2
+open, 8 data in order, Commit, 3 dumps, Forget; `$FILE_NAME` create
 carries "j.txt" in UTF-16LE; SetBits bit is the file's MFT
 number, count 1; both touched records carry an `MR_LSN` at
 or past their touching record; replay redoes exactly 1
@@ -430,8 +430,61 @@ The journaled test fails without the wiring (forced
 unjournaled: walk 0 records, `MR_LSN` 0, replay redoes 0 —
 10 failures), so it is live, not vacuous. Logfile suite
 stays 4900 checks, 0 failures.
-Still to do in Phase 2: step 3 (crash tests in
-`core/tests/test_crash.c`).
+Phase 2, step 3 (crash tests, in progress 2026-11-27): new
+`test_journaled_create_cut_points` in `core/tests/test_crash.c`
+sweeps 17 sampled cut points through one journaled create
+(`d/j.txt`, `d` a driver-made subdirectory — root creates are
+unjournaled by design): per cut it records the pre-replay
+`ntfsck` verdict, replays via `ntfs_logfile_replay_device()`,
+then checks post-replay `ntfsck`, remount lookup of the file,
+and that a second replay is a no-op. The first sweep found
+three real bugs (24 failures). Fix 1, landed 2026-11-27
+(commit, this round): the writer now emits one
+`OpenNonresidentAttribute` record per distinct attribute the
+transaction touches, before its data records
+(`txn_append_open_records` in `core/logfile/logfile_write.c`,
+appended directly — not via `txn_append_one` — so it touches
+no dirty page, but it does set the transaction's
+`first_lsn`). Replay's analysis learns the open-attribute
+table from these records (LOGFILE.md §3 step 4); without
+them the first create after a mount was unreplayable when
+its commit checkpoint never landed — the two attributes were
+opened at writer-open (new slots `0x68`/`0x90`, the
+checkpoint's `0x18`/`0x40` are stale duplicates from the
+previous session) and only the commit's checkpoint would
+have registered them, so analysis failed "open attribute
+entry `0x68` not allocated" and refused the volume. The redo
+payload is the writer's open-attribute table entry
+(`OA1_SIZE` bytes; the reader copies bytes 4..`OA1_SIZE`),
+the undo payload is the attribute name if it has one, and
+the `OA1_OPEN_RECORD_LSN` field keeps its open-time value
+(informational only — replay never decides on it — and the
+checkpoint dump carries the same value, so the two paths
+agree). A journaled create is now 15 records (was 13), a
+synthetic create 14 (was 12); the redo pass skips the open
+records (`lcns == 0`), so `records_redone` counts data
+records only. New unit test
+`test_journal_create_first_txn_uncommitted` (logfile suite
+4930 checks, 0 failures): a first transaction faulted
+mid-commit before any checkpoint, over a checkpoint that
+predates the attributes — without the fix replay fails
+`-EINVAL`, with it replay redoes the landed records and
+undoes exactly those and the file never appears (negative
+control: disabling the emission fails the new test with
+`-EINVAL`, plus the count assertions that depend on the open
+records). Crash sweep after fix 1: 379 checks, 8 failures —
+cuts 22/25 now replay (were refused) but still fail `ntfsck`
+with "Failed to open inode(65)", which is fix 2. Still to do
+in step 3: fix 2 (journal the `$MFT` `$DATA` size extension
+the create performs — the step-2 note "`$MFT` extension is
+unjournaled but self-consistent" is wrong: the extension
+lands on disk, replay never restores it, and the new record
+lies beyond `$MFT`'s stated size so `ntfsck` refuses it),
+fix 3 (analysis counts a phantom active transaction when a
+close checkpoint's table dumps re-allocate the just-freed
+transaction-table entry — benign for state, wrong
+accounting), then the crash sweep itself, which lands when
+it goes green.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

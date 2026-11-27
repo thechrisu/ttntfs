@@ -1354,6 +1354,109 @@ static int txn_append_one(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len,
 	return 0;
 }
 
+/* Append one OpenNonresidentAttribute record per distinct attribute the
+ * transaction touches, before its data records. Replay's analysis learns
+ * the open-attribute table from these records (docs/LOGFILE.md §3 step
+ * 4): without them, a transaction whose commit checkpoint never lands
+ * is unreplayable — the reader fails "open attribute entry ... not
+ * allocated" even though the data records are all durable. That was the
+ * first create after a mount (step-3 crash sweep cuts 22/25): the two
+ * attributes were opened at writer-open and only the commit's checkpoint
+ * would have registered them.
+ *
+ * The redo payload is the writer's open-attribute table entry for the
+ * attribute (OA1_SIZE bytes; the reader copies bytes 4..OA1_SIZE and
+ * ignores the table-entry header in bytes 0..3). The undo payload is
+ * the attribute name, if it has one (the reader stashes it in the
+ * names blob); unnamed attributes carry no undo. The record's
+ * target_vcn is 0 and it carries no page LCNs: it touches no page, so
+ * it must not stamp any dirty-page oldest LSN, and it is appended
+ * directly (not via txn_append_one) for the same reason — but it does
+ * set the transaction's first_lsn, since it is the transaction's first
+ * record. The data records' undo chain is unaffected (the first data
+ * record's header undo_next is 0, and the undo pass never reaches
+ * these records: their undo op is Noop).
+ *
+ * The OA1_OPEN_RECORD_LSN field in the copied entry still holds the
+ * value from open_attr time: the record's own LSN is only known after
+ * the append. The field is informational only — replay never uses it
+ * for a decision (it is surfaced by the ntfslog tooling) — and the
+ * checkpoint dump carries the same value, so the two paths agree.
+ */
+static int txn_append_open_records(ntfs_log_txn_t *t)
+{
+	ntfs_log_writer_t *w = t->w;
+	uint32_t *seen;
+	size_t nseen = 0, pos = 0;
+	int err = 0;
+
+	seen = malloc((t->nstaged ? t->nstaged : 1) * sizeof(*seen));
+	if (!seen)
+		return -ENOMEM;
+	while (pos < t->stage_len) {
+		uint32_t len = lf_get32(t->stage + pos);
+		const uint8_t *rec = t->stage + pos + 4;
+		uint32_t ta = lf_get16(rec + NR_TARGET_ATTRIBUTE);
+		size_t i;
+		bool dup = false;
+
+		for (i = 0; i < nseen; i++) {
+			if (seen[i] == ta) {
+				dup = true;
+				break;
+			}
+		}
+		if (!dup) {
+			const uint8_t *e;
+			const uint16_t *name = NULL;
+			uint16_t name_len = 0;
+			uint32_t p = 0;
+			uint8_t *ce;
+			uint32_t n;
+			uint64_t lsn;
+
+			seen[nseen++] = ta;
+			if (!lfs_table_entry_ok(&w->oatbl, ta)) {
+				err = -EINVAL;
+				break;
+			}
+			e = w->oatbl.buf + ta;
+			/* The attribute's name, if it has one, lives in
+			 * the names blob as (entry offset, byte length,
+			 * UTF-16LE bytes), terminated by a zero entry. */
+			while (p + AN_NAME <= w->attr_names_len) {
+				uint16_t eo = lf_get16(w->attr_names + p + AN_OFFSET);
+				uint16_t nb = lf_get16(w->attr_names + p + AN_NAME_BYTES);
+
+				if (!eo || p + AN_NAME + nb > w->attr_names_len)
+					break;
+				if (eo == ta) {
+					name = (const uint16_t *)(w->attr_names + p + AN_NAME);
+					name_len = nb;
+					break;
+				}
+				p += AN_NAME + nb;
+			}
+			err = txn_build_crec(LOP_OpenNonresidentAttribute, LOP_Noop,
+					     ta, 0, 0, 0, 0, 0, NULL,
+					     e, OA1_SIZE,
+					     name, name_len, &ce, &n);
+			if (err)
+				break;
+			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
+						     t->tid, 0, ce, n, &lsn);
+			free(ce);
+			if (err)
+				break;
+			if (!t->first_lsn)
+				t->first_lsn = lsn;
+		}
+		pos += 4 + len;
+	}
+	free(seen);
+	return err;
+}
+
 int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 			uint64_t *last_lsn_out)
 {
@@ -1378,7 +1481,13 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 		txn_free(t);
 		return 0;
 	}
-	while (pos < t->stage_len) {
+	/* The open records come first: replay's analysis needs the
+	 * attributes registered before it can apply any data record
+	 * (see txn_append_open_records). A failure here fails the
+	 * commit; the caller falls back to an unjournaled operation
+	 * rather than logging a transaction replay cannot apply. */
+	err = txn_append_open_records(t);
+	while (!err && pos < t->stage_len) {
 		uint32_t len = lf_get32(t->stage + pos);
 		uint64_t lsn;
 

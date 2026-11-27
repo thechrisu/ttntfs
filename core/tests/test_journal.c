@@ -38,7 +38,7 @@
  * driver that wrote it.
  *
  * Without the Phase 2 wiring the create test fails at the walk: the
- * log holds no client records at all (s.n == 0, not 13).
+ * log holds no client records at all (s.n == 0, not 15).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -490,34 +490,40 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: exactly one transaction, 8 data + Commit + 3 dumps
-	 * + Forget, in the order the create staged them. */
+	/* The walk: exactly one transaction, 2 open + 8 data + Commit +
+	 * 3 dumps + Forget, in the order the create staged them. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 13);
-	if (s.n == 13) {
+	CHECK_EQ(s.n, 15);
+	if (s.n == 15) {
 		static const uint16_t want_op[8] = {
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
 			LOP_AddIndexEntryRoot, LOP_SetBitsInNonresidentBitMap,
 		};
+		/* The two open records come first, one per attribute the
+		 * transaction touches, in first-use order. */
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
 		for (i = 0; i < 8; i++) {
-			CHECK_EQ(s.redo_op[i], want_op[i]);
+			CHECK_EQ(s.redo_op[i + 2], want_op[i]);
 			/* First seven target $MFT:$DATA (0x18); the
 			 * SetBits targets $MFT:$BITMAP (0x40). */
-			CHECK_EQ(s.target_attr[i], i < 7 ? 0x18u : 0x40u);
+			CHECK_EQ(s.target_attr[i + 2], i < 7 ? 0x18u : 0x40u);
 		}
-		CHECK_EQ(s.redo_op[8], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[9], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[10], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[11], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[12], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[10], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[11], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_ForgetTransaction);
 		/* The $FILE_NAME create is the last CreateAttribute, the
 		 * record right before the index entry. */
-		lsn_fn = s.lsn[5];
-		lsn_index = s.lsn[6];
-		CHECK_EQ(s.redo_op[5], LOP_CreateAttribute);
-		CHECK_EQ(s.redo_op[6], LOP_AddIndexEntryRoot);
+		lsn_fn = s.lsn[7];
+		lsn_index = s.lsn[8];
+		CHECK_EQ(s.redo_op[7], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[8], LOP_AddIndexEntryRoot);
 	}
 	/* The name appears in exactly one CreateAttribute's redo: the
 	 * $FILE_NAME one, and it is the record before the index entry. */
@@ -526,9 +532,9 @@ out:
 	/* The SetBits names the new record number, one bit. */
 	CHECK_EQ(s.bits_bit, (uint32_t)ino);
 	CHECK_EQ(s.bits_count, 1u);
-	CHECK_EQ(s.bits_lsn, s.lsn[7]);
+	CHECK_EQ(s.bits_lsn, s.lsn[9]);
 	/* The SetBits targets the bitmap's first cluster. */
-	CHECK_EQ(s.target_vcn[7], 0u);
+	CHECK_EQ(s.target_vcn[9], 0u);
 
 	/* Both touched records carry an MR_LSN at or past the record
 	 * that touched them: the replay's skip check. */

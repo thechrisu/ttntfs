@@ -3037,29 +3037,35 @@ static void test_journal_create_commit(void)
 	ntfs_log_writer_free(w);
 	ntfs_logfile_close(log);
 
-	/* Walk the log from the first record: 7 data + Commit + 3 table
-	 * dumps + Forget (the restart record is CLIENT_RESTART, which the
-	 * collector skips). */
+	/* Walk the log from the first record: 2 open + 7 data + Commit +
+	 * 3 table dumps + Forget (the restart record is CLIENT_RESTART,
+	 * which the collector skips). */
 	log = open_log(&m, &io);
 	memset(&s, 0, sizeof(s));
 	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
-	CHECK_EQ(s.n, 12);
-	if (s.n == 12) {
+	CHECK_EQ(s.n, 14);
+	if (s.n == 14) {
 		static const uint16_t want_op[7] = {
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
 			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
 			LOP_SetBitsInNonresidentBitMap,
 		};
+		/* The two open records come first, one per attribute the
+		 * transaction touches, in first-use order. */
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
 		for (i = 0; i < 7; i++) {
-			CHECK_EQ(s.redo_op[i], want_op[i]);
-			CHECK_EQ(s.target_attr[i], i < 6 ? 0x18u : 0x40u);
+			CHECK_EQ(s.redo_op[i + 2], want_op[i]);
+			CHECK_EQ(s.target_attr[i + 2], i < 6 ? 0x18u : 0x40u);
 		}
-		CHECK_EQ(s.redo_op[7], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[8], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[9], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[10], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[11], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[9], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[10], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[11], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
 		for (i = 0; i < s.n; i++) {
 			if (s.redo_op[i] == LOP_CreateAttribute &&
 			    s.target_vcn[i] == NEW_REC * VRS / VCS &&
@@ -3342,13 +3348,112 @@ static int build_uncommitted_log(uint8_t *buf, int budget, int *landed)
 	return -EIO;
 }
 
+/* Like build_uncommitted_log, but the faulted transaction is the FIRST
+ * one after the writer opened the attributes: no commit checkpoint has
+ * ever dumped them, so replay can only learn the open attributes from
+ * the transaction's own OpenNonresidentAttribute records. Without those
+ * records replay refuses the log (-EINVAL, "open attribute entry ...
+ * not allocated") even though the data records are durable; with them
+ * it redoes the landed records and undoes exactly those, and the file
+ * never appears. This is the step-3 crash sweep's cuts 22/25 at the
+ * unit level. *landed counts data records only (the two open records
+ * are skipped by both replay passes). */
+static int build_first_txn_uncommitted_log(uint8_t *buf, int budget, int *landed)
+{
+	struct memio m;
+	struct fault_memio f;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct ntfs_log_geometry g = { 4096, 1024, 512 };
+	struct rec_seen s;
+	uint64_t first_lsn = 0;
+	int err, i;
+
+	*landed = 0;
+	m.buf = buf;
+	memset(buf, 0xff, LSIZE);
+	m.size = LSIZE;
+	m.writes = 0;
+	f.m = &m;
+	f.limit = -1;
+	f.writes = 0;
+	memset(&io, 0, sizeof(io));
+	io.ctx = &f;
+	io.size = LSIZE;
+	io.read = fault_mem_read;
+	io.write = fault_mem_write;
+	err = ntfs_log_writer_format(&io, &g, LSIZE);
+	if (err)
+		return err;
+	log = open_log_keep_io(&io);
+	err = ntfs_log_writer_open(log, &w);
+	if (err)
+		return err;
+	/* A checkpoint that predates the attributes, as a mount-open
+	 * checkpoint does in real life: the previous session's close
+	 * wrote it, and this session's attributes are new slots it
+	 * does not contain. Without it replay would bail at "no
+	 * checkpoint: nothing was ever logged" and the test would be
+	 * vacuous; with it, replay walks the open records and the data
+	 * records that follow. */
+	err = ntfs_log_writer_checkpoint(w, NULL);
+	if (err)
+		return err;
+	err = ntfs_log_writer_open_attr(w, ATTR_TYPE_DATA, 0, 0, NULL, 0, NULL);
+	if (err)
+		return err;
+	err = ntfs_log_writer_open_attr(w, ATTR_TYPE_BITMAP, 0, 0, NULL, 0, NULL);
+	if (err)
+		return err;
+	err = ntfs_log_txn_begin(w, &t);
+	if (err)
+		return err;
+	err = stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			   (uint64_t)-1);
+	if (err)
+		return err;
+	f.limit = budget;
+	err = ntfs_log_txn_commit(t, &first_lsn, NULL);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+	if (err != -EIO)
+		return err;
+	/* Count the durable data records (the two open records first).
+	 * The walk starts at the transaction's first record: no
+	 * checkpoint exists yet, so a walk from 0 would find no start
+	 * LSN and return nothing. */
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m;
+	io.size = LSIZE;
+	io.read = mem_read;
+	io.write = mem_write;
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	if (ntfs_logfile_walk(log, first_lsn, collect_rec, &s) != 0) {
+		ntfs_logfile_close(log);
+		return -EIO;
+	}
+	ntfs_logfile_close(log);
+	for (i = 0; i < s.n; i++) {
+		if (s.redo_op[i] == LOP_OpenNonresidentAttribute)
+			continue;
+		(*landed)++;
+	}
+	return -EIO;
+}
+
 /* A commit that dies mid-append leaves an ACTIVE transaction, and replay
  * undoes it: the second file never appears, bit 41 stays clear, the first
  * file survives. The fault budget is found adaptively: how many writes one
  * append costs depends on tail copies and page spanning, so budgets are
- * tried in order until one leaves at least one second-transaction record
- * durable (a torn spanning record leaves nothing to undo, which is also
- * correct — but it would make this test vacuous, so the loop skips it). */
+ * tried in order until one leaves at least one second-transaction data
+ * record durable (a torn spanning record leaves nothing to undo, which
+ * is also correct — but it would make this test vacuous, so the loop
+ * skips it). The landed count includes the transaction's two open
+ * records, which redo/undo skip, so the redo/undo counts subtract
+ * them. */
 static void test_journal_create_uncommitted(void)
 {
 	uint8_t *buf = malloc(LSIZE);
@@ -3367,14 +3472,15 @@ static void test_journal_create_uncommitted(void)
 	m.writes = 0;
 	for (budget = 1; budget <= 16; budget++) {
 		err = build_uncommitted_log(buf, budget, &landed);
-		if (err == -EIO && landed >= 1)
+		if (err == -EIO && landed >= 3)
 			break;
 	}
 	CHECK_EQ(err, -EIO);
-	CHECK(landed >= 1);
+	CHECK(landed >= 3);
 
 	/* Replay redoes the first transaction's 7 records plus the landed
-	 * second-transaction records, then undoes exactly the landed ones. */
+	 * second-transaction data records, then undoes exactly the
+	 * landed ones (the 2 open records are skipped on both passes). */
 	vol_init(&v);
 	vol_apply(&v, &ap);
 	memset(&io, 0, sizeof(io));
@@ -3386,8 +3492,8 @@ static void test_journal_create_uncommitted(void)
 	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
 	CHECK_EQ(res.transactions_committed, 0);	/* first txn forgotten */
 	CHECK_EQ(res.transactions_active, 1);
-	CHECK_EQ(res.records_redone, 7 + (uint32_t)landed);
-	CHECK_EQ(res.records_undone, (uint32_t)landed);
+	CHECK_EQ(res.records_redone, 7 + (uint32_t)landed - 2);
+	CHECK_EQ(res.records_undone, (uint32_t)landed - 2);
 	CHECK(!res.needs_chkdsk);
 	/* First file present, second file rolled back. */
 	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
@@ -3395,6 +3501,60 @@ static void test_journal_create_uncommitted(void)
 	CHECK_EQ(v_read_mft(&v, NEW_REC2, got), 0);
 	CHECK(!(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE));
 	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5] & 0x02, 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(buf);
+}
+
+/* The first transaction after the attributes were opened, faulted
+ * mid-commit before any checkpoint: replay must still redo the landed
+ * records and undo exactly those — the open records are what make the
+ * attributes known to the analysis. Without them this replay fails
+ * -EINVAL (the step-3 crash sweep's cuts 22/25). The budget loop
+ * needs at least one landed data record, as in the test above. */
+static void test_journal_create_first_txn_uncommitted(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t got[VRS];
+	int landed = 0, budget, err = 0;
+
+	printf("test_journal_create_first_txn_uncommitted\n");
+	m.buf = buf;
+	m.size = LSIZE;
+	m.writes = 0;
+	for (budget = 1; budget <= 24; budget++) {
+		err = build_first_txn_uncommitted_log(buf, budget, &landed);
+		if (err == -EIO && landed >= 1)
+			break;
+	}
+	CHECK_EQ(err, -EIO);
+	CHECK(landed >= 1);
+
+	/* Replay redoes exactly the landed records, then undoes them:
+	 * the file never appears, bit 40 stays clear. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	memset(&io, 0, sizeof(io));
+	io.ctx = &m;
+	io.size = LSIZE;
+	io.read = mem_read;
+	io.write = mem_write;
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK_EQ(res.transactions_committed, 0);
+	CHECK_EQ(res.transactions_active, 1);
+	CHECK_EQ(res.records_redone, (uint32_t)landed);
+	CHECK_EQ(res.records_undone, (uint32_t)landed);
+	CHECK(!res.needs_chkdsk);
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	CHECK(!(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE));
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5] & 0x01, 0);
 	ntfs_logfile_close(log);
 	free(v.disk);
 	free(buf);
@@ -3467,6 +3627,7 @@ int main(void)
 	test_journal_create_commit();
 	test_journal_create_abort();
 	test_journal_create_uncommitted();
+	test_journal_create_first_txn_uncommitted();
 	test_journal_create_bad_vcn();
 	test_images();
 	printf("%d checks, %d failures\n", checks, failures);
