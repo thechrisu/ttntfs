@@ -1143,29 +1143,44 @@ The sweep found no bug. Phase 3, reparse (mknod half) — glue landed
 journaled transaction. `ntfs_journal_create_begin` begins for
 S_ISBLK/S_ISCHR/S_ISSOCK/S_ISFIFO, and the device branch of
 `__ntfs_create` stages `ntfs_journal_create_reparse` right after
-`ntfs_reparse_set_wsl_not_symlink` — the same three records as the
-symlink branch ($REPARSE_POINT, the $R entry, the $SI flags). It
-works as-is because the reparse set populates `ni->reparse_tag`
-(through `ntfs_set_ntfs_reparse_data`) and `ni->flags` gains
-FILE_ATTR_REPARSE_POINT there; the $SI staging reads old from the
-mapped record (FILE_ATTR_SYSTEM, the device branch's RECALL_ON_OPEN
-write goes to the $SI copy, not the record) and new from `ni->flags`
-(RECALL_ON_OPEN|REPARSE_POINT). The commit path is mode-agnostic
-(commit + MR_LSN stamps into the file, the parent and $Reparse),
-and a device create already staged $DATA, $EA and $FILE_NAME, so
-begin + the one staging call close the class. Evidence:
-`test_journal.c` 1575 checks, 0 failures (was 1480; new
-test_mknod_journaled: walk 19 records — 2 opens + 12 data ($MFT
-$DATA sizes, Initialize, $SD, $DATA, $REPARSE_POINT, $R entry, $SI
-flags, $EA_INFORMATION, $EA, $FILE_NAME, $I30 entry, SetBits) +
-Commit + 3 dumps + Forget; $SI redo 0x40400 undo 0x4; MR_LSN
-stamped into the file, the parent and $Reparse; replay redoes 2;
-device reads back S_IFCHR|0644 with REPARSE_POINT and RECALL_ON_OPEN
-on its $SI, tag 0x80000025 and $R count 1; second replay redoes 2
-and the $R entry is still exactly one; `ntfsck` clean). Crash tests
-in the follow-up commit (this round). Follow-ups, not this class:
-no VFS operation sets reparse data on an existing file, so there is
-no standalone reparse-set class to journal.
+`ntfs_reparse_set_wsl_not_symlink` — the $REPARSE_POINT and the $R
+entry. It works as-is because the reparse set populates
+`ni->reparse_tag` (through `ntfs_set_ntfs_reparse_data`) and
+`ni->flags` gains FILE_ATTR_REPARSE_POINT there. The $SI flags are
+staged separately, by a new `ntfs_journal_create_si_flags`, after
+the $FILE_NAME is built: `ni->flags` is only final once
+`__ntfs_create` folds `fn->file_attributes` back into it, so the
+staged new value is `fn->file_attributes | (ni->flags &
+FILE_ATTRIBUTE_RECALL_ON_OPEN)` — the same formula as the fold. The
+first version staged from `ni->flags` at the reparse set and the
+mknod crash sweep caught it: it replayed a device's $SI without
+SYSTEM (0x40400, live 0x40404) and a dir-link's without
+DUP_FILE_NAME_INDEX_PRESENT (0x400, live 0x10000400) — the $SI and
+$FILE_NAME copies disagreed after replay, depending on whether the
+record had been flushed. The fix (this round, follow-up commit)
+moved the staging after the $FILE_NAME for all reparse creates.
+The commit path is mode-agnostic (commit + MR_LSN stamps into the
+file, the parent and $Reparse), and a device create already staged
+$DATA, $EA and $FILE_NAME, so begin + the staging calls close the
+class. Evidence: `test_journal.c` 1586 checks, 0 failures (was 1480;
+new test_mknod_journaled: walk 19 records — 2 opens + 12 data ($MFT
+$DATA sizes, Initialize, $SD, $DATA, $REPARSE_POINT, $R entry,
+$EA_INFORMATION, $EA, $FILE_NAME, $SI flags, $I30 entry, SetBits) +
+Commit + 3 dumps + Forget; $SI redo 0x40404 undo 0x4, live and
+replayed $SI agree at 0x40404; MR_LSN stamped into the file, the
+parent and $Reparse; replay redoes 2; device reads back S_IFCHR|0644
+with REPARSE_POINT and RECALL_ON_OPEN on its $SI, tag 0x80000025
+and $R count 1; second replay redoes 2 and the $R entry is still
+exactly one; `ntfsck` clean; the symlink and dir-link walks moved
+their $SI update after the $FILE_NAME create too — res_redo 0x400
+for a plain/WSL link, 0x10000400 for a dir-link, live and replayed
+$SI agreeing in both cases). Crash tests in the follow-up commit
+(this round). Follow-ups, not this class: no VFS operation sets
+reparse data on an existing file, so there is no standalone
+reparse-set class to journal; the mkdir class never stages a $SI
+flags update at all, so a replayed directory's $SI carries the
+as-added flags instead of the final DUP_FILE_NAME_INDEX_PRESENT —
+the same shape, unasserted there.
 Next: the reparse crash tests, then the compressed-write class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)

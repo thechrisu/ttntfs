@@ -4275,9 +4275,16 @@ out_dev:
  * $SD / $DATA-or-$INDEX_ROOT / $REPARSE_POINT / $FILE_NAME creates,
  * the $R index entry, the $SI flags, the parent index entry and the
  * SetBits — in that order. */
+/* The walk checker for a journaled symlink create, shared by the
+ * plain, WSL-tag and dir-link cases. @si_redo is the $SI flags value
+ * the create stages: FILE_ATTR_REPARSE_POINT (0x400) for a plain or
+ * WSL link, plus FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT (0x10000000)
+ * for a dir-link — the $SI staging runs after the $FILE_NAME is
+ * built, so it carries the final ni->flags, not the reparse set's
+ * half-built one. */
 static void check_symlink_walk(struct rec_seen *s, const char *snap,
 			       uint64_t ino, uint64_t sub_ino,
-			       uint64_t rp_ino)
+			       uint64_t rp_ino, uint32_t si_redo)
 {
 	uint64_t mrlsn_file = 0, mrlsn_dir = 0, mrlsn_rp = 0,
 		 lsn_fn = 0, lsn_index = 0, lsn_r = 0;
@@ -4291,8 +4298,8 @@ static void check_symlink_walk(struct rec_seen *s, const char *snap,
 			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
-			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
-			LOP_CreateAttribute, LOP_AddIndexEntryRoot,
+			LOP_AddIndexEntryRoot, LOP_CreateAttribute,
+			LOP_UpdateResidentValue, LOP_AddIndexEntryRoot,
 			LOP_SetBitsInNonresidentBitMap,
 		};
 		CHECK_EQ(s->redo_op[0], LOP_OpenNonresidentAttribute);
@@ -4312,13 +4319,15 @@ static void check_symlink_walk(struct rec_seen *s, const char *snap,
 	CHECK_EQ(s->redo_op[15], LOP_OpenAttributeTableDump);
 	CHECK_EQ(s->redo_op[16], LOP_ForgetTransaction);
 	/* The $FILE_NAME create is the last CreateAttribute, the
-	 * record right before the parent index entry; the $R entry
-	 * and the $SI flags sit between the $REPARSE_POINT create
-	 * and the $FILE_NAME one. */
+	 * record right before the $SI flags update; the $R entry sits
+	 * between the $REPARSE_POINT create and the $FILE_NAME one,
+	 * and the $SI flags sit between the $FILE_NAME create and the
+	 * parent index entry. */
 	lsn_r = s->lsn[7];
-	lsn_fn = s->lsn[9];
+	lsn_fn = s->lsn[8];
 	lsn_index = s->lsn[10];
-	CHECK_EQ(s->redo_op[9], LOP_CreateAttribute);
+	CHECK_EQ(s->redo_op[8], LOP_CreateAttribute);
+	CHECK_EQ(s->redo_op[9], LOP_UpdateResidentValue);
 	CHECK_EQ(s->redo_op[10], LOP_AddIndexEntryRoot);
 	/* The name appears in exactly one CreateAttribute's redo: the
 	 * $FILE_NAME one. */
@@ -4329,12 +4338,14 @@ static void check_symlink_walk(struct rec_seen *s, const char *snap,
 	CHECK_EQ(s->bits_count, 1u);
 	CHECK_EQ(s->bits_lsn, s->lsn[11]);
 	CHECK_EQ(s->target_vcn[11], 0u);
-	/* The $SI flags record: the reparse set flipped
-	 * FILE_ATTR_REPARSE_POINT (0x400) on, and the as-added $SI
-	 * carried no flags at all. */
-	CHECK_EQ(s->res_redo, 0x400u);
+	/* The $SI flags record: the final ni->flags, staged after the
+	 * $FILE_NAME is built — FILE_ATTR_REPARSE_POINT (0x400) for a
+	 * plain or WSL link, plus FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT
+	 * for a dir-link — over the as-added $SI, which carried no flags
+	 * at all. */
+	CHECK_EQ(s->res_redo, si_redo);
 	CHECK_EQ(s->res_undo, 0u);
-	CHECK_EQ(s->res_lsn, s->lsn[8]);
+	CHECK_EQ(s->res_lsn, s->lsn[9]);
 	/* The $MFT $DATA size extension: exactly one record, staged
 	 * first, its redo the live size, its undo one record less. */
 	{
@@ -4456,7 +4467,7 @@ out:
 	 * 3 dumps + Forget. */
 	set_fn_name(lname);
 	CHECK_EQ(walk_log(snap, &s), 0);
-	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino);
+	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino, 0x400u);
 
 	/* Replay copy 1: the MFT records were already flushed, so only
 	 * the two records that carry no LSN to skip on redo — the $MFT
@@ -5289,6 +5300,7 @@ static void test_symlink_dir_journaled(void)
 	ntfs_inode_t *ext = NULL, *rp = NULL;
 	struct rec_seen s;
 	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
 	uint64_t ino = 0, sub_ino = 0, rp_ino = 0;
 	uint16_t flags = 0;
 	char buf[64];
@@ -5364,7 +5376,7 @@ out:
 	 * $INDEX_ROOT create is still one CreateAttribute. */
 	set_fn_name("dlink");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino);
+	check_symlink_walk(&s, snap, ino, sub_ino, rp_ino, 0x10000400u);
 
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
@@ -5381,6 +5393,14 @@ out:
 	/* The link's record is a directory record, read from the image. */
 	CHECK_EQ(read_mft_flags(snap1, ino, &flags), 0);
 	CHECK(flags & 0x0002u);
+	/* The $SI flags agree between the live snapshot and the replay:
+	 * FILE_ATTR_REPARSE_POINT plus FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT
+	 * — the dir-link's final ni->flags, which the old staging (from
+	 * ni->flags at the reparse set) missed. */
+	CHECK_EQ(attr_after_mount(snap, "sub", "dlink", &at), 0);
+	CHECK_EQ(at.file_attributes, 0x10000400u);
+	CHECK_EQ(attr_after_mount(snap1, "sub", "dlink", &at), 0);
+	CHECK_EQ(at.file_attributes, 0x10000400u);
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	unlink(orig);
@@ -5708,8 +5728,11 @@ out:
 	/* The walk: exactly one transaction, 2 open + 12 data + Commit +
 	 * 3 dumps + Forget. The data records, in staging order: the
 	 * $MFT $DATA size extension, Initialize, $SD, $DATA,
-	 * $REPARSE_POINT, $R entry, $SI flags, $EA_INFORMATION, $EA,
-	 * $FILE_NAME, $I30 entry, SetBits. */
+	 * $REPARSE_POINT, $R entry, $EA_INFORMATION, $EA, $FILE_NAME,
+	 * $SI flags, $I30 entry, SetBits. The $SI flags sit after the
+	 * $FILE_NAME: they are staged from the final ni->flags, which
+	 * only exists once fn->file_attributes is folded back into it.
+	 */
 	set_fn_name("dev");
 	CHECK_EQ(walk_log(snap, &s), 0);
 	CHECK_EQ(s.n, 19);
@@ -5718,9 +5741,9 @@ out:
 			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
-			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
+			LOP_AddIndexEntryRoot, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
-			LOP_CreateAttribute, LOP_AddIndexEntryRoot,
+			LOP_UpdateResidentValue, LOP_AddIndexEntryRoot,
 			LOP_SetBitsInNonresidentBitMap,
 		};
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
@@ -5738,14 +5761,15 @@ out:
 		CHECK_EQ(s.redo_op[16], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[17], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[18], LOP_ForgetTransaction);
-		/* The $R entry and the $SI flags sit between the
-		 * $REPARSE_POINT create and the $EA ones; the
-		 * $FILE_NAME create is the last CreateAttribute, the
-		 * record right before the parent index entry. */
+		/* The $R entry sits between the $REPARSE_POINT create
+		 * and the $EA ones; the $FILE_NAME create is the last
+		 * CreateAttribute but one — the $SI flags update follows
+		 * it, and the parent index entry follows that. */
 		lsn_r = s.lsn[7];
-		lsn_fn = s.lsn[11];
+		lsn_fn = s.lsn[10];
 		lsn_index = s.lsn[12];
-		CHECK_EQ(s.redo_op[11], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[10], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[11], LOP_UpdateResidentValue);
 		CHECK_EQ(s.redo_op[12], LOP_AddIndexEntryRoot);
 	}
 	/* The name appears in exactly one CreateAttribute's redo: the
@@ -5757,14 +5781,16 @@ out:
 	CHECK_EQ(s.bits_count, 1u);
 	CHECK_EQ(s.bits_lsn, s.lsn[13]);
 	CHECK_EQ(s.target_vcn[13], 0u);
-	/* The $SI flags record: the device branch set
-	 * FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000) and the reparse
-	 * set flipped FILE_ATTR_REPARSE_POINT (0x400) on, over the
-	 * as-added $SI, which carried FILE_ATTR_SYSTEM (0x4) — the
-	 * device branch overwrites the $SI copy, not the record. */
-	CHECK_EQ(s.res_redo, 0x40400u);
+	/* The $SI flags record: the final ni->flags, staged after the
+	 * $FILE_NAME is built — FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000)
+	 * and FILE_ATTR_REPARSE_POINT (0x400) over the as-added $SI,
+	 * which carried FILE_ATTR_SYSTEM (0x4) — the device branch
+	 * overwrites the $SI copy, not the record. Staging from
+	 * ni->flags at the reparse set would have replayed 0x40400
+	 * (no SYSTEM); the live driver lands 0x40404. */
+	CHECK_EQ(s.res_redo, 0x40404u);
 	CHECK_EQ(s.res_undo, 0x4u);
-	CHECK_EQ(s.res_lsn, s.lsn[8]);
+	CHECK_EQ(s.res_lsn, s.lsn[11]);
 	/* The $MFT $DATA size extension: exactly one record, staged
 	 * first, its redo the live size, its undo one record less. */
 	{
@@ -5811,11 +5837,19 @@ out:
 
 	/* The device reads back after a remount, with its mode, the
 	 * reparse flag and RECALL_ON_OPEN on its $SI, its LX_CHR tag,
-	 * and its $R entry in place. */
+	 * and its $R entry in place. The $SI flags agree between the
+	 * live snapshot and the replay — 0x40404 on both — which is
+	 * what the old staging got wrong. The live snapshot still has
+	 * a dirty $LogFile, so its mount stays read-only and strips
+	 * the write bits from the mode (020444); the replayed volume
+	 * mounts read-write (020644). */
+	CHECK_EQ(attr_after_mount(snap, "sub", "dev", &at), 0);
+	CHECK_EQ(at.mode, 020444u);
+	CHECK_EQ(at.file_attributes, 0x40404u);
+	CHECK_EQ(at.reparse_tag, 0x80000025u);
 	CHECK_EQ(attr_after_mount(snap1, "sub", "dev", &at), 0);
 	CHECK_EQ(at.mode, 020644u);
-	CHECK(at.file_attributes & 0x400u);
-	CHECK(at.file_attributes & 0x40000u);
+	CHECK_EQ(at.file_attributes, 0x40404u);
 	CHECK_EQ(at.reparse_tag, 0x80000025u);
 	CHECK_EQ(reparse_index_count_entries(snap1, rp_ino, 0x80000025u, ino), 1);
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);

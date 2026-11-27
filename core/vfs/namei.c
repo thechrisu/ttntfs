@@ -772,6 +772,31 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	if (err)
 		goto err_out;
 
+	/*
+	 * PORT: journal the $SI flags for a reparse create
+	 * (docs/JOURNAL-DESIGN.md Phase 3 reparse). Staged here, not
+	 * in ntfs_journal_create_reparse: ni->flags is only final once
+	 * the $FILE_NAME is built — __ntfs_create folds
+	 * fn->file_attributes back into it below, and devices gain
+	 * FILE_ATTR_SYSTEM and dir-links gain
+	 * FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT there — so the new
+	 * value is fn->file_attributes | (ni->flags &
+	 * FILE_ATTRIBUTE_RECALL_ON_OPEN), the same formula as the
+	 * fold. Staging from ni->flags at the reparse set replayed a
+	 * device's $SI without SYSTEM (0x40400, live 0x40404) and a
+	 * dir-link's without DUP (0x400, live 0x10000400): the $SI and
+	 * $FILE_NAME copies disagreed after replay, depending on
+	 * whether the record had been flushed.
+	 */
+	if (rollback_reparse) {
+		err = journal_stage(jt ? ntfs_journal_create_si_flags(jt, vol, ni, ni_mrec,
+								      fn->file_attributes |
+								      (ni->flags & FILE_ATTRIBUTE_RECALL_ON_OPEN)) : 0,
+				    &jt);
+		if (err)
+			goto err_out;
+	}
+
 	child_mft_ref = MK_MREF(ni->mft_no,
 				le16_to_cpu(ni_mrec->sequence_number));
 	/* Set hard links count and directory flag. */

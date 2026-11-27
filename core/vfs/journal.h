@@ -82,19 +82,32 @@ int ntfs_journal_create_index(struct ntfs_journal_txn *t,
 			      const struct mft_record *dir_mrec,
 			      u64 child_mref);
 
-/* Stage the three records a symlink create adds on top of a plain
+/* Stage the two records a reparse create adds on top of a plain
  * create, in live order: a CreateAttribute for the $REPARSE_POINT
- * attribute, an AddIndexEntryRoot for the $R index entry in $Reparse
- * (found by (tag, file_id)), and a 4-byte UpdateResidentValue for
- * the $SI flags (the reparse set flipped FILE_ATTR_REPARSE_POINT in
- * ni->flags, which the mapped $SI does not carry yet). Returns
- * -ENOENT when any of the three cannot be described; the caller then
- * aborts and proceeds unjournaled. The commit stamps MR_LSN into
- * $Reparse's record too, so the replay skips the $R entry record. */
+ * attribute and an AddIndexEntryRoot for the $R index entry in
+ * $Reparse (found by (tag, file_id)). The $SI flags are staged
+ * separately, by ntfs_journal_create_si_flags, after the $FILE_NAME
+ * is built — ni->flags is only final then. Returns -ENOENT when
+ * either cannot be described; the caller then aborts and proceeds
+ * unjournaled. The commit stamps MR_LSN into $Reparse's record too,
+ * so the replay skips the $R entry record. */
 int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
 				struct ntfs_volume *vol,
 				struct ntfs_inode *ni,
 				const struct mft_record *mrec);
+
+/* Stage the $SI flags update for a reparse create: a 4-byte
+ * UpdateResidentValue on the new file's record, old from the mapped
+ * $SI, new as passed (the caller passes fn->file_attributes |
+ * (ni->flags & FILE_ATTRIBUTE_RECALL_ON_OPEN) — the same formula
+ * __ntfs_create applies when it finalises ni->flags — after the
+ * $FILE_NAME is staged). Returns -ENOENT when the $SI cannot be
+ * described. */
+int ntfs_journal_create_si_flags(struct ntfs_journal_txn *t,
+				 struct ntfs_volume *vol,
+				 struct ntfs_inode *ni,
+				 const struct mft_record *mrec,
+				 __le32 new_flags);
 
 /* Stage the SetBits record for the allocated MFT record number. */
 int ntfs_journal_create_bitmap(struct ntfs_journal_txn *t,

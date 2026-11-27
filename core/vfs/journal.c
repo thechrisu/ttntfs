@@ -674,21 +674,19 @@ static int find_reparse_index_entry(const struct mft_record *rp_mrec,
 	return -ENOENT;
 }
 
-/* Stage the three records a symlink create adds on top of a plain
+/* Stage the two records a reparse create adds on top of a plain
  * create, in live order: the $REPARSE_POINT attribute (its value was
- * just written into the mapped record), the $R index entry in
- * $Reparse, and the $SI flags (the reparse set flipped
- * FILE_ATTR_REPARSE_POINT in ni->flags, which the mapped $SI does
- * not carry yet — ntfs_inode_sync_standard_information runs at inode
- * writeback, and the WAL gate holds the record until the commit).
+ * just written into the mapped record) and the $R index entry in
+ * $Reparse. The $SI flags are staged separately, by
+ * ntfs_journal_create_si_flags, after the $FILE_NAME is built —
+ * ni->flags is only final then (devices gain FILE_ATTR_SYSTEM and
+ * dir-links gain FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT when
+ * __ntfs_create folds fn->file_attributes back into it).
  *
- * Returns -ENOENT when any of the three cannot be described (the
- * attribute went to an extent, the $R entry went to an
- * $INDEX_ALLOCATION block, $Reparse cannot be found, the $SI moved)
- * — the caller then aborts and proceeds unjournaled. A failure in
- * the third step is safe even though the first two are already
- * staged: staging only appends to the in-memory transaction, and
- * the abort discards them all. */
+ * Returns -ENOENT when either cannot be described (the attribute
+ * went to an extent, the $R entry went to an $INDEX_ALLOCATION
+ * block, $Reparse cannot be found) — the caller then aborts and
+ * proceeds unjournaled. */
 int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
 				struct ntfs_volume *vol,
 				struct ntfs_inode *ni,
@@ -758,47 +756,6 @@ int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
 	unmap_mft_record(rp_ni);
 	mutex_unlock(&rp_ni->mrec_lock);
 	iput(rp_vi);
-
-	/* (3) The $SI flags. The mapped $SI still holds the as-added
-	 * flags at this point — the sync that writes ni->flags into it
-	 * is deferred by the WAL gate — so old is read from the mapped
-	 * record and new from ni->flags. Stage only on change: the
-	 * truncate $SI pattern. The coordinates are the new file's,
-	 * not $Reparse's. */
-	{
-		const struct attr_record *si_attr;
-		const struct standard_information *si_val;
-		u16 si_off = 0;
-		__le32 new_flags, old_flags;
-
-		si_attr = find_attr(mrec, AT_STANDARD_INFORMATION, NULL, 0,
-				    &si_off);
-		if (!si_attr || si_attr->non_resident)
-			return -ENOENT;
-		si_val = (const struct standard_information *)
-			((const u8 *)si_attr +
-			 le16_to_cpu(si_attr->data.resident.value_offset));
-		old_flags = si_val->file_attributes;
-		new_flags = ni->flags;
-		if (old_flags != new_flags) {
-			err = mft_coords(vol, ni->mft_no, &vcn,
-					 &cluster_off, &page_lcn);
-			if (err)
-				return err;
-			err = ntfs_log_txn_update_resident(
-				t->t, vol->log_mft_data_attr,
-				vcn, cluster_off, page_lcn,
-				si_off,
-				le16_to_cpu(
-					si_attr->data.resident.value_offset) +
-					offsetof(struct standard_information,
-						 file_attributes),
-				&new_flags, sizeof(new_flags),
-				&old_flags, sizeof(old_flags));
-			if (err)
-				return err;
-		}
-	}
 	return 0;
 
 out_unmap:
@@ -807,6 +764,65 @@ out_unlock:
 	mutex_unlock(&rp_ni->mrec_lock);
 	iput(rp_vi);
 	return err;
+}
+
+/* Stage the $SI flags update for a reparse create, as a 4-byte
+ * UpdateResidentValue on the new file's record. Old is read from
+ * the mapped $SI, which still holds the as-added flags — the sync
+ * that writes ni->flags into it is deferred by the WAL gate — and
+ * new is passed in, because ni->flags is only final once the
+ * $FILE_NAME is built: __ntfs_create folds fn->file_attributes
+ * back into ni->flags at the end of the create (devices gain
+ * FILE_ATTR_SYSTEM there, dir-links gain
+ * FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT), so a caller that staged
+ * this from ni->flags at the reparse set would replay $SI flags
+ * without those bits. The caller passes
+ * fn->file_attributes | (ni->flags & FILE_ATTRIBUTE_RECALL_ON_OPEN)
+ * — the same formula __ntfs_create applies — after the $FILE_NAME
+ * is staged. Stage only on change: the truncate $SI pattern.
+ * Returns -ENOENT when the $SI cannot be described. */
+int ntfs_journal_create_si_flags(struct ntfs_journal_txn *t,
+				 struct ntfs_volume *vol,
+				 struct ntfs_inode *ni,
+				 const struct mft_record *mrec,
+				 __le32 new_flags)
+{
+	const struct attr_record *si_attr;
+	const struct standard_information *si_val;
+	u64 vcn, page_lcn;
+	u16 cluster_off, si_off = 0;
+	__le32 old_flags;
+	int err;
+
+	if (!t)
+		return -EINVAL;
+	si_attr = find_attr(mrec, AT_STANDARD_INFORMATION, NULL, 0,
+			    &si_off);
+	if (!si_attr || si_attr->non_resident)
+		return -ENOENT;
+	si_val = (const struct standard_information *)
+		 ((const u8 *)si_attr +
+		  le16_to_cpu(si_attr->data.resident.value_offset));
+	old_flags = si_val->file_attributes;
+	if (old_flags != new_flags) {
+		err = mft_coords(vol, ni->mft_no, &vcn,
+				 &cluster_off, &page_lcn);
+		if (err)
+			return err;
+		err = ntfs_log_txn_update_resident(
+			t->t, vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			si_off,
+			le16_to_cpu(
+				si_attr->data.resident.value_offset) +
+				offsetof(struct standard_information,
+					 file_attributes),
+			&new_flags, sizeof(new_flags),
+			&old_flags, sizeof(old_flags));
+		if (err)
+			return err;
+	}
+	return 0;
 }
 
 int ntfs_journal_create_bitmap(struct ntfs_journal_txn *t,
