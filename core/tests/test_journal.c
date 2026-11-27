@@ -35,22 +35,27 @@
  * ntfs_vfs_unlink:
  *
  *   unlink_journaled   a regular-file unlink writes exactly one
- *                        transaction to $LogFile (one open record,
- *                        DeleteIndexEntryRoot, DeleteAttribute, Commit,
- *                        three table dumps, Forget); the create's
- *                        records are dispensable once the unlink's
- *                        checkpoint lands, so the walk holds only the
- *                        unlink's 8. Replaying the snapshot redoes
- *                        nothing — the unlink's records are skipped on
- *                        their MR_LSN stamps — the file is gone and
- *                        ntfsck -n is clean.
+ *                        transaction to $LogFile (two open records —
+ *                        $MFT:$DATA and $MFT:$BITMAP — DeleteIndexEntryRoot,
+ *                        DeleteAttribute, DeallocateFileRecordSegment,
+ *                        ClearBitsInNonresidentBitMap, Commit, three
+ *                        table dumps, Forget); the create's records
+ *                        stay live (their pages were never flushed),
+ *                        so the walk holds 25. Replaying the snapshot
+ *                        redoes the create's two idempotent records
+ *                        plus the unlink's ClearBits, skips the
+ *                        DeleteAttribute/DeleteIndexEntryRoot on their
+ *                        MR_LSN stamps and the Deallocate on its
+ *                        effect (the record is already free) — the
+ *                        file is gone and ntfsck -n is clean.
  *   unlink_in_root_unjournaled
  *                        an unlink in the root writes no client records
  *                        (its entry lives in the root's
  *                        $INDEX_ALLOCATION block) and still succeeds.
  *   rmdir_journaled    an rmdir of an empty driver-made directory
- *                        journals the same two records as a file
- *                        unlink.
+ *                        journals the same four data records as a
+ *                        file unlink; replay redoes only the
+ *                        ClearBits.
  *
  * The snapshot is copied after create+sync while the original is still
  * mounted, so the copy holds the flushed metadata and the still-dirty
@@ -908,41 +913,59 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk from the oldest LSN holds 22 records: the create's
+	/* The walk from the oldest LSN holds 25 records: the create's
 	 * 14 that are still live (its 2 open records are already
 	 * dispensable — oldest sits at its first data record — so 9
-	 * data + Commit + 3 dumps + Forget) plus the unlink's 8 (1
-	 * open + 2 data + Commit + 3 dumps + Forget). The create's
-	 * records stay live because the MFT pages they dirtied were
-	 * never flushed to disk — no checkpoint is emitted after a
-	 * sync, so the dirty-page table still names the create's
-	 * LSNs as the oldest for those pages. That is correct NTFS
-	 * behaviour: a crash before those pages flush needs the
-	 * create's redo records. The unlink's records follow at
-	 * positions 14..21. */
+	 * data + Commit + 3 dumps + Forget) plus the unlink's 11.
+	 * The unlink transaction is 2 open + 4 data + Commit + 3
+	 * dumps + Forget: it touches two attributes, so it opens
+	 * both ($MFT:$DATA for the index, the $FILE_NAME and the
+	 * Deallocate; $MFT:$BITMAP for the ClearBits), and its data
+	 * records are DeleteIndexEntryRoot, DeleteAttribute,
+	 * DeallocateFileRecordSegment and ClearBitsInNonresidentBitMap
+	 * — the free is part of the unlink transaction, not a
+	 * separate evict one. The create's records stay live because
+	 * the MFT pages they dirtied were never flushed to disk — no
+	 * checkpoint is emitted after a sync, so the dirty-page table
+	 * still names the create's LSNs as the oldest for those
+	 * pages. That is correct NTFS behaviour: a crash before those
+	 * pages flush needs the create's redo records. The unlink's
+	 * records follow at positions 14..24. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 22);
-	if (s.n == 22) {
+	CHECK_EQ(s.n, 25);
+	if (s.n == 25) {
 		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[16], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[17], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[18], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[19], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[20], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_ForgetTransaction);
-		/* Both delete records target $MFT:$DATA (0x18): the
-		 * index entry lives in the parent's record, the
-		 * $FILE_NAME in the file's own. */
-		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x40u);
+		CHECK_EQ(s.redo_op[16], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[18], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[19], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
+		/* The index, $FILE_NAME and Deallocate records target
+		 * $MFT:$DATA (0x18): the index entry lives in the
+		 * parent's record, the $FILE_NAME and the free in the
+		 * file's own. The ClearBits targets $MFT:$BITMAP
+		 * (0x40). */
 		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.target_attr[18], 0x18u);
+		CHECK_EQ(s.target_attr[19], 0x40u);
 		/* The file's record is at vcn ino/4 (1024-byte records
-		 * in 4096-byte clusters), the parent's at sub_ino/4. */
-		CHECK_EQ(s.target_vcn[15], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[16], ino / 4);
-		lsn_del_idx = s.lsn[15];
-		lsn_del_attr = s.lsn[16];
+		 * in 4096-byte clusters), the parent's at sub_ino/4;
+		 * the bitmap bit for the file's record is in cluster
+		 * (ino/8)/4096 of $MFT:$BITMAP. */
+		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[17], ino / 4);
+		CHECK_EQ(s.target_vcn[18], ino / 4);
+		CHECK_EQ(s.target_vcn[19], (ino / 8) / 4096);
+		lsn_del_idx = s.lsn[16];
+		lsn_del_attr = s.lsn[17];
 	}
 
 	/* Both touched records carry an MR_LSN at or past the record
@@ -955,32 +978,34 @@ out:
 	CHECK(mrlsn_dir != 0);
 	CHECK(mrlsn_dir >= lsn_del_idx);
 
-	/* Replay copy 1: the unlink's two records are skipped on
-	 * their MR_LSN stamps, but the create's records are still
-	 * live (see above) so the replay redoes exactly its two
-	 * idempotent ones — SetNewAttributeSizes (MFT record 0)
-	 * and SetBitsInNonresidentBitMap (the $MFT bitmap cluster).
-	 * The SetBits redo is the known evict gap: it sets the
-	 * bitmap bit for a record the clean unmount already freed,
-	 * so ntfsck on the replayed image reports it (exit 4) —
-	 * journaling the evict-time deallocation is the follow-up
-	 * commit, which will flip this to a clean replay. On a real
-	 * crash the bit was never cleared on disk, so the redo is
-	 * a no-op there; the gap is only visible when replaying a
-	 * cleanly-unmounted image whose log still holds the create.
+	/* Replay copy 1: the unlink's DeleteIndexEntryRoot and
+	 * DeleteAttribute are skipped on their MR_LSN stamps and
+	 * its Deallocate is skipped on its effect (the record is
+	 * already free on disk — the effect-based skip), but the
+	 * create's records are still live (see above) so the replay
+	 * redoes exactly its two idempotent ones —
+	 * SetNewAttributeSizes (MFT record 0) and
+	 * SetBitsInNonresidentBitMap (the $MFT bitmap cluster) —
+	 * plus the unlink's ClearBits, which clears the same
+	 * cluster's bit again (idempotent: the clean unmount
+	 * already cleared it, so the cluster count stays 1).
+	 * The replayed image is ntfsck-clean: the free is in the
+	 * unlink transaction, so the SetBits redo no longer
+	 * resurrects the freed record's bit.
 	 */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.records_redone, 3u);
 	CHECK_EQ(an.mft_records_written, 1u);
 	CHECK_EQ(an.clusters_written, 1u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
 
-	/* The file is gone on the replayed volume. */
+	/* The file is gone on the replayed volume, and it is clean. */
 	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* The file is gone on the live snapshot too, and it is clean. */
 	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), -ENOENT);
@@ -1094,8 +1119,9 @@ static void test_rmdir_journaled(void)
 	e = NULL;
 	CHECK_EQ(ntfs_volume_sync(vol), 0);
 
-	/* rmdir of the empty driver-made directory: the same two
-	 * records as a file unlink (index entry + $FILE_NAME). */
+	/* rmdir of the empty driver-made directory: the same four
+	 * data records as a file unlink (index entry + $FILE_NAME
+	 * + Deallocate + ClearBits). */
 	CHECK_EQ(ntfs_rmdir(d, "sub2"), 0);
 	CHECK_EQ(ntfs_volume_sync(vol), 0);
 	CHECK_EQ(copy_file(orig, snap), 0);
@@ -1110,20 +1136,34 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 8);
-	if (s.n == 8) {
+	CHECK_EQ(s.n, 11);
+	if (s.n == 11) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.redo_op[1], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[2], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
-		CHECK_EQ(s.target_vcn[1], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[2], sub2_ino / 4);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[4], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[5], (sub2_ino / 8) / 4096);
 	}
 
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 0u);
+	/* Only the ClearBits redoes (idempotent clear of an
+	 * already-clear bit); the Deallocate is skipped on its
+	 * effect — the record is already free on disk. */
+	CHECK_EQ(an.records_redone, 1u);
 	CHECK(!an.needs_chkdsk);
 
 	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "sub2"), -ENOENT);

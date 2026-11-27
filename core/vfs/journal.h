@@ -155,13 +155,22 @@ void ntfs_journal_create_abort(struct ntfs_journal_txn *t);
  * helpers). In every case the caller aborts and proceeds unjournaled,
  * exactly as the driver did before Phase 2.
  *
- * The evict-time deallocation (freeing the data clusters, clearing
- * the $MFT bitmap bit, deallocating the record) is NOT part of this
- * transaction: it runs at iput, after the unlink returns, and stays
- * unjournaled for now. A crash after the unlink commits but before
- * evict leaves a link-count-0 record still in use — the crash tests
- * pin down whether ntfsck accepts that state; if it does not, the
- * deallocation gets its own transaction in a follow-up commit.
+ * The record free IS part of this transaction: when the link count
+ * hits 0, ntfs_delete stages a Deallocate record (redo clears
+ * IN_USE and bumps the sequence number, undo restores the record
+ * bytes) and a ClearBits record for the $MFT bitmap bit, for the
+ * base record and each extent record, before the commit. The
+ * physical free still runs at evict (iput, after the unlink
+ * returns) — the log describes the intended end state, which the
+ * replay applies only after a crash, when the file is no longer
+ * open anywhere, so staging it at unlink time is safe for
+ * unlink-while-open. Without it, a crash after the unlink commits
+ * but before evict leaves a link-count-0 record still in use, and
+ * the replay's DeleteAttribute leaves it with no $FILE_NAME —
+ * ntfsck fails it ("Failed to find filename", 7 of 20 cut points
+ * in test_journaled_unlink_cut_points even after the bitmap half
+ * was journaled on its own). The data-cluster freeing stays
+ * unjournaled (it belongs to the truncate/extend class).
  */
 struct file_name_attr;
 
@@ -213,5 +222,15 @@ int ntfs_journal_unlink_stage_attr(struct ntfs_journal_unlink *u,
 int ntfs_journal_unlink_commit(struct ntfs_journal_unlink *u,
 			       struct ntfs_inode *ni,
 			       struct ntfs_inode *dir_ni);
+
+/* Stage the record free for the link-count-0 case: a Deallocate
+ * record plus a ClearBits record for the $MFT bitmap bit, for the
+ * base record (@mrec, in its post-delete state) and each extent
+ * record. Call once, after the last $FILE_NAME removal, when the
+ * link count has hit 0. Returns -ENOENT when a record cannot be
+ * staged; the caller then aborts and proceeds unjournaled. */
+int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
+				   struct ntfs_inode *ni,
+				   const struct mft_record *mrec);
 
 #endif /* NTFS_JOURNAL_H */

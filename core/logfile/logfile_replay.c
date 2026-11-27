@@ -1056,8 +1056,24 @@ static int do_action(struct replay *r, uint32_t target_attr, const struct action
 				return INCOHERENT(r, "lsn 0x%llx: mft record %llu fails validation",
 						  (unsigned long long)a->lsn, (unsigned long long)mft_no);
 		} else if (op == LOP_DeallocateFileRecordSegment) {
-			if (!m->bad && lsn_already_applied(rec, a->lsn))
-				return plan_skip(r, a->lsn, op, a->undo, "mft record already at or past lsn");
+			/*
+			 * The skip is effect-based, not LSN-based: the
+			 * record's MR_LSN is stamped at commit time with the
+			 * transaction's last LSN, which is PAST this
+			 * record's LSN — but the flag clear the record
+			 * describes happens at evict, after the commit, so
+			 * a record flushed after the commit carries an
+			 * MR_LSN that claims this effect while the flag is
+			 * still set. An LSN skip would leave the flag set
+			 * and ntfsck would fail the record for having no
+			 * $FILE_NAME. Skip only when the flag is already
+			 * clear (the effect is present, e.g. the free
+			 * already landed on disk or a previous replay
+			 * applied it); a second replay is still a no-op,
+			 * because the first one cleared the flag.
+			 */
+			if (!m->bad && !(lf_get16(rec + MR_FLAGS) & MFT_RECORD_IN_USE))
+				return plan_skip(r, a->lsn, op, a->undo, "mft record already free");
 			if (m->bad)
 				return INCOHERENT(r, "lsn 0x%llx: cannot deallocate BAAD mft record %llu",
 						  (unsigned long long)a->lsn, (unsigned long long)mft_no);

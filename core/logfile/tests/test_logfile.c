@@ -3795,13 +3795,21 @@ static void test_journal_create_bad_vcn(void)
  * and $DATA in the new record). The replay's DeleteAttribute decrements
  * the link count itself (it keys on the attribute's INDEXED flag), so
  * no separate record carries the count. Returns the first error. */
+/* Stage the four data records of a regular-file unlink into @t:
+ * DeleteIndexEntryRoot, DeleteAttribute, DeallocateFileRecordSegment
+ * and ClearBitsInNonresidentBitMap — the free is part of the unlink
+ * transaction, as the driver stages it. The Deallocate undo carries
+ * the record bytes after the $FILE_NAME removal (init + $SD + $DATA,
+ * link 0), so it composes with the DeleteAttribute undo instead of
+ * duplicating the $FILE_NAME. */
 static int stage_unlink(ntfs_log_txn_t *t, uint32_t mft_attr,
-			uint64_t recno, const char *name, uint64_t parent)
+			uint32_t bmp_attr, uint64_t recno, const char *name,
+			uint64_t parent)
 {
 	uint8_t init_rec[VRS], sd_attr[64], data_attr[32], fn_attr[256];
-	uint8_t fn_val[128], entry[256];
+	uint8_t fn_val[128], entry[256], del_rec[VRS];
 	uint32_t init_len, sd_len, data_len, fn_len, fn_vlen, entry_len;
-	uint32_t sd_off, data_off, fn_off;
+	uint32_t sd_off, data_off, fn_off, del_len;
 	uint64_t vcn = recno * VRS / VCS;
 	uint32_t cluster_off = (uint32_t)((recno * VRS % VCS) / 512);
 	uint64_t page_lcn = MFT_LCN + vcn;
@@ -3837,12 +3845,37 @@ static int stage_unlink(ntfs_log_txn_t *t, uint32_t mft_attr,
 	data_off = sd_off + sd_len;
 	fn_off = data_off + data_len;
 
+	/* Post-delete record bytes: init + $SD + $DATA, link 0, end
+	 * marker after $DATA. */
+	{
+		uint32_t off;
+
+		build_record(del_rec, recno, MFT_RECORD_IN_USE, fill_init_si);
+		lf_put16(del_rec + MR_LINK_COUNT, 0);
+		off = lf_get32(del_rec + MR_BYTES_IN_USE) - 8;
+		put_res_attr(del_rec, &off, ATTR_TYPE_SECURITY_DESCRIPTOR,
+			     sd_val, sizeof(sd_val), 1);
+		put_res_attr(del_rec, &off, ATTR_TYPE_DATA, empty_val, 0, 2);
+		lf_put32(del_rec + off, ATTR_TYPE_END);
+		off += 8;
+		lf_put32(del_rec + MR_BYTES_IN_USE, off);
+		del_len = off;
+	}
+
 	err = ntfs_log_txn_delete_index_root(t, mft_attr, pvcn, 0, ppage_lcn,
 					     dir_ir_off, 56, entry, entry_len);
 	if (err)
 		return err;
-	return ntfs_log_txn_delete_attr(t, mft_attr, vcn, cluster_off,
-					page_lcn, fn_off, fn_attr, fn_len);
+	err = ntfs_log_txn_delete_attr(t, mft_attr, vcn, cluster_off,
+				       page_lcn, fn_off, fn_attr, fn_len);
+	if (err)
+		return err;
+	err = ntfs_log_txn_deallocate_record(t, mft_attr, vcn, cluster_off,
+					     page_lcn, del_rec, del_len);
+	if (err)
+		return err;
+	return ntfs_log_txn_set_bitmap(t, bmp_attr, 0, 0, MFTBMP_LCN,
+				       (uint32_t)recno, 1, false);
 }
 
 /* Scan a deprotected MFT record for an attribute of @type; return its
@@ -3918,7 +3951,8 @@ static void test_journal_unlink_commit(void)
 	struct ntfs_log_replay_result res;
 	struct rec_seen s;
 	uint8_t got[VRS];
-	uint64_t first_lsn, lsn_del_idx = 0, lsn_del_attr = 0;
+	uint64_t first_lsn, lsn_del_idx = 0, lsn_del_attr = 0,
+		 lsn_dealloc = 0;
 	int i;
 
 	printf("test_journal_unlink_commit\n");
@@ -3929,7 +3963,7 @@ static void test_journal_unlink_commit(void)
 			      (uint64_t)-1), 0);
 	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
 	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
-	CHECK_EQ(stage_unlink(t, 0x18, NEW_REC, "t.txt", DIR_REC), 0);
+	CHECK_EQ(stage_unlink(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC), 0);
 	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
 	ntfs_log_writer_free(w);
 	ntfs_logfile_close(log);
@@ -3937,30 +3971,37 @@ static void test_journal_unlink_commit(void)
 	/* Walk from the unlink's first record: the create's checkpoint
 	 * advanced the oldest LSN past the create's records, so a walk
 	 * from the create's first LSN is refused -EINVAL. The unlink
-	 * carries 8 records: 1 open + 2 data + Commit + 3 dumps +
+	 * carries 11 records: 2 open + 4 data + Commit + 3 dumps +
 	 * Forget. */
 	log = open_log(&m, &io);
 	memset(&s, 0, sizeof(s));
 	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
-	CHECK_EQ(s.n, 8);
-	if (s.n == 8) {
+	CHECK_EQ(s.n, 11);
+	if (s.n == 11) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[0], 0x18u);
-		CHECK_EQ(s.redo_op[1], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[2], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
 		for (i = 0; i < s.n; i++) {
 			if (s.redo_op[i] == LOP_DeleteIndexEntryRoot)
 				lsn_del_idx = s.lsn[i];
 			if (s.redo_op[i] == LOP_DeleteAttribute)
 				lsn_del_attr = s.lsn[i];
+			if (s.redo_op[i] == LOP_DeallocateFileRecordSegment)
+				lsn_dealloc = s.lsn[i];
 		}
 		CHECK(lsn_del_idx != 0);
 		CHECK(lsn_del_attr != 0);
+		CHECK(lsn_dealloc != 0);
 	}
 	ntfs_logfile_close(log);
 
@@ -3968,7 +4009,7 @@ static void test_journal_unlink_commit(void)
 	vol_apply(&v, &ap);
 	log = open_log(&m, &io);
 	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
-	CHECK_EQ(res.records_redone, 9);
+	CHECK_EQ(res.records_redone, 11);
 	CHECK_EQ(res.transactions_committed, 0);
 	CHECK_EQ(res.transactions_active, 0);
 	CHECK_EQ(res.mft_records_written, 2);
@@ -3976,26 +4017,30 @@ static void test_journal_unlink_commit(void)
 	CHECK(!res.needs_chkdsk);
 	ntfs_logfile_close(log);
 
-	/* Record 40: in use, link 0, no $FILE_NAME, $DATA intact. */
+	/* Record 40: free, link 0, no $FILE_NAME, $DATA intact. */
 	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
-	CHECK(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	CHECK(!(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE));
 	CHECK_EQ(lf_get16(got + MR_LINK_COUNT), 0);
 	CHECK_EQ(find_attr_off(got, ATTR_TYPE_FILE_NAME), -1);
 	CHECK(find_attr_off(got, ATTR_TYPE_DATA) >= 0);
-	CHECK_EQ(lf_get64(got + MR_LSN), lsn_del_attr);
+	/* The Deallocate is the last data record touching record 40,
+	 * so its MR_LSN is the Deallocate's LSN. */
+	CHECK_EQ(lf_get64(got + MR_LSN), lsn_dealloc);
 	/* Record 32: the entry is gone, $SI untouched (mtime is the
 	 * setattr class's gap, not the unlink's). */
 	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
 	CHECK(!index_has_entry(got, NEW_REC | (1ULL << 48)));
 	CHECK_EQ(lf_get64(got + MR_LSN), lsn_del_idx);
-	/* Bit 40 still set: the record is allocated until evict. */
-	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x01);
+	/* Bit 40 clear: the record is free. */
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x00);
 
-	/* Second replay: only the SetBits re-applies; the volume is
-	 * unchanged. */
+	/* Second replay: the SetBits and the ClearBits re-apply (both
+	 * target the bitmap cluster, which has no MR_LSN skip); the
+	 * Deallocate is skipped on its effect — the record is already
+	 * free — and the volume is unchanged. */
 	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false,
 				     &res), 0);
-	CHECK_EQ(res.records_redone, 1);
+	CHECK_EQ(res.records_redone, 2);
 	CHECK_EQ(res.mft_records_written, 0);
 	CHECK_EQ(res.clusters_written, 1);
 	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
@@ -4030,7 +4075,7 @@ static void test_journal_unlink_abort(void)
 			      (uint64_t)-1), 0);
 	CHECK_EQ(ntfs_log_txn_commit(t, NULL, NULL), 0);
 	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
-	CHECK_EQ(stage_unlink(t, 0x18, NEW_REC, "t.txt", DIR_REC), 0);
+	CHECK_EQ(stage_unlink(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC), 0);
 	CHECK_EQ(ntfs_log_txn_abort(t), 0);
 	ntfs_log_writer_free(w);
 	ntfs_logfile_close(log);

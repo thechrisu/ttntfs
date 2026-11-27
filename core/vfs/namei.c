@@ -1104,6 +1104,33 @@ search:
 		ntfs_delete_reparse_index(ni);
 		ntfs_delete_object_id_index(ni);
 		link_count_zero = true;
+		/*
+		 * PORT: journal the record free
+		 * (docs/JOURNAL-DESIGN.md Phase 3). The link count
+		 * hit 0, so the record will be freed at evict; stage
+		 * the Deallocate + ClearBits records now, from the
+		 * record as it stands after the last $FILE_NAME
+		 * removal, so the transaction describes the whole
+		 * removal including the free. The physical free still
+		 * runs at evict — the log describes the intended end
+		 * state, applied by the replay only after a crash,
+		 * when the file is no longer open anywhere. Without
+		 * these records a crash after the commit but before
+		 * evict leaves a link-count-0 record still in use
+		 * with no $FILE_NAME, which ntfsck fails. Any staging
+		 * failure aborts the transaction and the delete
+		 * proceeds unjournaled.
+		 */
+		if (jt) {
+			err = ntfs_journal_unlink_stage_free(jt, ni, ni_mrec);
+			if (err) {
+				ntfs_journal_unlink_abort(jt);
+				jt = NULL;
+				if (jtp)
+					*jtp = NULL;
+				err = 0;
+			}
+		}
 	}
 
 	ntfs_attr_put_search_ctx(actx);

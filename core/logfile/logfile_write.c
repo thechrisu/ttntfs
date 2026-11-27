@@ -1251,6 +1251,32 @@ int ntfs_log_txn_init_record(ntfs_log_txn_t *t, uint32_t mft_attr,
 		       (uint16_t)rec_len, NULL, 0);
 }
 
+/*
+ * DeallocateFileRecordSegment: the record at @target_vcn is freed on
+ * redo (IN_USE cleared, sequence bumped) and restored on undo by the
+ * Initialize carrying @rec (the record bytes as they stood when the
+ * free was staged). The mirror of ntfs_log_txn_init_record, which
+ * stages Initialize-redo / Deallocate-undo for a fresh record.
+ * The redo carries no payload — the apply needs only the record
+ * number — and the undo carries the whole used record, so an undone
+ * free restores the record byte-identical (including its $FILE_NAME,
+ * which the paired DeleteAttribute undo then re-adds only if the
+ * staged bytes predate its removal; stage the bytes after the
+ * removal so the two undos compose instead of duplicating it).
+ */
+int ntfs_log_txn_deallocate_record(ntfs_log_txn_t *t, uint32_t mft_attr,
+				   uint64_t target_vcn, uint16_t cluster_off,
+				   uint64_t page_lcn, const void *rec,
+				   uint32_t rec_len)
+{
+	if (!rec || !rec_len || rec_len > 0xffff)
+		return -EINVAL;
+	return txn_add(t, LOP_DeallocateFileRecordSegment,
+		       LOP_InitializeFileRecordSegment, mft_attr, 1, 0, 0,
+		       cluster_off, target_vcn, &page_lcn, NULL, 0,
+		       rec, (uint16_t)rec_len);
+}
+
 int ntfs_log_txn_create_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
 			     uint64_t target_vcn, uint16_t cluster_off,
 			     uint64_t page_lcn, uint16_t record_off,

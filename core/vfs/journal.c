@@ -873,3 +873,87 @@ int ntfs_journal_unlink_stage_attr(struct ntfs_journal_unlink *u,
 	kfree(copy);
 	return err;
 }
+
+/*
+ * Stage one record's free: a Deallocate record (redo clears IN_USE
+ * and bumps the sequence number, undo restores the record bytes)
+ * and a ClearBits record for its $MFT bitmap bit (redo clears, undo
+ * sets). @rec is the record bytes as they stand now; @rec_len is
+ * their used length.
+ */
+static int stage_one_free(struct ntfs_journal_unlink *u,
+			  struct ntfs_volume *vol, u64 mft_no,
+			  const void *rec, u32 rec_len)
+{
+	u64 vcn, page_lcn, bvcn, bpage_lcn;
+	u16 cluster_off, bcluster_off;
+	int err;
+
+	err = mft_coords(vol, mft_no, &vcn, &cluster_off, &page_lcn);
+	if (err)
+		return err;
+	err = ntfs_log_txn_deallocate_record(u->t, vol->log_mft_data_attr,
+					     vcn, cluster_off, page_lcn,
+					     rec, rec_len);
+	if (err)
+		return err;
+	err = bitmap_coords(vol, mft_no, &bvcn, &bcluster_off, &bpage_lcn);
+	if (err)
+		return err;
+	return ntfs_log_txn_set_bitmap(u->t, vol->log_mft_bitmap_attr,
+				       bvcn, bcluster_off, bpage_lcn,
+				       (u32)mft_no, 1, false);
+}
+
+int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
+				   struct ntfs_inode *ni,
+				   const struct mft_record *mrec)
+{
+	int err, i, n;
+	u32 len;
+
+	if (!u || !mrec)
+		return -EINVAL;
+	/*
+	 * The base record first, in its post-delete state: the
+	 * $FILE_NAME is already gone and the link count is 0, so the
+	 * Deallocate undo (Initialize with these bytes) restores
+	 * exactly this state and the DeleteAttribute undo then
+	 * re-adds the $FILE_NAME once — the two undos compose
+	 * instead of duplicating it. Then the extent records, whose
+	 * bytes are final already (the unlink touches only the base
+	 * record and the parent's index).
+	 */
+	len = le32_to_cpu(mrec->bytes_in_use);
+	if (len < (u32)sizeof(struct mft_record) ||
+	    len > ni->vol->mft_record_size)
+		return -EINVAL;
+	err = stage_one_free(u, ni->vol, ni->mft_no, mrec, len);
+	if (err)
+		return err;
+	n = ni->nr_extents;
+	if (n < 0)
+		n = 0;
+	for (i = 0; i < n && !err; i++) {
+		struct ntfs_inode *ext = ni->ext.extent_ntfs_inos[i];
+		struct mft_record *em;
+		u32 elen;
+
+		if (!ext)
+			continue;
+		em = map_mft_record(ext);
+		if (IS_ERR(em)) {
+			err = PTR_ERR(em);
+			break;
+		}
+		elen = le32_to_cpu(em->bytes_in_use);
+		if (elen < (u32)sizeof(struct mft_record) ||
+		    elen > ni->vol->mft_record_size)
+			err = -EINVAL;
+		else
+			err = stage_one_free(u, ni->vol, ext->mft_no,
+					     em, elen);
+		unmap_mft_record(ext);
+	}
+	return err;
+}

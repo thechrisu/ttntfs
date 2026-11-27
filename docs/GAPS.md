@@ -613,18 +613,22 @@ the next mount's replay undoes the partial transaction and
 restores the file, the correct outcome for a failed unlink.
 New driver tests `test_unlink_journaled`,
 `test_unlink_in_root_unjournaled`, `test_rmdir_journaled`
-(`core/tests/test_journal.c`, suite 171 checks, 0 failures):
-the journaled unlink writes exactly one 8-record transaction;
-the walk from the oldest LSN holds 22 records — the create's
-14 still-live ones (its 2 open records are already dispensable)
-plus the unlink's 8 — because the MFT pages the create
-dirtied were never flushed and no checkpoint is emitted after
-a sync, so the dirty-page table still names the create's LSNs
-as the oldest for those pages (correct NTFS behaviour: a crash
-before those pages flush needs the create's redo records). The
-unlink's two data records are skipped on replay by their
-`MR_LSN` stamps; the create's two idempotent records are
-redone (sizes + SetBits). Two bugs found by the tests and fixed
+(`core/tests/test_journal.c`, suite 171 checks, 0 failures at
+that commit; 191 checks, 0 failures after the free-in-unlink
+fix below): the journaled unlink writes exactly one
+transaction — 8 records before the free-in-unlink fix, 11
+after (2 open + 4 data + Commit + 3 dumps + Forget); the walk
+from the oldest LSN holds 22 records before the fix and 25
+after — the create's 14 still-live ones (its 2 open records
+are already dispensable) plus the unlink's — because the MFT
+pages the create dirtied were never flushed and no checkpoint
+is emitted after a sync, so the dirty-page table still names
+the create's LSNs as the oldest for those pages (correct NTFS
+behaviour: a crash before those pages flush needs the create's
+redo records). The unlink's data records are skipped on replay
+by their `MR_LSN` stamps (the Deallocate by its effect, see
+below); the create's two idempotent records are redone (sizes
++ SetBits), plus the unlink's ClearBits after the fix. Two bugs found by the tests and fixed
 in this commit: `stage_attr` tested `actx->mrec !=
 actx->base_mrec`, but the search context only fills
 `base_mrec` on the external (attribute-list) path, so it
@@ -637,16 +641,48 @@ attrib.c sets `RESIDENT_ATTR_IS_INDEXED` for every
 no-op on live-created names. The root-unlink and root-rmdir
 cases stay unjournaled by design (their entries live in the
 root's `$INDEX_ALLOCATION` blocks) and still succeed.
-Known gap, next commit: the evict-time deallocation (free
-clusters, clear the $MFT bitmap bit, deallocate the record)
-is NOT in the unlink transaction. Replaying a
-cleanly-unmounted image redoes the create's SetBits onto the
-freed record, so `ntfsck` reports the resurrected bit (exit 4)
-— the driver test pins this as the current behaviour. On a
-real crash the bit was never cleared on disk, so the redo is a
-no-op there; the gap is only visible when replaying a clean
-image whose log still holds the create. The crash tests (next)
-decide whether the deallocation gets its own transaction.
+Free-in-unlink-txn (evict-deallocation gap, closed, commit this
+round): the unlink transaction now stages the record's
+deallocation itself — Deallocate and ClearBits records in the
+unlink commit — so a crash after unlink-commit but before
+evict still leaves a good state: the record is freed by replay.
+New builder `ntfs_log_txn_deallocate_record` (redo
+LOP_DeallocateFileRecordSegment, undo
+LOP_InitializeFileRecordSegment carrying the record bytes after
+the $FILE_NAME removal, so it composes with the DeleteAttribute
+undo instead of duplicating the $FILE_NAME), staging helper
+`ntfs_journal_unlink_stage_free`, called from `ntfs_delete` for
+the base record and each extent record when `link_count`
+reaches 0, gated on a journaled unlink (rename passes NULL, so
+it never stages it). The physical free still runs at evict —
+the log describes the intended end state, applied by replay
+only after a crash, when the file is no longer open anywhere,
+so staging at unlink time is safe for unlink-while-open. The
+data clusters' free stays unjournaled (the truncate/extend
+class). The replay's LOP_DeallocateFileRecordSegment skip is now
+effect-based, not LSN-based: skip only when the record's
+IN_USE flag is already clear. An LSN skip is wrong because the
+commit stamps MR_LSN = last_lsn, which is past the Deallocate's
+LSN, but the flag clear happens at evict after the commit — a
+record flushed after the commit carries an MR_LSN claiming the
+effect while the flag is still set, and an LSN skip would leave
+the flag set and ntfsck would fail the record for having no
+$FILE_NAME. A second replay is still a no-op: the first one
+cleared the flag. The unlink transaction is now 11 records (2
+open — $MFT:$DATA 0x18 and $MFT:$BITMAP 0x40 — + 4 data +
+Commit + 3 dumps + Forget); the walk from oldest holds 25
+records (14 still-live create records + 11 unlink); replay
+redoes 3 (create sizes + create SetBits + unlink ClearBits; the
+Deallocate is skipped on its effect). Driver test updated to
+the new shape (test_journal 191 checks, 0 failures); logfile
+test `stage_unlink` now stages the free records too
+(test_journal_unlink_commit expects the 11-record walk, the
+free record with no $FILE_NAME, and the clear bitmap bit).
+Crash sweep (test_journaled_unlink_cut_points, not yet pushed):
+536 checks, 0 failures, 22 cut points, 0 still bad after
+replay — down from 16 bad (resurrected bitmap bit) and 7 bad
+(link-count-0 record with no $FILE_NAME). Next: land the crash
+test as its own commit, then the rename class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

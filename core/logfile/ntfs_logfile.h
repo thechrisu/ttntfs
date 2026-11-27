@@ -371,6 +371,10 @@ int ntfs_log_txn_begin(ntfs_log_writer_t *w, ntfs_log_txn_t **out);
 int ntfs_log_txn_init_record(ntfs_log_txn_t *t, uint32_t mft_attr,
 			     uint64_t target_vcn, uint16_t cluster_off,
 			     uint64_t page_lcn, const void *rec, uint32_t rec_len);
+int ntfs_log_txn_deallocate_record(ntfs_log_txn_t *t, uint32_t mft_attr,
+				   uint64_t target_vcn, uint16_t cluster_off,
+				   uint64_t page_lcn, const void *rec,
+				   uint32_t rec_len);
 int ntfs_log_txn_create_attr(ntfs_log_txn_t *t, uint32_t mft_attr,
 			     uint64_t target_vcn, uint16_t cluster_off,
 			     uint64_t page_lcn, uint16_t record_off,
