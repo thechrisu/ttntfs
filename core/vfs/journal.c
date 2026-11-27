@@ -50,6 +50,8 @@ struct mft_attr_snapshot {
 	u16 attr_off;		/* attribute offset in record 0 */
 	u16 pairs_off;		/* mapping-pairs offset within the attribute */
 	u16 pairs_len;		/* mapping-pairs byte length */
+	u16 flags;		/* attribute flags (ATTR_IS_SPARSE et al) */
+	u16 name_off;		/* name offset within the attribute */
 	u8 *pairs;		/* kmalloc'd copy of the pairs */
 };
 
@@ -188,6 +190,8 @@ static int snapshot_mft_attr(const struct mft_record *m0, __le32 type,
 		le64_to_cpu(a->data.non_resident.compressed_size) : 0;
 	snap->attr_off = off;
 	snap->pairs_off = pairs_off;
+	snap->flags = le16_to_cpu(a->flags);
+	snap->name_off = le16_to_cpu(a->name_offset);
 	snap->pairs_len = (u16)(len - pairs_off);
 	snap->pairs = kmalloc(snap->pairs_len, GFP_NOFS);
 	if (!snap->pairs)
@@ -543,7 +547,14 @@ static int stage_mft_attr(struct ntfs_journal_txn *t,
 		return -ENOENT;
 	len = le32_to_cpu(a->length);
 	pairs_off = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
-	if (off != snap->attr_off || pairs_off != snap->pairs_off)
+	/* The create path extends $MFT $DATA/$BITMAP by allocation, never
+	 * by a hole, so the header never flips here: the old and new
+	 * flags, name_off and pairs_off are the same. If they ever
+	 * differ, abort to unjournaled rather than log a half-described
+	 * attribute. */
+	if (off != snap->attr_off || pairs_off != snap->pairs_off ||
+	    le16_to_cpu(a->flags) != snap->flags ||
+	    le16_to_cpu(a->name_offset) != snap->name_off)
 		return -ENOENT;
 	if (pairs_off >= len)
 		return -EIO;
@@ -553,7 +564,9 @@ static int stage_mft_attr(struct ntfs_journal_txn *t,
 		err = ntfs_log_txn_update_mapping_pairs(
 			t->t, t->vol->log_mft_data_attr, vcn, cluster_off,
 			page_lcn, off, pairs_off,
+			le16_to_cpu(a->flags), le16_to_cpu(a->name_offset),
 			(const u8 *)a + pairs_off, (u16)(len - pairs_off),
+			snap->flags, snap->name_off, snap->pairs_off,
 			snap->pairs, snap->pairs_len);
 		if (err)
 			return err;

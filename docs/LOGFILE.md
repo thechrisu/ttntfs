@@ -190,7 +190,7 @@ holds the next free index. Entries are addressed by byte offset (that is what
 | 05 / 06 | CreateAttribute / DeleteAttribute | MFT: insert / remove at an attribute boundary, link count for indexed resident attrs |
 | 07 | UpdateResidentValue | MFT: in place when redo/undo lengths match, else resize the attribute |
 | 08 | UpdateNonresidentValue | cluster: copy `dlen` at `record_offset`; INDX blocks are re-protected |
-| 09 | UpdateMappingPairs | MFT: splice mapping pairs, recompute `highest_vcn` |
+| 09 | UpdateMappingPairs | MFT: splice mapping pairs, recompute `highest_vcn`; redo/undo payloads are prefixed with an 8-byte header (`flags`, `name_off`, `pairs_off`) — a sparse flip moves all three, so the pairs alone do not describe the attribute |
 | 0a | DeleteDirtyClusters | analysis: zero matching `page_lcns` |
 | 0b | SetNewAttributeSizes | MFT: alloc/data/valid (+ total when the attribute has the field) |
 | 0c / 0d / 11 / 13 / 21 | Add/DeleteIndexEntryRoot, SetIndexEntryVcnRoot, UpdateFileNameRoot, UpdateRecordDataRoot | MFT: `$INDEX_ROOT` entry ops |

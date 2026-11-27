@@ -1034,6 +1034,142 @@ static void test_undo_bitmap(void)
 	free(b.buf);
 }
 
+/* Record 40 with one non-resident $DATA: 16 clusters at LCN 48, plain
+ * (pairs at 0x40, flags 0). The pairs are {0x41, 16, 48, 0, 0, 0, 0}. */
+static void fill_data16(uint8_t *rec, uint32_t *off)
+{
+	put_nonres_attr(rec, off, ATTR_TYPE_DATA, 48, 16, 1);
+}
+
+/*
+ * UpdateMappingPairs with a sparse flip: the redo extends record 40's
+ * $DATA by a 48-cluster hole, which flips the attribute sparse — flags
+ * 0 -> 0x8000, name_off and mapping_pairs_offset 0x40 -> 0x48. The
+ * redo payload carries the new header, the undo payload the old one;
+ * the pairs themselves are the full run lists, not deltas. When
+ * @commit is false the transaction has no Commit record, so the replay
+ * redoes it and then undoes it (ARIES: redo everything, undo losers).
+ */
+static void build_pairs_flip_scenario(struct lb *b, bool commit)
+{
+	uint8_t oat[256];
+	uint32_t oatn = build_oatbl(oat, 6, ATTR_TYPE_DATA);
+	uint64_t start, oa_lsn, restart_lsn;
+	struct crec c;
+	static const uint8_t old_pairs[7] = { 0x41, 16, 48, 0, 0, 0, 0 };
+	static const uint8_t new_pairs[6] = { 0x11, 16, 48, 0x01, 48, 0 };
+	uint8_t redo[MP_HDR_SIZE + sizeof(new_pairs)];
+	uint8_t undo[MP_HDR_SIZE + sizeof(old_pairs)];
+
+	lb_init(b, FIRST_PAGE, 2);
+	start = lb_simple(b, 0x18, LOP_Noop, LOP_Noop);
+	oa_lsn = lb_table_dump(b, LOP_OpenAttributeTableDump, oat, oatn);
+	restart_lsn = lb_checkpoint(b, 0, oa_lsn, oatn, 0, 0, 0, 0);
+
+	lf_put16(redo + MP_HDR_FLAGS, 0x8000);
+	lf_put16(redo + MP_HDR_NAME_OFF, AT_NONRESIDENT_EX_SIZE);
+	lf_put16(redo + MP_HDR_PAIRS_OFF, AT_NONRESIDENT_EX_SIZE);
+	lf_put16(redo + MP_HDR_PAIRS_OFF + 2, 0);
+	memcpy(redo + MP_HDR_SIZE, new_pairs, sizeof(new_pairs));
+	lf_put16(undo + MP_HDR_FLAGS, 0);
+	lf_put16(undo + MP_HDR_NAME_OFF, AT_NONRESIDENT_SIZE);
+	lf_put16(undo + MP_HDR_PAIRS_OFF, AT_NONRESIDENT_SIZE);
+	lf_put16(undo + MP_HDR_PAIRS_OFF + 2, 0);
+	memcpy(undo + MP_HDR_SIZE, old_pairs, sizeof(old_pairs));
+
+	/* Record 40 is at vcn 10 (MFT_LCN + 10), its $DATA at 0x38. */
+	memset(&c, 0, sizeof(c));
+	c.redo_op = LOP_UpdateMappingPairs;
+	c.undo_op = LOP_UpdateMappingPairs;
+	c.target_attr = 0x18;
+	c.lcns = 1;
+	c.lcn[0] = MFT_LCN + 10;
+	c.target_vcn = 10;
+	c.cluster_off = 0;
+	c.record_off = MR_FIXUP_OFFSET_3 + 8;
+	c.attr_off = AT_NONRESIDENT_EX_SIZE;
+	c.redo = redo; c.redo_len = (uint16_t)sizeof(redo);
+	c.undo = undo; c.undo_len = (uint16_t)sizeof(undo);
+	lb_client(b, 0x40, 0, &c);
+	if (commit) {
+		lb_simple(b, 0x40, LOP_CommitTransaction, LOP_Noop);
+		lb_simple(b, 0x40, LOP_ForgetTransaction, LOP_Noop);
+	}
+	lb_restart(b, b->last_lsn, b->last_len, start, restart_lsn, 0, false);
+	lb_protect(b);
+}
+
+static void test_update_mapping_pairs_sparse_flip(void)
+{
+	struct lb b;
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint8_t rec[VRS];
+	const uint8_t *r, *a;
+	static const uint8_t old_pairs[7] = { 0x41, 16, 48, 0, 0, 0, 0 };
+	static const uint8_t new_pairs[6] = { 0x11, 16, 48, 0x01, 48, 0 };
+
+	printf("test_update_mapping_pairs_sparse_flip\n");
+
+	/* Committed: the redo flips record 40's $DATA sparse. */
+	build_pairs_flip_scenario(&b, true);
+	m.buf = b.buf; m.size = LSIZE; m.writes = 0;
+	log = open_log(&m, &io);
+	vol_init(&v);
+	build_record(rec, 40, MFT_RECORD_IN_USE, fill_data16);
+	vol_put_record(&v, 40, rec);
+	vol_apply(&v, &ap);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK(!res.needs_chkdsk);
+	CHECK_EQ(res.records_redone, 1);
+	CHECK_EQ(res.records_undone, 0);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK_EQ(res.mft_records_written, 1);
+	r = v.disk + MFT_LCN * VCS + 40 * VRS;
+	a = r + (MR_FIXUP_OFFSET_3 + 8);
+	CHECK_EQ(lf_get32(a + AT_TYPE), ATTR_TYPE_DATA);
+	CHECK_EQ(lf_get16(a + AT_FLAGS), 0x8000);
+	CHECK_EQ(lf_get16(a + AT_NAME_OFFSET), AT_NONRESIDENT_EX_SIZE);
+	CHECK_EQ(lf_get16(a + AT_MAPPING_PAIRS_OFFSET), AT_NONRESIDENT_EX_SIZE);
+	CHECK_EQ(lf_get64(a + AT_HIGHEST_VCN), 63);
+	CHECK_EQ(lf_get32(a + AT_LENGTH), LF_ALIGN8(AT_NONRESIDENT_EX_SIZE + 6));
+	CHECK(memcmp(a + AT_NONRESIDENT_EX_SIZE, new_pairs, sizeof(new_pairs)) == 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(b.buf);
+
+	/* Uncommitted: redo then undo restores the plain attribute. */
+	build_pairs_flip_scenario(&b, false);
+	m.buf = b.buf; m.size = LSIZE; m.writes = 0;
+	log = open_log(&m, &io);
+	vol_init(&v);
+	build_record(rec, 40, MFT_RECORD_IN_USE, fill_data16);
+	vol_put_record(&v, 40, rec);
+	vol_apply(&v, &ap);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, false, &res), 0);
+	CHECK(!res.needs_chkdsk);
+	CHECK_EQ(res.records_redone, 1);
+	CHECK_EQ(res.records_undone, 1);
+	CHECK_EQ(res.transactions_active, 1);
+	CHECK_EQ(res.mft_records_written, 1);
+	r = v.disk + MFT_LCN * VCS + 40 * VRS;
+	a = r + (MR_FIXUP_OFFSET_3 + 8);
+	CHECK_EQ(lf_get32(a + AT_TYPE), ATTR_TYPE_DATA);
+	CHECK_EQ(lf_get16(a + AT_FLAGS), 0);
+	CHECK_EQ(lf_get16(a + AT_NAME_OFFSET), AT_NONRESIDENT_SIZE);
+	CHECK_EQ(lf_get16(a + AT_MAPPING_PAIRS_OFFSET), AT_NONRESIDENT_SIZE);
+	CHECK_EQ(lf_get64(a + AT_HIGHEST_VCN), 15);
+	CHECK_EQ(lf_get32(a + AT_LENGTH), LF_ALIGN8(AT_NONRESIDENT_SIZE + 7));
+	CHECK(memcmp(a + AT_NONRESIDENT_SIZE, old_pairs, sizeof(old_pairs)) == 0);
+	ntfs_logfile_close(log);
+	free(v.disk);
+	free(b.buf);
+}
+
 static void test_refuse_incoherent(void)
 {
 	struct lb b;
@@ -3243,11 +3379,16 @@ static void test_journal_create_mft_sizes(void)
 		/* Pairs first, then sizes — the order the create path
 		 * stages them, so the redo extends the runs before it
 		 * grows the sizes. Record 0's $DATA is at 0x38, its
-		 * pairs at AT_NONRESIDENT_SIZE (0x40). */
+		 * pairs at AT_NONRESIDENT_SIZE (0x40). No header change:
+		 * the old and new flags, name_off and pairs_off are
+		 * the same (flags 0, name at 0x40). */
 		CHECK_EQ(ntfs_log_txn_update_mapping_pairs(t, 0x18, 0, 0,
 							     MFT_LCN, 0x38,
 							     AT_NONRESIDENT_SIZE,
+							     0, AT_NONRESIDENT_SIZE,
 							     new_pairs, 7,
+							     0, AT_NONRESIDENT_SIZE,
+							     AT_NONRESIDENT_SIZE,
 							     old_pairs, 7), 0);
 		/* Short-form: no compressed_size field, total is 0. */
 		CHECK_EQ(ntfs_log_txn_set_attr_sizes(t, 0x18, 0, 0, MFT_LCN,
@@ -4186,6 +4327,7 @@ int main(void)
 	test_walk_wrap_multipage();
 	test_redo_bitmap();
 	test_undo_bitmap();
+	test_update_mapping_pairs_sparse_flip();
 	test_refuse_incoherent();
 	test_mft_record_ops();
 	test_tail_copy_and_torn();

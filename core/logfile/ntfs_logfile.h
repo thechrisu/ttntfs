@@ -430,7 +430,10 @@ int ntfs_log_txn_update_mapping_pairs(ntfs_log_txn_t *t, uint32_t mft_attr,
 				      uint64_t target_vcn, uint16_t cluster_off,
 				      uint64_t page_lcn, uint16_t record_off,
 				      uint16_t attr_off,
+				      uint16_t new_flags, uint16_t new_name_off,
 				      const void *new_pairs, uint16_t new_len,
+				      uint16_t old_flags, uint16_t old_name_off,
+				      uint16_t old_attr_off,
 				      const void *old_pairs, uint16_t old_len);
 int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 			uint64_t *last_lsn_out);

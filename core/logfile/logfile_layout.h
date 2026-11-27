@@ -350,6 +350,24 @@ enum {
 	AT_NONRESIDENT_SIZE	= 0x40,
 	AT_NONRESIDENT_EX_SIZE	= 0x48,
 };
+
+/*
+ * UpdateMappingPairs redo/undo payload header (8 bytes, before the pairs).
+ * The pairs alone do not describe the attribute: extending a file with a
+ * hole flips it sparse, which inserts the 8-byte compressed_size field
+ * and moves name_offset and mapping_pairs_offset by 8 (and sets
+ * ATTR_IS_SPARSE). The record must carry the header fields the pairs
+ * sit under, or a replay would write the new pairs under the old header
+ * and an undo could not restore the old offset at all. Both payloads
+ * carry their own header: the redo's pairs_off duplicates the record's
+ * ATTRIBUTE_OFFSET, the undo's is the only copy of the old offset.
+ */
+enum {
+	MP_HDR_SIZE		= 8,
+	MP_HDR_FLAGS		= 0,
+	MP_HDR_NAME_OFF		= 2,
+	MP_HDR_PAIRS_OFF	= 4,
+};
 #define ATTR_TYPE_STANDARD_INFORMATION	0x10u
 #define ATTR_TYPE_ATTRIBUTE_LIST	0x20u
 #define ATTR_TYPE_FILE_NAME		0x30u

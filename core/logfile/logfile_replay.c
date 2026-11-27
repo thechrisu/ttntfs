@@ -1160,18 +1160,39 @@ static int do_action(struct replay *r, uint32_t target_attr, const struct action
 			break;
 		}
 		case LOP_UpdateMappingPairs: {
-			nsize = aoff + dlen;
+			/* The payload is the MP_HDR_SIZE header (flags,
+			 * name_off, pairs_off) plus the pairs. The header
+			 * fields are applied first: a sparse flip moves
+			 * the pairs by 8, so the pairs must be written
+			 * under the header they belong to, and the undo
+			 * payload is the only copy of the old header.
+			 * The record's ATTRIBUTE_OFFSET is the redo
+			 * pairs_off; on undo the header carries the old
+			 * one instead. */
+			uint16_t poff;
+			const uint8_t *pairs;
+			uint32_t pairs_len;
+
+			if (dlen < MP_HDR_SIZE)
+				return INCOHERENT(r, "UpdateMappingPairs: short data");
+			poff = lf_get16(data + MP_HDR_PAIRS_OFF);
+			pairs = data + MP_HDR_SIZE;
+			pairs_len = dlen - MP_HDR_SIZE;
+			nsize = poff + pairs_len;
 			asize = lf_get32(attr + AT_LENGTH);
 			used = lf_get32(rec + MR_BYTES_IN_USE);
 			if (!check_if_attr(rec, rs, roff) || !attr[AT_NON_RESIDENT] ||
-			    aoff < lf_get16(attr + AT_MAPPING_PAIRS_OFFSET) || aoff > asize ||
+			    poff < AT_NONRESIDENT_SIZE || poff > asize ||
 			    (nsize > asize && nsize - asize > rs - used))
 				return INCOHERENT(r, "UpdateMappingPairs: inconsistent");
+			lf_put16(attr + AT_FLAGS, lf_get16(data + MP_HDR_FLAGS));
+			lf_put16(attr + AT_NAME_OFFSET, lf_get16(data + MP_HDR_NAME_OFF));
+			lf_put16(attr + AT_MAPPING_PAIRS_OFFSET, poff);
 			nsize = LF_ALIGN8(nsize);
 			memmove(attr + nsize, attr + asize, used - roff - asize);
 			lf_put32(rec + MR_BYTES_IN_USE, used + nsize - asize);
 			lf_put32(attr + AT_LENGTH, nsize);
-			memmove(attr + aoff, data, dlen);
+			memmove(attr + poff, pairs, pairs_len);
 			/* Recompute highest_vcn from the new mapping pairs. */
 			{
 				struct open_attr tmp;

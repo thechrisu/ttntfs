@@ -1396,23 +1396,54 @@ int ntfs_log_txn_set_attr_sizes(ntfs_log_txn_t *t, uint32_t mft_attr,
 /*
  * UpdateMappingPairs: the mapping pairs of the attribute at
  * @record_off in the MFT record at @target_vcn are replaced wholesale
- * — @new_pairs at @attr_off on redo, @old_pairs on undo. The pairs
- * are the attribute's full run list, not a delta; the replay
- * recomputes highest_vcn from them.
+ * — @new_pairs at @attr_off on redo, @old_pairs at @old_attr_off on
+ * undo. The pairs are the attribute's full run list, not a delta; the
+ * replay recomputes highest_vcn from them. Each payload is prefixed
+ * with the MP_HDR_SIZE header (flags, name_off, pairs_off) the pairs
+ * sit under: a sparse flip moves all three, so the pairs alone do not
+ * describe the attribute and the undo payload is the only copy of the
+ * old header. @attr_off is the redo pairs_off; it duplicates the
+ * redo header's pairs_off.
  */
 int ntfs_log_txn_update_mapping_pairs(ntfs_log_txn_t *t, uint32_t mft_attr,
 				      uint64_t target_vcn, uint16_t cluster_off,
 				      uint64_t page_lcn, uint16_t record_off,
 				      uint16_t attr_off,
+				      uint16_t new_flags, uint16_t new_name_off,
 				      const void *new_pairs, uint16_t new_len,
+				      uint16_t old_flags, uint16_t old_name_off,
+				      uint16_t old_attr_off,
 				      const void *old_pairs, uint16_t old_len)
 {
+	uint8_t *redo = NULL, *undo = NULL;
+	int err;
+
 	if (!new_pairs || !new_len || !old_pairs || !old_len)
 		return -EINVAL;
-	return txn_add(t, LOP_UpdateMappingPairs, LOP_UpdateMappingPairs,
-		       mft_attr, 1, record_off, attr_off, cluster_off,
-		       target_vcn, &page_lcn, new_pairs, new_len,
-		       old_pairs, old_len);
+	redo = malloc(MP_HDR_SIZE + new_len);
+	undo = malloc(MP_HDR_SIZE + old_len);
+	if (!redo || !undo) {
+		err = -ENOMEM;
+		goto out;
+	}
+	lf_put16(redo + MP_HDR_FLAGS, new_flags);
+	lf_put16(redo + MP_HDR_NAME_OFF, new_name_off);
+	lf_put16(redo + MP_HDR_PAIRS_OFF, attr_off);
+	lf_put16(redo + MP_HDR_PAIRS_OFF + 2, 0);
+	memcpy(redo + MP_HDR_SIZE, new_pairs, new_len);
+	lf_put16(undo + MP_HDR_FLAGS, old_flags);
+	lf_put16(undo + MP_HDR_NAME_OFF, old_name_off);
+	lf_put16(undo + MP_HDR_PAIRS_OFF, old_attr_off);
+	lf_put16(undo + MP_HDR_PAIRS_OFF + 2, 0);
+	memcpy(undo + MP_HDR_SIZE, old_pairs, old_len);
+	err = txn_add(t, LOP_UpdateMappingPairs, LOP_UpdateMappingPairs,
+		      mft_attr, 1, record_off, attr_off, cluster_off,
+		      target_vcn, &page_lcn, redo, MP_HDR_SIZE + new_len,
+		      undo, MP_HDR_SIZE + old_len);
+out:
+	free(redo);
+	free(undo);
+	return err;
 }
 
 /* Append one staged record; update the transaction-table entry. */
