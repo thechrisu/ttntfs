@@ -82,6 +82,12 @@ int ntfs_reparse_set_wsl_symlink(struct ntfs_inode *ni,
 			const __le16 *target, int target_len);
 int ntfs_reparse_set_wsl_not_symlink(struct ntfs_inode *ni, mode_t mode);
 int ntfs_delete_reparse_index(struct ntfs_inode *ni);
-int ntfs_remove_ntfs_reparse_data(struct ntfs_inode *ni);
+
+/* NOTE: ntfs_remove_ntfs_reparse_data was declared here but never
+ * defined or called in this port — it exists only in libntfs-3g,
+ * where it removes reparse data from an inode (xattrs.c, dir.c).
+ * This driver has no such path: the setters run only at create, and
+ * removal is ntfs_delete_reparse_index at unlink. The dead
+ * declaration was removed in the reparse class (2026-11-27). */
 
 #endif /* _LINUX_NTFS_REPARSE_H */

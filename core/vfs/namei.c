@@ -1126,6 +1126,23 @@ search:
 	 */
 	if (ni_mrec->link_count == 0) {
 		NInoSetBeingDeleted(ni);
+		/*
+		 * PORT: journal the $R entry removal
+		 * (docs/JOURNAL-DESIGN.md Phase 3, reparse class).
+		 * Stage before the removal, from the live entry: the
+		 * entry is gone afterwards. Any staging failure aborts
+		 * the transaction and the delete proceeds unjournaled.
+		 */
+		if (jt) {
+			err = ntfs_journal_unlink_stage_reparse(jt, ni);
+			if (err) {
+				ntfs_journal_unlink_abort(jt);
+				jt = NULL;
+				if (jtp)
+					*jtp = NULL;
+				err = 0;
+			}
+		}
 		ntfs_delete_reparse_index(ni);
 		ntfs_delete_object_id_index(ni);
 		link_count_zero = true;

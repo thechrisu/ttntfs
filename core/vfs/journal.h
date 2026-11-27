@@ -158,17 +158,20 @@ void ntfs_journal_create_abort(struct ntfs_journal_txn *t);
  * and case handling — instead of a second search that could disagree
  * with it.
  *
- * Not journaled, by design: a target carrying a reparse point or an
- * object ID (ntfs_journal_unlink_check, -ENOENT) — ntfs_delete also
- * removes its $Extend index entry, which this class cannot describe
- * yet (that belongs to the reparse/EA class); the parent's $SI mtime
- * update after the delete (same known gap as the create path, the
- * setattr class's work — the WAL gate holds the directory record
- * until the commit, so the mtime can never reach the disk ahead of
- * the index removal); an index entry in an $INDEX_ALLOCATION block
- * or a $FILE_NAME outside the base record (-ENOENT from the staging
- * helpers). In every case the caller aborts and proceeds unjournaled,
- * exactly as the driver did before Phase 2.
+ * Not journaled, by design: a target carrying an object ID
+ * (ntfs_journal_unlink_check, -ENOENT) — ntfs_delete also removes
+ * its $Extend index entry, which this class cannot describe yet;
+ * the parent's $SI mtime update after the delete (same known gap
+ * as the create path, the setattr class's work — the WAL gate holds
+ * the directory record until the commit, so the mtime can never
+ * reach the disk ahead of the index removal); an index entry in an
+ * $INDEX_ALLOCATION block or a $FILE_NAME outside the base record
+ * (-ENOENT from the staging helpers). A reparse point IS journaled
+ * since the reparse class: its $R entry removal is staged by
+ * ntfs_journal_unlink_stage_reparse in the link-count-0 branch,
+ * and the commit stamps MR_LSN into $Reparse's record too. In every
+ * case the caller aborts and proceeds unjournaled, exactly as the
+ * driver did before Phase 2.
  *
  * The record free IS part of this transaction: when the link count
  * hits 0, ntfs_delete stages a Deallocate record (redo clears
@@ -200,10 +203,12 @@ void ntfs_journal_unlink_abort(struct ntfs_journal_unlink *u);
 
 /* Gate check, called from inside ntfs_delete under the mrec locks
  * before anything mutates: 0 when the unlink can be journaled,
- * -ENOENT when the target carries a reparse point or an object ID
- * (its $Extend index removal is undescribable here) — the caller
- * aborts and proceeds unjournaled. Any other error is also -ENOENT
- * to the caller: a record that cannot be read cannot be journaled. */
+ * -ENOENT when the target carries an object ID (its $Extend index
+ * removal is undescribable here) — the caller aborts and proceeds
+ * unjournaled. A reparse point is journaled since the reparse class
+ * (its $R entry removal is staged in the link-count-0 branch). Any
+ * other error is also -ENOENT to the caller: a record that cannot be
+ * read cannot be journaled. */
 int ntfs_journal_unlink_check(struct ntfs_journal_unlink *u,
 			      struct ntfs_inode *ni);
 
@@ -248,6 +253,17 @@ int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
 				   struct ntfs_inode *ni,
 				   const struct mft_record *mrec);
 
+/* Stage the $R index entry removal for a reparse point whose link
+ * count just hit 0: a DeleteIndexEntryRoot record for the entry in
+ * $Reparse's $INDEX_ROOT, found by (tag, file_id). Call from
+ * ntfs_delete in the link-count-0 branch, before
+ * ntfs_delete_reparse_index removes the entry. Returns 0 when the
+ * target is not a reparse point (nothing staged) and -ENOENT when
+ * the entry cannot be described; the caller then aborts and
+ * proceeds unjournaled. */
+int ntfs_journal_unlink_stage_reparse(struct ntfs_journal_unlink *u,
+				      struct ntfs_inode *ni);
+
 /* ---- Rename (Phase 3, second class) -------------------------------------
  *
  * A rename is one transaction per __ntfs_vfs_rename call, in the order
@@ -288,10 +304,12 @@ int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
  *
  * Not journaled, by design: any step whose staging fails (-ENOENT
  * from a lookup miss — an entry in an $INDEX_ALLOCATION block, a
- * $FILE_NAME outside the base record, a reparse point or object ID
- * on either deleted name, via ntfs_delete's check) aborts the
- * transaction and the rename proceeds unjournaled, exactly as the
- * driver did before Phase 2. The $SI mtime/ctime updates the
+ * $FILE_NAME outside the base record, an object ID on either deleted
+ * name, via ntfs_delete's check, or a $R entry that cannot be
+ * staged) aborts the transaction and the rename proceeds
+ * unjournaled, exactly as the driver did before Phase 2. A rename
+ * of a reparse point is journaled since the reparse class: the $R
+ * entry's key is (tag, file_id), which a rename does not change. The $SI mtime/ctime updates the
  * rename makes (simple_rename_timestamp) are not journaled either
  * — the same known gap as the create path's parent $SI mtime, the
  * setattr class's work; the staged $FILE_NAME carries the

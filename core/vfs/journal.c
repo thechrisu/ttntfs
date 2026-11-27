@@ -318,6 +318,39 @@ void ntfs_journal_create_abort(struct ntfs_journal_txn *t)
 	kfree(t);
 }
 
+/* Stamp MR_LSN into $Reparse's record. A transaction that added or
+ * removed a $R index entry there must stamp it, or a post-commit
+ * flush + crash replays the entry record onto a record that already
+ * carries (or already lacks) it: AddIndexEntryRoot inserts
+ * unconditionally and DeleteIndexEntryRoot is offset-based, so either
+ * re-application corrupts the index. Best-effort: the commit already
+ * succeeded, so a stamp failure here (an iget/map failure on a
+ * record that exists — its entry was staged moments ago) cannot fail
+ * the operation; it leaves the same re-application risk a failed
+ * commit leaves for the other records. */
+static void stamp_reparse_mft_lsn(struct ntfs_volume *vol,
+				  u64 reparse_mft_no, u64 last_lsn)
+{
+	struct inode *rp_vi;
+	struct mft_record *rp_mrec;
+
+	if (!reparse_mft_no)
+		return;
+	rp_vi = ntfs_iget(vol->sb, reparse_mft_no);
+	if (IS_ERR(rp_vi))
+		return;
+	mutex_lock_nested(&NTFS_I(rp_vi)->mrec_lock,
+			  NTFS_EXTEND_MUTEX_PARENT);
+	rp_mrec = map_mft_record(NTFS_I(rp_vi));
+	if (rp_mrec) {
+		rp_mrec->lsn = cpu_to_le64(last_lsn);
+		mark_mft_record_dirty(NTFS_I(rp_vi));
+		unmap_mft_record(NTFS_I(rp_vi));
+	}
+	mutex_unlock(&NTFS_I(rp_vi)->mrec_lock);
+	iput(rp_vi);
+}
+
 int ntfs_journal_create_commit(struct ntfs_journal_txn *t,
 			       struct mft_record *mrec,
 			       struct mft_record *parent_mrec)
@@ -348,30 +381,8 @@ int ntfs_journal_create_commit(struct ntfs_journal_txn *t,
 		 * replays the AddIndexEntryRoot onto a record that
 		 * already has it and duplicates the entry — the replay's
 		 * AddIndexEntryRoot inserts unconditionally, and its
-		 * skip check is this record's MR_LSN. Best-effort: the
-		 * commit already succeeded, so a stamp failure here (an
-		 * iget/map failure on a record that exists — we staged
-		 * its entry moments ago) cannot fail the create; it
-		 * leaves the same duplicate-on-replay risk a failed
-		 * commit leaves for the other records. */
-		if (t->reparse_mft_no) {
-			struct inode *rp_vi =
-				ntfs_iget(t->vol->sb, t->reparse_mft_no);
-			struct mft_record *rp_mrec;
-
-			if (!IS_ERR(rp_vi)) {
-				mutex_lock_nested(&NTFS_I(rp_vi)->mrec_lock,
-						  NTFS_EXTEND_MUTEX_PARENT);
-				rp_mrec = map_mft_record(NTFS_I(rp_vi));
-				if (rp_mrec) {
-					rp_mrec->lsn =
-						cpu_to_le64(last_lsn);
-					unmap_mft_record(NTFS_I(rp_vi));
-				}
-				mutex_unlock(&NTFS_I(rp_vi)->mrec_lock);
-				iput(rp_vi);
-			}
-		}
+		 * skip check is this record's MR_LSN. */
+		stamp_reparse_mft_lsn(t->vol, t->reparse_mft_no, last_lsn);
 	}
 	free_snapshot(&t->snap_data);
 	free_snapshot(&t->snap_bmp);
@@ -585,6 +596,80 @@ found:
 	return err;
 }
 
+/*
+ * Find the $R index entry for (tag, file_id) in @rp_mrec's $INDEX_ROOT
+ * named "$R". The entry is a struct reparse_index: a 16-byte header,
+ * the 12-byte key, a 4-byte filling. On success fills @attr_off_out
+ * (the $INDEX_ROOT's offset in the record), @entry_off_out (the
+ * entry's offset from the attribute record's start — the aoff the log
+ * records carry), @len_out and @entry_out (the entry itself, valid
+ * while @rp_mrec stays mapped). Returns -ENOENT when the entry is not
+ * in the root (it lives in an $INDEX_ALLOCATION block, which this
+ * phase cannot describe) and -EINVAL on a corrupt index. Shared by
+ * the create staging (which adds the entry) and the unlink staging
+ * (which removes it).
+ */
+static int find_reparse_index_entry(const struct mft_record *rp_mrec,
+				    __le32 tag, u64 file_id,
+				    u16 *attr_off_out, u16 *entry_off_out,
+				    u32 *len_out,
+				    const struct index_entry **entry_out)
+{
+	const struct attr_record *a;
+	const struct index_root *ir;
+	const struct index_header *ih;
+	const u8 *value, *entries, *end;
+	const struct index_entry *e;
+	u16 attr_off = 0;
+
+	a = find_attr(rp_mrec, AT_INDEX_ROOT, reparse_index_name, 2,
+		      &attr_off);
+	if (!a || a->non_resident)
+		return -ENOENT;
+	value = (const u8 *)a +
+		le16_to_cpu(a->data.resident.value_offset);
+	ir = (const struct index_root *)value;
+	ih = &ir->index;
+	entries = (const u8 *)ih + le32_to_cpu(ih->entries_offset);
+	end = (const u8 *)ih + le32_to_cpu(ih->index_length);
+	if (entries < value ||
+	    end > value + le32_to_cpu(a->data.resident.value_length))
+		return -EINVAL;
+	for (e = (const struct index_entry *)entries;
+	     (const u8 *)e + 16 <= end;) {
+		u16 elen = le16_to_cpu(e->length);
+
+		if (elen < 16 || (const u8 *)e + elen > end)
+			return -EINVAL;
+		if (e->flags & INDEX_ENTRY_END)
+			break;
+		if (elen < sizeof(struct reparse_index))
+			return -EINVAL;
+		{
+			const struct reparse_index *ri =
+				(const struct reparse_index *)e;
+
+			if (ri->key.reparse_tag == tag &&
+			    le64_to_cpu(ri->key.file_id) == file_id) {
+				if (attr_off_out)
+					*attr_off_out = attr_off;
+				if (entry_off_out)
+					*entry_off_out = (u16)((const u8 *)e -
+							(const u8 *)a);
+				if (len_out)
+					*len_out = elen;
+				if (entry_out)
+					*entry_out = e;
+				return 0;
+			}
+		}
+		e = (const struct index_entry *)((const u8 *)e + elen);
+	}
+	/* Not in the root: the entry went to an $INDEX_ALLOCATION block,
+	 * which Phase 2 cannot describe. */
+	return -ENOENT;
+}
+
 /* Stage the three records a symlink create adds on top of a plain
  * create, in live order: the $REPARSE_POINT attribute (its value was
  * just written into the mapped record), the $R index entry in
@@ -605,10 +690,6 @@ int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
 				struct ntfs_inode *ni,
 				const struct mft_record *mrec)
 {
-	const struct attr_record *a;
-	const struct index_root *ir;
-	const struct index_header *ih;
-	const u8 *value, *entries, *end;
 	const struct index_entry *e;
 	struct inode *rp_vi;
 	struct ntfs_inode *rp_ni;
@@ -645,65 +726,17 @@ int ntfs_journal_create_reparse(struct ntfs_journal_txn *t,
 		err = -ENOENT;
 		goto out_unlock;
 	}
-	a = find_attr(rp_mrec, AT_INDEX_ROOT, reparse_index_name, 2,
-		      &attr_off);
-	if (!a || a->non_resident) {
-		err = -ENOENT;
+	err = find_reparse_index_entry(rp_mrec, ni->reparse_tag,
+				       MK_MREF(ni->mft_no, ni->seq_no),
+				       &attr_off, &entry_off, &len, &e);
+	if (err)
 		goto out_unmap;
-	}
-	value = (const u8 *)a +
-		le16_to_cpu(a->data.resident.value_offset);
-	ir = (const struct index_root *)value;
-	ih = &ir->index;
-	entries = (const u8 *)ih + le32_to_cpu(ih->entries_offset);
-	end = (const u8 *)ih + le32_to_cpu(ih->index_length);
-	if (entries < value ||
-	    end > value + le32_to_cpu(a->data.resident.value_length)) {
-		err = -EINVAL;
-		goto out_unmap;
-	}
-	for (e = (const struct index_entry *)entries;
-	     (const u8 *)e + 16 <= end;) {
-		u16 elen = le16_to_cpu(e->length);
-
-		if (elen < 16 || (const u8 *)e + elen > end) {
-			err = -EINVAL;
-			goto out_unmap;
-		}
-		if (e->flags & INDEX_ENTRY_END)
-			break;
-		if (elen < sizeof(struct reparse_index)) {
-			err = -EINVAL;
-			goto out_unmap;
-		}
-		{
-			const struct reparse_index *ri =
-				(const struct reparse_index *)e;
-
-			if (le32_to_cpu(ri->key.reparse_tag) ==
-					ni->reparse_tag &&
-			    le64_to_cpu(ri->key.file_id) ==
-				    MK_MREF(ni->mft_no, ni->seq_no)) {
-				len = elen;
-				goto found;
-			}
-		}
-		e = (const struct index_entry *)((const u8 *)e + elen);
-	}
-	/* Not in the root: the entry went to an $INDEX_ALLOCATION block,
-	 * which Phase 2 cannot describe. */
-	err = -ENOENT;
-	goto out_unmap;
-
-found:
 	copy = kmalloc(len, GFP_NOFS);
 	if (!copy) {
 		err = -ENOMEM;
 		goto out_unmap;
 	}
 	memcpy(copy, e, len);
-	/* aoff is the entry's offset from the attribute record's start. */
-	entry_off = (u16)((const u8 *)e - (const u8 *)a);
 	err = mft_coords(vol, reparse_mft_no, &vcn, &cluster_off,
 			 &page_lcn);
 	if (!err)
@@ -905,6 +938,12 @@ int ntfs_journal_create_mft_sizes(struct ntfs_journal_txn *t)
 struct ntfs_journal_unlink {
 	struct ntfs_volume *vol;
 	ntfs_log_txn_t *t;
+	/* $Reparse's MFT record number, when the unlink staged a $R
+	 * index entry removal there (a reparse point whose link count
+	 * hit 0): the commit stamps its MR_LSN too, so the replay
+	 * skips the $R removal record. 0 when no $R entry was staged.
+	 * Initialized at begin: kmalloc does not zero (round 25). */
+	u64 reparse_mft_no;
 };
 
 int ntfs_journal_unlink_begin(struct ntfs_volume *vol,
@@ -921,6 +960,7 @@ int ntfs_journal_unlink_begin(struct ntfs_volume *vol,
 		return -ENOMEM;
 	u->vol = vol;
 	u->t = NULL;
+	u->reparse_mft_no = 0;
 	mutex_lock(&vol->log_txn_lock);
 	err = ntfs_log_txn_begin(vol->log_writer, &u->t);
 	if (err) {
@@ -983,6 +1023,14 @@ int ntfs_journal_unlink_commit(struct ntfs_journal_unlink *u,
 				unmap_mft_record(dir_ni);
 			}
 		}
+		/* A reparse point also touched $Reparse's record (its $R
+		 * index entry was removed): stamp it too, or a
+		 * post-commit flush + crash replays the
+		 * DeleteIndexEntryRoot onto a record that already lacks
+		 * the entry — the replay's delete is offset-based, so
+		 * it would excise whatever bytes now sit at that
+		 * offset. */
+		stamp_reparse_mft_lsn(u->vol, u->reparse_mft_no, last_lsn);
 	}
 	atomic_dec(&u->vol->log_txn_open);
 	mutex_unlock(&u->vol->log_txn_lock);
@@ -999,21 +1047,19 @@ int ntfs_journal_unlink_check(struct ntfs_journal_unlink *u,
 	if (!u)
 		return -EINVAL;
 	/*
-	 * A reparse point or an object ID means ntfs_delete also
-	 * removes an $Extend index entry, which this class cannot
-	 * describe — the unlink must proceed unjournaled. The flags
-	 * are the authority for reparse points (ntfs_delete_reparse_index
-	 * keys on them); the record scan covers object IDs, which have
-	 * no such flag. An unreadable record is the same answer: a
+	 * An object ID means ntfs_delete also removes an $Extend
+	 * index entry, which this class cannot describe — the unlink
+	 * must proceed unjournaled. A reparse point is journaled
+	 * since the reparse class: its $R entry removal is staged
+	 * by ntfs_journal_unlink_stage_reparse in the link-count-0
+	 * branch. The record scan covers object IDs, which have no
+	 * flag to key on. An unreadable record is the same answer: a
 	 * record that cannot be read cannot be journaled.
 	 */
-	if (ni->flags & FILE_ATTR_REPARSE_POINT)
-		return -ENOENT;
 	m = map_mft_record(ni);
 	if (IS_ERR(m))
 		return -ENOENT;
-	if (find_attr(m, AT_REPARSE_POINT, NULL, 0, NULL) ||
-	    find_attr(m, AT_OBJECT_ID, NULL, 0, NULL))
+	if (find_attr(m, AT_OBJECT_ID, NULL, 0, NULL))
 		err = -ENOENT;
 	unmap_mft_record(ni);
 	return err;
@@ -1288,6 +1334,118 @@ int ntfs_journal_unlink_stage_free(struct ntfs_journal_unlink *u,
 	return err;
 }
 
+/*
+ * Stage the $R index entry removal for a reparse point whose link
+ * count just hit 0: a DeleteIndexEntryRoot record for the entry in
+ * $Reparse's $INDEX_ROOT, found by (tag, file_id). Call from
+ * ntfs_delete in the link-count-0 branch, before
+ * ntfs_delete_reparse_index removes the entry — the staging reads
+ * the live bytes, and the entry is gone afterwards. The tag comes
+ * from the file's own record (its $REPARSE_POINT value): ni->flags
+ * is the authority for whether the file IS a reparse point, but
+ * ni->reparse_tag is only populated by the readlink path, so it
+ * cannot be trusted here. The $REPARSE_POINT attribute itself needs
+ * no record: the record free staged after this (stage_free) carries
+ * the whole post-delete record, and the attribute dies with the
+ * record. The commit stamps MR_LSN into $Reparse's record too
+ * (u->reparse_mft_no), so the replay skips this record — its delete
+ * is offset-based and would otherwise excise whatever bytes sit at
+ * that offset after a re-application. Returns -ENOENT when the entry
+ * is not in the root (it lives in an $INDEX_ALLOCATION block) or the
+ * file carries no $REPARSE_POINT attribute; the caller then aborts
+ * and proceeds unjournaled. A file that is not a reparse point
+ * stages nothing and returns 0.
+ */
+int ntfs_journal_unlink_stage_reparse(struct ntfs_journal_unlink *u,
+				      struct ntfs_inode *ni)
+{
+	struct inode *rp_vi;
+	struct ntfs_inode *rp_ni;
+	struct mft_record *mrec, *rp_mrec;
+	const struct attr_record *a;
+	const struct index_entry *e = NULL;
+	u64 reparse_mft_no, vcn, page_lcn, file_id;
+	u16 cluster_off, attr_off = 0, entry_off = 0;
+	u16 rp_off = 0;
+	__le32 tag;
+	u8 *copy;
+	u32 len = 0;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	/* Not a reparse point: ntfs_delete removes no $R entry. */
+	if (!(ni->flags & FILE_ATTR_REPARSE_POINT))
+		return 0;
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec))
+		return -ENOENT;
+	a = find_attr(mrec, AT_REPARSE_POINT, NULL, 0, &rp_off);
+	if (!a || a->non_resident) {
+		err = -ENOENT;
+		goto out_unmap;
+	}
+	/* The tag is the first 4 bytes of the reparse value. */
+	if (le16_to_cpu(a->data.resident.value_offset) + sizeof(tag) >
+	    le32_to_cpu(a->data.resident.value_length)) {
+		err = -ENOENT;
+		goto out_unmap;
+	}
+	tag = *(const __le32 *)((const u8 *)a +
+		le16_to_cpu(a->data.resident.value_offset));
+	file_id = MK_MREF(ni->mft_no, ni->seq_no);
+
+	err = ntfs_reparse_mft_no(ni->vol, &reparse_mft_no);
+	if (err) {
+		err = -ENOENT;
+		goto out_unmap;
+	}
+	rp_vi = ntfs_iget(ni->vol->sb, reparse_mft_no);
+	if (IS_ERR(rp_vi)) {
+		err = -ENOENT;
+		goto out_unmap;
+	}
+	rp_ni = NTFS_I(rp_vi);
+	mutex_lock_nested(&rp_ni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	rp_mrec = map_mft_record(rp_ni);
+	if (!rp_mrec) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	err = find_reparse_index_entry(rp_mrec, tag, file_id,
+				       &attr_off, &entry_off, &len, &e);
+	if (err)
+		goto out_rp_unmap;
+	copy = kmalloc(len, GFP_NOFS);
+	if (!copy) {
+		err = -ENOMEM;
+		goto out_rp_unmap;
+	}
+	memcpy(copy, e, len);
+	err = mft_coords(ni->vol, reparse_mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (!err)
+		err = ntfs_log_txn_delete_index_root(u->t,
+						     ni->vol->log_mft_data_attr,
+						     vcn, cluster_off, page_lcn,
+						     attr_off, entry_off,
+						     copy, len);
+	kfree(copy);
+	if (err)
+		goto out_rp_unmap;
+	/* The commit stamps this record's MR_LSN, so the replay skips
+	 * the $R removal record. */
+	u->reparse_mft_no = reparse_mft_no;
+out_rp_unmap:
+	unmap_mft_record(rp_ni);
+out_unlock:
+	mutex_unlock(&rp_ni->mrec_lock);
+	iput(rp_vi);
+out_unmap:
+	unmap_mft_record(ni);
+	return err;
+}
+
 /* ---- rename (Phase 3) ---------------------------------------------------- */
 
 /*
@@ -1489,6 +1647,11 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
 			mark_mft_record_dirty(ni);
 			unmap_mft_record(ni);
 		}
+		/* As in the unlink commit: a reparse point deleted by
+		 * this rename (renaming over an existing link, or the
+		 * old name's last link) also touched $Reparse's
+		 * record. */
+		stamp_reparse_mft_lsn(u->vol, u->reparse_mft_no, last_lsn);
 	}
 	atomic_dec(&u->vol->log_txn_open);
 	mutex_unlock(&u->vol->log_txn_lock);

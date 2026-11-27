@@ -5446,6 +5446,181 @@ static void test_symlink_in_root_unjournaled(void)
 	unlink(snap);
 }
 
+/* ---- 24. unlinking a symlink journals the $R entry removal ---------
+ *
+ * A symlink's unlink is one transaction like a plain file's, plus
+ * the $R index entry removal in $Reparse: the unlink's data records
+ * are DeleteIndexEntryRoot ($I30), DeleteAttribute ($FILE_NAME),
+ * DeleteIndexEntryRoot ($R), DeallocateFileRecordSegment and
+ * ClearBitsInNonresidentBitMap, in that order — the $R removal is
+ * staged in the link-count-0 branch, before ntfs_delete_reparse_index
+ * removes the entry, and the commit stamps MR_LSN into $Reparse's
+ * record too. Before this class the unlink refused reparse points
+ * outright and proceeded unjournaled. The walk below holds the
+ * symlink create's 15 still-live records (its 2 opens are already
+ * dispensable, as in test_unlink_journaled) plus the unlink's 12.
+ */
+static void test_unlink_reparse_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *l = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, sub_ino = 0, rp_ino = 0;
+	uint64_t mrlsn_file = 0, mrlsn_dir = 0, mrlsn_rp = 0,
+		 lsn_del_idx = 0, lsn_del_attr = 0, lsn_del_r = 0;
+	int err;
+
+	printf("test_unlink_reparse_journaled\n");
+	scratch_path(orig, sizeof(orig), "urorig");
+	scratch_path(snap, sizeof(snap), "ursnap");
+	scratch_path(snap1, sizeof(snap1), "ursnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_unlink_reparse_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_symlink(d, "ln.txt", "t.txt", &l);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(l);
+	CHECK(ino > 16);
+	ntfs_inode_put(l);
+	l = NULL;
+	/* $Reparse's record number, for the MR_LSN and $R-entry
+	 * checks below: $Extend/$Reparse, by name. */
+	err = ntfs_lookup(root, "$Extend", &ext);
+	CHECK_EQ(err, 0);
+	if (!err) {
+		err = ntfs_lookup(ext, "$Reparse", &rp);
+		CHECK_EQ(err, 0);
+		if (!err)
+			rp_ino = ntfs_inode_number(rp);
+		ntfs_inode_put(rp);
+		rp = NULL;
+		ntfs_inode_put(ext);
+		ext = NULL;
+	}
+	CHECK(rp_ino != 0);
+	if (err) { goto out; }
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* The unlink: the link, its $R entry and its record all go
+	 * in the one transaction. */
+	CHECK_EQ(ntfs_unlink(d, "ln.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (l) { ntfs_inode_put(l); l = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 27);
+	if (s.n == 27) {
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[16], 0x40u);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[19], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[20], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[21], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[22], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[23], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[25], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[26], LOP_ForgetTransaction);
+		/* Every record targets $MFT:$DATA (0x18) except the
+		 * ClearBits, which targets $MFT:$BITMAP (0x40). */
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.target_attr[18], 0x18u);
+		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.target_attr[20], 0x18u);
+		CHECK_EQ(s.target_attr[21], 0x40u);
+		/* The $I30 entry lives in the parent's record, the
+		 * $FILE_NAME and the free in the file's own, the $R
+		 * entry in $Reparse's record (vcn = record/4). */
+		CHECK_EQ(s.target_vcn[17], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[18], ino / 4);
+		CHECK_EQ(s.target_vcn[19], rp_ino / 4);
+		CHECK_EQ(s.target_vcn[20], ino / 4);
+		CHECK_EQ(s.target_vcn[21], (ino / 8) / 4096);
+		lsn_del_idx = s.lsn[17];
+		lsn_del_attr = s.lsn[18];
+		lsn_del_r = s.lsn[19];
+	}
+	/* All three touched records carry an MR_LSN at or past the
+	 * record that touched them — even though the file's record
+	 * was deallocated afterwards by evict, the stamp survives
+	 * in it. The $Reparse stamp is the new one: without it the
+	 * replay would re-apply the $R removal onto a record that
+	 * already lacks the entry, and its offset-based delete
+	 * would excise the wrong bytes. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_del_attr);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_del_idx);
+	CHECK_EQ(read_mft_lsn(snap, rp_ino, &mrlsn_rp), 0);
+	CHECK(mrlsn_rp != 0);
+	CHECK(mrlsn_rp >= lsn_del_r);
+
+	/* Replay copy 1: the create's two idempotent records
+	 * (SetNewAttributeSizes, SetBits) plus the unlink's
+	 * ClearBits — everything else is skipped on its MR_LSN
+	 * stamp or its effect (the record is already free). */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	/* The link is gone and its $R entry with it, on the replayed
+	 * volume and on the live snapshot; both are ntfsck-clean. */
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "ln.txt"), -ENOENT);
+	CHECK_EQ(reparse_index_count_entries(snap1, rp_ino, 0xA000000Cu, ino), 0);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "ln.txt"), -ENOENT);
+	CHECK_EQ(reparse_index_count_entries(snap, rp_ino, 0xA000000Cu, ino), 0);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -5483,6 +5658,7 @@ int main(void)
 	test_symlink_wsl_journaled();
 	test_symlink_dir_journaled();
 	test_symlink_in_root_unjournaled();
+	test_unlink_reparse_journaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

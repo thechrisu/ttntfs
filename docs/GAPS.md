@@ -1103,7 +1103,41 @@ the xattr class's $SI snapshot comes from the mapped record, a
 latent one-step-too-far undo on $SI ctime/flags when two xattr
 transactions run without a sync between them; the handler's flags
 path is still unjournaled.
-Next: the reparse class.
+Phase 3, reparse (unlink half) — glue landed 2026-11-27 (commit,
+this round): unlinking a reparse point is now one journaled
+transaction. `ntfs_journal_unlink_check` no longer refuses reparse
+points (only object IDs still refuse); a new
+`ntfs_journal_unlink_stage_reparse` stages a DeleteIndexEntryRoot
+record for the $R entry in $Reparse's $INDEX_ROOT — found by (tag,
+file_id) through a shared `find_reparse_index_entry` helper factored
+out of `ntfs_journal_create_reparse`'s scan — in the link-count-0
+branch of `ntfs_delete`, before `ntfs_delete_reparse_index` removes
+the entry. The tag is read from the file's own record (its
+$REPARSE_POINT value): `ni->reparse_tag` is only populated by the
+readlink path and cannot be trusted at unlink time. The $REPARSE_POINT
+attribute itself needs no record: the record free staged after the
+$R removal carries the whole post-delete record bytes. The unlink
+carrier gains its own `reparse_mft_no` (initialized to 0 at begin),
+and the unlink and rename commits stamp MR_LSN into $Reparse's
+record through a shared `stamp_reparse_mft_lsn` helper (the create
+commit uses it now too): without the stamp a post-commit flush +
+crash would replay the offset-based DeleteIndexEntryRoot onto a
+record that already lacks the entry and excise the wrong bytes. A
+rename of a reparse point becomes journaled as a side effect (the $R
+key is (tag, file_id), unchanged by rename). `ntfs_remove_ntfs_reparse_data`
+was declared in `reparse.h` but defined only in libntfs-3g and never
+called in this port — the dead declaration is removed. Evidence:
+`test_journal.c` 1480 checks, 0 failures (was 1418; new
+test_unlink_reparse_journaled: walk 27 records — the create's 15
+still-live plus the unlink's 12; $R delete targets $MFT:$DATA at vcn
+rp_ino/4; MR_LSN stamped into the file, the parent and $Reparse;
+replay redoes 3; link gone and $R count 0 after replay and on the
+live snapshot; `ntfsck` clean). Crash tests in the follow-up commit
+(this round). Follow-ups, not this class: the mknod half (device
+creation still never begins — its reparse staging is the next commit
+of this class); no VFS operation sets reparse data on an existing
+file, so there is no standalone reparse-set class to journal.
+Next: the reparse class, mknod half, then the reparse crash tests.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
