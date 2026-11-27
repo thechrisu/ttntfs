@@ -27,6 +27,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 
@@ -174,6 +175,160 @@ int ntfs_logfile_mark_clean_device(struct ntfs_bdev *dev)
 		(void)dev->ops->flush(dev);	/* best effort; see fskit_flush */
 	ntfs_image_close(&img);
 	return err;
+}
+
+/*
+ * Attach a writer to a live volume's $LogFile (docs/JOURNAL-DESIGN.md
+ * Phase 2). The handle owns the image, the opened log and the writer;
+ * the volume holds it for the whole read-write mount.
+ *
+ * Ladder, in order: open the log; if it will not open (no restart page,
+ * freshly formatted), format it and open again — format refuses with
+ * -EEXIST when a restart page is already present, so a log that is
+ * present but unparseable is never formatted over, it is refused with
+ * -ENOTSUP for the retire fallback. A log that opens empty (state EMPTY,
+ * no restart area — what mkntfs writes, all 0xff) is formatted the same
+ * way, before the version check: an empty log opens successfully but
+ * reports version 0.0, and checking the version first would refuse a
+ * log that has nothing to refuse yet. A log that opens non-empty but is
+ * not v1.1 (v2.0 from a current Windows PC, or v1.0) is likewise refused:
+ * the writer is v1.1-only (Phase 1), and writing v1.1 records into a v2.0
+ * log would leave a journal neither Windows nor this driver can read.
+ *
+ * The writer open itself reopens a clean log (puts the NTFS client back
+ * in use, clears the clean flag, syncs the restart pages) before any
+ * record, so a crash right after open leaves an open log with no new
+ * records — a good state.
+ */
+int ntfs_log_writer_open_device(struct ntfs_bdev *dev, struct ntfs_log_handle **out)
+{
+	struct ntfs_image_io io = { .ctx = dev, .pread = bdev_pread,
+				    .pwrite = bdev_pwrite, .sync = bdev_sync };
+	struct ntfs_log_geometry geom;
+	struct ntfs_logfile_info info;
+	struct ntfs_log_io log_io;
+	ntfs_log_handle_t *h = NULL;
+	int err;
+
+	if (!dev || !out)
+		return -EINVAL;
+	*out = NULL;
+	if (dev->read_only)
+		return -EROFS;
+	h = calloc(1, sizeof(*h));
+	if (!h)
+		return -ENOMEM;
+	/* Calloc, not malloc: the fail path below calls ntfs_image_close()
+	 * unconditionally, and close reads fd/runs — it must see zeroes,
+	 * not heap garbage, if the image open itself failed. */
+	h->img = calloc(1, sizeof(*h->img));
+	if (!h->img) {
+		free(h);
+		return -ENOMEM;
+	}
+	err = ntfs_image_open_io(h->img, &io, dev->size_bytes, true);
+	if (err)
+		goto fail;
+	ntfs_image_log_io(h->img, &log_io);
+	ntfs_image_geometry(h->img, &geom);
+	err = ntfs_logfile_open(&log_io, &geom, &h->log);
+	if (err) {
+		/* No restart page: lay one down. A restart page already
+		 * present makes format refuse, so this cannot overwrite
+		 * a log that is merely unparseable. */
+		err = ntfs_log_writer_format(&log_io, &geom, h->img->log_size);
+		if (err) {
+			if (err == -EEXIST)
+				err = -ENOTSUP;
+			goto fail;
+		}
+		err = ntfs_logfile_open(&log_io, &geom, &h->log);
+		if (err)
+			goto fail;
+	}
+	ntfs_logfile_get_info(h->log, &info);
+	if (info.state == NTFS_LOG_EMPTY) {
+		/* No restart area and no version to check (0.0): format
+		 * a v1.1 log, then open it. The version check below then
+		 * sees the format's own version. */
+		ntfs_logfile_close(h->log);
+		h->log = NULL;
+		err = ntfs_log_writer_format(&log_io, &geom, h->img->log_size);
+		if (err)
+			goto fail;
+		err = ntfs_logfile_open(&log_io, &geom, &h->log);
+		if (err)
+			goto fail;
+		ntfs_logfile_get_info(h->log, &info);
+	}
+	if (info.major_ver != 1 || info.minor_ver != 1) {
+		/* v2.0, v1.0: the writer is v1.1-only. */
+		err = -ENOTSUP;
+		goto fail;
+	}
+	err = ntfs_log_writer_open(h->log, &h->w);
+	if (err == -ENOENT) {
+		/* Opened but empty (no restart area): format, then open. */
+		ntfs_logfile_close(h->log);
+		h->log = NULL;
+		err = ntfs_log_writer_format(&log_io, &geom, h->img->log_size);
+		if (err)
+			goto fail;
+		err = ntfs_logfile_open(&log_io, &geom, &h->log);
+		if (err)
+			goto fail;
+		err = ntfs_log_writer_open(h->log, &h->w);
+	}
+	if (err)
+		goto fail;
+	*out = h;
+	return 0;
+
+fail:
+	if (h->log)
+		ntfs_logfile_close(h->log);
+	ntfs_image_close(h->img);
+	free(h->img);
+	free(h);
+	return err;
+}
+
+/* Clean close: checkpoint + clean restart pages, then free everything.
+ * A failed writer (a log-write error during the mount) refuses the
+ * close with -EIO; the caller leaves the volume dirty so the next
+ * mount replays what is in the log. */
+int ntfs_log_writer_close_device(ntfs_log_handle_t *h)
+{
+	int err = 0;
+
+	if (!h)
+		return -EINVAL;
+	if (h->w) {
+		err = ntfs_log_writer_close(h->w, NULL);
+		ntfs_log_writer_free(h->w);
+	}
+	if (h->log)
+		ntfs_logfile_close(h->log);
+	ntfs_image_close(h->img);
+	free(h->img);
+	free(h);
+	return err;
+}
+
+/* Free everything with no device write, for the retire fallback: the
+ * caller is about to overwrite the log itself (mark clean or erase),
+ * so a clean close would be wasted work on pages about to be replaced. */
+void ntfs_log_writer_abandon_device(ntfs_log_handle_t *h)
+{
+	if (!h)
+		return;
+	if (h->w)
+		ntfs_log_writer_free(h->w);
+	if (h->log)
+		ntfs_logfile_close(h->log);
+	ntfs_image_close(h->img);
+	free(h->img);
+	free(h);
 }
 
 int ntfs_logfile_replay_device(struct ntfs_bdev *dev, struct ntfs_logfile_analysis *out)

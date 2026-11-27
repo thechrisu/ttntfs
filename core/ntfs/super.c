@@ -15,12 +15,33 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 
+/*
+ * PORT: core/ntfs/inode.h declares an internal struct ntfs_attr and the
+ * kernel-signature ntfs_getattr()/ntfs_setattr(); the public ABI in
+ * ntfscore.h uses the same names. Rename the internal ones for this file
+ * (same pattern as core/vfs/api.c and core/vfs/super_glue.c): the
+ * internal headers are parsed with the renames active, then the renames
+ * are dropped and the public header is included. This file's body uses
+ * neither spelling, it only needs the writer device open/close.
+ * ntfs_ea_listxattr joins the set because ea.h renames ntfs_listxattr
+ * to it, and ntfscore.h declares a public function of the same name
+ * with a different signature.
+ */
+#define ntfs_attr ntfs_attr_internal
+#define ntfs_getattr ntfs_getattr_internal
+#define ntfs_setattr ntfs_setattr_internal
+#define ntfs_ea_listxattr ntfs_ea_listxattr_internal
 #include "sysctl.h"
 #include "logfile.h"
 #include "index.h"
 #include "ntfs.h"
 #include "ea.h"
 #include "volume.h"
+#undef ntfs_attr
+#undef ntfs_getattr
+#undef ntfs_setattr
+#undef ntfs_ea_listxattr
+#include "ntfscore.h"	/* $LogFile writer device open/close (journal) */
 
 /* A global default upcase table and a corresponding reference count. */
 static __le16 *default_upcase;
@@ -1820,6 +1841,30 @@ static void ntfs_put_super(struct super_block *sb)
 	ntfs_commit_inode(vol->mft_ino);
 
 	/*
+	 * Journal (docs/JOURNAL-DESIGN.md Phase 2): close the writer now,
+	 * while the volume is still dirty. Every commit above is
+	 * synchronous (ntfs_commit_inode waits for the write), and the
+	 * unmount syncs already flushed the page cache, so all metadata
+	 * the log describes is durable before the log is marked clean —
+	 * a crash after the close loses nothing the log was protecting.
+	 * A failed close sets errors, so the dirty-flag clear below is
+	 * skipped and the next mount replays the log instead of trusting
+	 * it. The flag clear and its re-commits below are unjournaled,
+	 * exactly as before Phase 2, and land after the close.
+	 */
+	if (vol->log_handle) {
+		struct ntfs_log_handle *h = vol->log_handle;
+
+		vol->log_handle = NULL;
+		vol->log_writer = NULL;
+		if (ntfs_log_writer_close_device(h)) {
+			ntfs_warning(sb,
+				"Failed to close the journal cleanly.  Leaving volume marked dirty.  Run chkdsk.");
+			NVolSetErrors(vol);
+		}
+	}
+
+	/*
 	 * If a read-write mount and no volume errors have occurred, mark the
 	 * volume clean.  Also, re-commit all affected inodes.
 	 */
@@ -1837,6 +1882,19 @@ static void ntfs_put_super(struct super_block *sb)
 			ntfs_warning(sb,
 				"Volume has errors.  Leaving volume marked dirty.  Run chkdsk.");
 		}
+	}
+
+	/*
+	 * Journal, error path: the writer is still attached (the clean
+	 * close above only ran on the no-errors path). Abandon it — free
+	 * with no device write — so the log stays open and the next mount
+	 * replays the transactions in it, instead of trusting a clean
+	 * close over a volume that is being left dirty.
+	 */
+	if (vol->log_handle) {
+		ntfs_log_writer_abandon_device(vol->log_handle);
+		vol->log_handle = NULL;
+		vol->log_writer = NULL;
 	}
 
 	iput(vol->vol_ino);
@@ -2699,6 +2757,10 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	NVolSetCaseSensitive(vol);
 	init_rwsem(&vol->mftbmp_lock);
 	init_rwsem(&vol->lcnbmp_lock);
+	/* Journal (docs/JOURNAL-DESIGN.md Phase 2): no writer until
+	 * make_rw attaches one; the gate starts closed (0 open txns). */
+	mutex_init(&vol->log_txn_lock);
+	atomic_set(&vol->log_txn_open, 0);
 
 	fc->s_fs_info = vol;
 	fc->ops = &ntfs_context_ops;

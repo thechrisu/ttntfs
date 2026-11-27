@@ -428,6 +428,23 @@ static int ntfs_write_folio(struct address_space *mapping, struct folio *folio)
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
+	/*
+	 * PORT: WAL gate (docs/JOURNAL-DESIGN.md Phase 2). The $MFT:$BITMAP
+	 * folio carries the bit the create transaction just set; while
+	 * the transaction is open its SetBits record is not durable yet,
+	 * so the folio must not reach the disk. Defer it — re-dirty and
+	 * return 0, the next writeback picks it up — following the
+	 * trylock-fail precedent in ntfs_write_folio_resident. The
+	 * folio stays locked for the caller, as usual here. Only this
+	 * mapping is gated: resident-attribute folios only copy bytes
+	 * into the in-memory MFT record, and that record is gated at
+	 * its own $MFT folio in ntfs_write_mft_block().
+	 */
+	if (ni->mft_no == FILE_MFT && ni->type == AT_BITMAP &&
+	    atomic_read(&ni->vol->log_txn_open) > 0) {
+		folio_redirty_for_writepage(NULL, folio);
+		return 0;
+	}
 	if (ni->type != AT_INDEX_ALLOCATION) {
 		if (NInoEncrypted(ni))
 			return -EOPNOTSUPP;

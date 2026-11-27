@@ -47,6 +47,12 @@
 #include "glue.h"
 /* The journal tools' volume parser: one MFT record for the label, no mount. */
 #include "../logfile/ntfs_image.h"
+/* map_mft_record(): record 0's sequence number for the open attributes. */
+#include "mft.h"
+/* The $LogFile writer API (open attributes, handle). */
+#include "../logfile/ntfs_logfile.h"
+/* ATTR_TYPE_* are the logfile module's plain-u32 attribute constants. */
+#include "../logfile/logfile_layout.h"
 
 extern struct file_system_type ntfs_fs_type;	/* super.c (PORT: exported) */
 
@@ -321,16 +327,21 @@ static int ntfs_glue_make_rw(struct ntfs_volume *vol)
 		return -EROFS;
 	}
 	/*
-	 * Retire the journal so Windows cannot replay stale records over what we
-	 * are about to write.
+	 * Attach the $LogFile writer instead of retiring the journal, so
+	 * creates from here on are journaled (docs/JOURNAL-DESIGN.md
+	 * Phase 2). A log the writer cannot write (v2.0, v1.0 or
+	 * unparseable) falls back to retiring it exactly as before, with
+	 * a warning — the volume still goes read-write, just unjournaled.
 	 *
-	 * Two restart pages first, the whole-log erase only as a fallback. The
-	 * erase is upstream's behaviour and it walks every page from VCN 0,
-	 * destroying the restart pages before anything else: measured at 1420
-	 * writes / 5.5 MiB on a small stick and 16384 pages on a 64 MiB journal,
-	 * for a mount that changes nothing else. A crash inside that loop leaves
-	 * a log full of recoverable work with nothing left to reach it by, which
-	 * is exactly what happened to a user's disk on 2026-09-13.
+	 * Retiring, for the fallback: two restart pages first, the
+	 * whole-log erase only as a further fallback. The erase is
+	 * upstream's behaviour and it walks every page from VCN 0,
+	 * destroying the restart pages before anything else: measured at
+	 * 1420 writes / 5.5 MiB on a small stick and 16384 pages on a
+	 * 64 MiB journal, for a mount that changes nothing else. A crash
+	 * inside that loop leaves a log full of recoverable work with
+	 * nothing left to reach it by, which is exactly what happened to
+	 * a user's disk on 2026-09-13.
 	 *
 	 * ntfs_logfile_mark_clean_device() writes two pages, last, and leaves the
 	 * same thing Windows leaves on a clean dismount. It refuses with -ENOTSUP
@@ -338,15 +349,61 @@ static int ntfs_glue_make_rw(struct ntfs_volume *vol)
 	 * for, so the fallback stays.
 	 */
 	if (vol->logfile_ino) {
-		int lerr = ntfs_logfile_mark_clean_device(sb->s_bdev);
+		struct ntfs_log_handle *h = NULL;
+		int lerr = ntfs_log_writer_open_device(sb->s_bdev, &h);
 
-		if (lerr && !ntfs_empty_logfile(vol->logfile_ino)) {
-			ntfs_error(sb, "Failed to retire journal LogFile.  Staying read-only.");
-			NVolSetErrors(vol);
-			return -EROFS;
+		if (!lerr) {
+			/* Register the two attributes the create
+			 * transactions target, $MFT:$DATA first (its id is
+			 * what the replay's H1 check keys on). The
+			 * sequence number is record 0's own, read live:
+			 * the replay does not validate it, but Windows
+			 * would, and it costs one map. */
+			struct mft_record *m0 = map_mft_record(NTFS_I(vol->mft_ino));
+			uint16_t mft_seq = 1;
+
+			if (!IS_ERR(m0)) {
+				mft_seq = le16_to_cpu(m0->sequence_number);
+				unmap_mft_record(NTFS_I(vol->mft_ino));
+			}
+			/* ATTR_TYPE_* are the logfile module's plain-u32
+			 * constants, not the driver's __le32 AT_*: the
+			 * replay compares the table entry against them. */
+			lerr = ntfs_log_writer_open_attr(h->w, ATTR_TYPE_DATA,
+							 FILE_MFT, mft_seq,
+							 NULL, 0,
+							 &vol->log_mft_data_attr);
+			if (!lerr)
+				lerr = ntfs_log_writer_open_attr(h->w, ATTR_TYPE_BITMAP,
+								 FILE_MFT, mft_seq,
+								 NULL, 0,
+								 &vol->log_mft_bitmap_attr);
+			if (lerr) {
+				ntfs_log_writer_abandon_device(h);
+				h = NULL;
+			} else {
+				vol->log_handle = h;
+				vol->log_writer = h->w;
+			}
 		}
-		if (lerr)
-			ntfs_debug("marking the journal clean failed (%d); erased it instead", lerr);
+		if (!h) {
+			/* Writer refused (or registration failed): retire
+			 * the journal as before, and say so — creates on
+			 * this mount are unjournaled, exactly as they were
+			 * before Phase 2. */
+			platform_log(PLATFORM_LOG_WARN,
+				     "ntfs: %s: journal not writable by this driver (%d); continuing unjournaled",
+				     sb->s_id, lerr);
+			lerr = ntfs_logfile_mark_clean_device(sb->s_bdev);
+
+			if (lerr && !ntfs_empty_logfile(vol->logfile_ino)) {
+				ntfs_error(sb, "Failed to retire journal LogFile.  Staying read-only.");
+				NVolSetErrors(vol);
+				return -EROFS;
+			}
+			if (lerr)
+				ntfs_debug("marking the journal clean failed (%d); erased it instead", lerr);
+		}
 	}
 	sb->s_flags &= ~SB_RDONLY;
 	return 0;

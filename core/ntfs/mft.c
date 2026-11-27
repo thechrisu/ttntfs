@@ -2801,6 +2801,22 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 	ntfs_debug("Entering for inode 0x%llx, attribute type 0x%x, folio index 0x%lx.",
 			ni->mft_no, ni->type, folio->index);
 
+	/*
+	 * PORT: WAL gate (docs/JOURNAL-DESIGN.md Phase 2). While a create
+	 * transaction is open, a record in this folio may be mid-mutation
+	 * with its log records not yet durable; writing the folio now
+	 * would put unjournaled metadata on the disk ahead of the log.
+	 * Defer, following the -ENOMEM precedent below: re-dirty the
+	 * folio, unlock it, return 0 — the next writeback, after the
+	 * commit, picks it up. This covers both the folio path and
+	 * ntfs_mft_writepages, which delegate here.
+	 */
+	if (atomic_read(&vol->log_txn_open) > 0) {
+		folio_redirty_for_writepage(wbc, folio);
+		folio_unlock(folio);
+		return 0;
+	}
+
 	if (!locked_nis || !ref_inos) {
 		folio_redirty_for_writepage(wbc, folio);
 		folio_unlock(folio);

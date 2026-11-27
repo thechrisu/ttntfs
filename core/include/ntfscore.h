@@ -367,6 +367,20 @@ int ntfs_logfile_replay_device(struct ntfs_bdev *dev, struct ntfs_logfile_analys
  * case the caller must fall back to the full erase. */
 int ntfs_logfile_mark_clean_device(struct ntfs_bdev *dev);
 
+/* Attach a $LogFile writer to a live volume (docs/JOURNAL-DESIGN.md Phase 2):
+ * open the image, the log and the writer, and leave the NTFS client in use.
+ * The handle owns all three; the volume holds it for the whole read-write
+ * mount. Returns -ENOTSUP for a log the writer cannot write (v2.0, v1.0 or
+ * unparseable) — the caller then falls back to retiring the journal as
+ * before. A log with no restart page is formatted, not refused. Close
+ * writes the writer-owned clean close (checkpoint + clean restart pages);
+ * abandon frees everything with no device write, for the retire fallback,
+ * which overwrites the log itself. */
+struct ntfs_log_handle;
+int ntfs_log_writer_open_device(struct ntfs_bdev *dev, struct ntfs_log_handle **out);
+int ntfs_log_writer_close_device(struct ntfs_log_handle *h);
+void ntfs_log_writer_abandon_device(struct ntfs_log_handle *h);
+
 /* Our own module's verdict on a device's journal, as an enum ntfs_log_state.
  * The vendored ntfs_check_logfile() cannot distinguish "no restart page" from
  * "a v2.0 header I do not understand"; this can. */

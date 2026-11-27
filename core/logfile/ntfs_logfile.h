@@ -298,6 +298,24 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out);
 int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type,
 			   uint32_t transaction_id, uint64_t undo_next_lsn,
 			   const void *data, uint32_t data_len, uint64_t *lsn_out);
+
+/* ---- Live-volume handle (Phase 2: journal writing, docs/JOURNAL-DESIGN.md) ----
+ *
+ * A writer attached to a mounted volume: the image, the opened log and the
+ * writer travel together, because the log io reads/writes through the image
+ * (io->ctx) — the image must outlive every append. The device open/close
+ * live in logfile_repair.c (next to ntfs_logfile_mark_clean_device); the
+ * struct is here so the volume can hold it by pointer. The image is a
+ * forward declaration only: this header stays libc-only, and the image
+ * type is completed by ntfs_image.h where it is used.
+ */
+struct ntfs_image;
+typedef struct ntfs_log_handle ntfs_log_handle_t;
+struct ntfs_log_handle {
+	struct ntfs_image *img;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+};
 int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 			      uint64_t mft_no, uint16_t mft_seq,
 			      const uint16_t *name, uint16_t name_len,

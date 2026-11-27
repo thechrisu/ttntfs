@@ -213,6 +213,20 @@ if(NTFS_BUILD_TESTS)
   set_tests_properties(crash PROPERTIES
     ENVIRONMENT "NTFS_MKNTFS=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/sbin/mkntfs;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck;NTFS_NTFSINFO=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/bin/ntfsinfo;NTFS_PATCH_REPARSE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_reparse.py")
 
+  # Journal: the create path writes one transaction to $LogFile, and
+  # replaying the dirty snapshot converges (Phase 2, docs/JOURNAL-DESIGN.md
+  # §5). Drives the public VFS surface and reads the journal back through
+  # the logfile module, the way a crash would see it.
+  add_executable(test_journal core/tests/test_journal.c)
+  target_link_libraries(test_journal ntfscore ntfsplatform)
+  target_include_directories(test_journal PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/logfile
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+  add_test(NAME journal COMMAND test_journal)
+  set_tests_properties(journal PROPERTIES
+    ENVIRONMENT "NTFS_MKNTFS=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local/sbin/mkntfs;NTFS_NTFSCK=${CMAKE_CURRENT_SOURCE_DIR}/tools/.local-plus/sbin/ntfsck")
+
   # Large directories: the index B-tree. Nothing exercised a directory past a
   # handful of entries, so ntfs_ib_split(), ntfs_ir_reparent(),
   # ntfs_index_rm_node/_rm_leaf() and ntfs_ih_takeout() had never run under a

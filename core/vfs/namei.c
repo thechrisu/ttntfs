@@ -16,6 +16,7 @@
 #include "reparse.h"
 #include "object_id.h"
 #include "ea.h"
+#include "journal.h"	/* PORT: Phase 2 create journaling */
 
 static const __le16 aux_name_le[3] = {
 	cpu_to_le16('A'), cpu_to_le16('U'), cpu_to_le16('X')
@@ -233,6 +234,36 @@ static int ntfs_sd_add_everyone(struct ntfs_inode *ni)
 	return ret;
 }
 
+/*
+ * journal_stage - fold one journal staging result into the create.
+ *
+ * A staging call returns 0 (staged), -ENOENT (this sub-mutation cannot
+ * be described in the log — the attribute went to an extent, the index
+ * entry went to an $INDEX_ALLOCATION block), or another error (I/O,
+ * no memory, an inconsistent record). -ENOENT is not a create failure:
+ * abort the transaction — it staged nothing durable — and carry on
+ * unjournaled, exactly as the driver did before Phase 2. A directory
+ * whose root END entry already points at an $INDEX_ALLOCATION block
+ * (the mkntfs/Windows root does) takes this path on every create; the
+ * file is still created, only unjournaled. Any other error fails the
+ * create, as before.
+ *
+ * Returns 0 to continue the create, or the error to fail it. On the
+ * -ENOENT path *jtp is set NULL: the transaction is gone, and later
+ * stage sites (guarded by jt) are skipped.
+ */
+static int journal_stage(int err, struct ntfs_journal_txn **jtp)
+{
+	if (!err)
+		return 0;
+	if (err == -ENOENT && *jtp) {
+		ntfs_journal_create_abort(*jtp);
+		*jtp = NULL;
+		return 0;
+	}
+	return err;
+}
+
 static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		__le16 *name, u8 name_len, mode_t mode, dev_t dev,
 		__le16 *target, int target_len,
@@ -242,6 +273,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	struct ntfs_inode *dir_ni = NTFS_I(dir);
 	struct ntfs_volume *vol = dir_ni->vol;
 	struct ntfs_inode *ni;
+	struct ntfs_journal_txn *jt = NULL;
 	bool rollback_data = false, rollback_sd = false, rollback_reparse = false;
 	struct file_name_attr *fn = NULL;
 	struct standard_information *si = NULL;
@@ -324,6 +356,21 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	simple_inode_init_ts(vi);
 	ni->i_crtime = inode_get_ctime(vi);
 
+	/*
+	 * PORT: journal the create (docs/JOURNAL-DESIGN.md Phase 2).
+	 * Begin before anything mutates: the WAL gate must be up before
+	 * the record is allocated (the bare-record window between alloc
+	 * and insert_inode_hash) and before the directory is marked
+	 * dirty. A begin failure is not a create failure — the driver
+	 * created unjournaled for years — so warn and proceed
+	 * unjournaled. Non-regular files never begin (jt stays NULL).
+	 */
+	err = ntfs_journal_create_begin(vol, mode, &jt);
+	if (err)
+		ntfs_error(sb,
+			   "journal begin failed (%d); creating unjournaled.\n",
+			   err);
+
 	inode_set_mtime_to_ts(dir, ni->i_crtime);
 	inode_set_ctime_to_ts(dir, ni->i_crtime);
 	mark_inode_dirty(dir);
@@ -331,6 +378,8 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	err = ntfs_mft_record_alloc(dir_ni->vol, dir_link ? (mode & ~S_IFMT) | S_IFDIR : mode, &ni, NULL,
 				    &ni_mrec);
 	if (err) {
+		if (jt)
+			ntfs_journal_create_abort(jt);
 		iput(vi);
 		return ERR_PTR(err);
 	}
@@ -448,11 +497,21 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 		ntfs_error(sb, "Failed to add STANDARD_INFORMATION attribute.\n");
 		goto err_out;
 	}
+	err = journal_stage(jt ? ntfs_journal_create_init(jt, ni, ni_mrec) : 0,
+			    &jt);
+	if (err)
+		goto err_out;
 
 	err = ntfs_sd_add_everyone(ni);
 	if (err)
 		goto err_out;
 	rollback_sd = true;
+	err = journal_stage(jt ? ntfs_journal_create_attr(jt, ni, ni_mrec,
+							   AT_SECURITY_DESCRIPTOR,
+							   AT_UNNAMED, 0) : 0,
+			    &jt);
+	if (err)
+		goto err_out;
 
 	if (S_ISDIR(mode) || dir_link) {
 		struct index_root *ir = NULL;
@@ -519,6 +578,12 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			goto err_out;
 		}
 		rollback_data = true;
+		err = journal_stage(jt ? ntfs_journal_create_attr(jt, ni, ni_mrec,
+								  AT_DATA,
+								  AT_UNNAMED, 0) : 0,
+				    &jt);
+		if (err)
+			goto err_out;
 
 		err = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
 		if (err)
@@ -575,6 +640,10 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	if (!S_ISLNK(mode)) {
 		err = ntfs_ea_set_wsl_inode(vi, dev, &ea_size,
 				NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
+		if (err)
+			goto err_out;
+		err = journal_stage(jt ? ntfs_journal_create_ea(jt, ni, ni_mrec) : 0,
+				    &jt);
 		if (err)
 			goto err_out;
 	}
@@ -643,6 +712,12 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 		ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
 		goto err_out;
 	}
+	err = journal_stage(jt ? ntfs_journal_create_attr(jt, ni, ni_mrec,
+							   AT_FILE_NAME,
+							   AT_UNNAMED, 0) : 0,
+			    &jt);
+	if (err)
+		goto err_out;
 
 	child_mft_ref = MK_MREF(ni->mft_no,
 				le16_to_cpu(ni_mrec->sequence_number));
@@ -655,6 +730,36 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	if (err) {
 		ntfs_debug("Failed to add entry to the index");
 		goto err_out;
+	}
+
+	if (jt) {
+		/*
+		 * The parent record was unmapped after the parent
+		 * reference was taken; re-map it for the index stage and
+		 * the commit stamp, holding the directory mrec lock the
+		 * whole time, and unmap it once the commit is done.
+		 */
+		dni_mrec = map_mft_record(dir_ni);
+		if (IS_ERR(dni_mrec)) {
+			err = -EIO;
+			goto err_out;
+		}
+		err = journal_stage(ntfs_journal_create_index(jt, dir_ni,
+							       dni_mrec,
+							       child_mft_ref),
+				    &jt);
+		if (!err && jt)
+			err = journal_stage(ntfs_journal_create_bitmap(jt, vol,
+								       ni->mft_no),
+					    &jt);
+		if (!err && jt) {
+			err = ntfs_journal_create_commit(jt, ni_mrec, dni_mrec);
+			/* Commit consumed the transaction either way. */
+			jt = NULL;
+		}
+		unmap_mft_record(dir_ni);
+		if (err)
+			goto err_out;
 	}
 
 	unmap_mft_record(ni);
@@ -675,6 +780,16 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	return ni;
 
 err_out:
+	/*
+	 * PORT: abort any open journal transaction first: the WAL gate
+	 * must be down before the rollback writes below, or they would
+	 * be deferred forever, and the log holds whatever prefix was
+	 * appended — the next replay undoes it. jt is NULL when the
+	 * create was unjournaled, and after a commit (which consumed it).
+	 */
+	if (jt)
+		ntfs_journal_create_abort(jt);
+
 	if (rollback_sd)
 		ntfs_attr_remove(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0);
 

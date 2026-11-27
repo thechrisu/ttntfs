@@ -307,10 +307,131 @@ second file rolled back, bit 41 clear),
 naming the wrong `$MFT` vcn commits fine but replay refuses
 the whole log, H1, and writes nothing). Logfile suite now
 4900 checks, 0 failures.
-Still to do in Phase 2: step 2 (create-path wiring in
-`core/vfs/namei.c` + WAL gate in `pagecache.c` + mount
-lifecycle + `MR_LSN` stamping at the metadata flush) and step
-3 (crash tests in `core/tests/test_crash.c`).
+Phase 2, step 2 landed 2026-11-27 (commit, this round): the
+create path is journaled end to end. New glue
+`core/vfs/journal.c` + `core/vfs/journal.h` stages one create
+transaction — `ntfs_journal_create_begin` (regular files only,
+writer present; a volume-level `log_txn_lock` serialises
+transactions and an atomic `log_txn_open` counter drives the
+WAL gate), `create_init` (copies the record right after the
+`$SI` add, validates the first attribute is `$SI` and the
+second is `AT_END`), `create_attr` (captures each attribute
+at its own insertion offset — attributes are type-sorted, not
+appended — and sets `RESIDENT_ATTR_IS_INDEXED` on the log
+copy of the `$FILE_NAME` only, never on the live record, so
+replay's CreateAttribute bumps the link count), `create_ea`
+(net effect: one CreateAttribute each for `$EA_INFORMATION`
+and `$EA` with their final values after all three `set_ea`
+calls, not the intermediate updates), `create_index` (scans
+the parent's `$INDEX_ROOT` `$I30` for the child's mref;
+`aoff` is the entry offset from the attribute start;
+`index_length` is measured from the **index header** start,
+not from `entries_offset` — a bug in the first version
+overshot the value end and failed the create), `create_bitmap`
+(the `$MFT:$BITMAP` bit), and `create_commit` (commit, then
+stamp the transaction's last LSN — the Commit record's LSN —
+into both touched MFT records' `MR_LSN`, so every record of
+the transaction skips on replay). `__ntfs_create`
+(`core/vfs/namei.c`) begins the transaction before the
+parent-mtime dirty and before `ntfs_mft_record_alloc`,
+stages after each mutation, and commits after
+`ntfs_index_add_filename`; `err_out` aborts first, before
+the rollback writes (the gate must be down before they run).
+A stage failure of `-ENOENT` means the sub-mutation cannot be
+described in the log — the attribute went to an extent, the
+index entry went to an `$INDEX_ALLOCATION` block — and is
+**not** a create failure: `journal_stage` aborts the
+transaction and the create proceeds unjournaled, exactly as
+the driver did before Phase 2. The mkntfs/Windows volume root
+already has an `$INDEX_ALLOCATION` block and its END entry
+points down at it, so a create in the root is always
+unjournaled on such images; a create in a driver-made
+subdirectory (fresh `$INDEX_ROOT`, no allocation block) is
+journaled. Any other stage error fails the create, as before.
+The WAL gate (corrected from the plan: `writeback_one` is
+**not** the single choke point — `ntfs_mft_writepages` calls
+`ntfs_write_mft_block` directly and `__ntfs_write_inode`
+writes the MFT record straight to the device via bio, so the
+gate sits at three sites: `ntfs_write_mft_block` (defer by
+`folio_redirty_for_writepage` + unlock + return 0),
+`ntfs_write_folio` in `core/vfs/aops.c` (only the
+`$MFT:$BITMAP` mapping; resident-attr folios only copy bytes
+into the in-memory MFT record), and `__ntfs_write_inode`
+(return early, leaving `NInoDirty` set); nothing goes in the
+filesystem-agnostic `pagecache.c`) closes two windows the
+locking alone does not: the bare-record window between
+`ntfs_mft_record_alloc` and `insert_inode_hash` (the inode
+is not in icache yet, so `ntfs_may_write_mft_record` returns
+true and the folio path would flush the fresh bare record
+with no log coverage) and the dir-mtime window between
+`mark_inode_dirty(dir)` and taking `dir_ni->mrec_lock`.
+Mount lifecycle: `ntfs_glue_make_rw` opens the writer via
+`ntfs_log_writer_open_device` (open image → log io/geometry
+→ `ntfs_logfile_open`; on failure format a v1.1 log and retry;
+version check v1.1 only), registers `$MFT:$DATA` then
+`$MFT:$BITMAP` with the logfile module's plain-u32 constants
+(`ATTR_TYPE_DATA` 0x80 / `ATTR_TYPE_BITMAP` 0xB0 — the replay
+compares the table entry against them, not the driver's
+`__le32` `AT_DATA`/`AT_BITMAP`), and falls back to retiring
+the journal with a logged warning on any refusal; `ntfs_put_super`
+closes the writer after the first inode-commit block (all
+metadata the log describes is durable before the log is
+marked clean — `ntfs_commit_inode` is synchronous — and a
+close failure sets the volume-error flag so the flag clear is
+skipped and the next mount replays). The parent's on-disk
+`$SI` mtime update happens at dir-inode writeback and is
+**not** journaled in Phase 2 — it belongs to the setattr
+class in Phase 3 (recorded gap). `$MFT` extension during a
+create is unjournaled but self-consistent (growing `$MFT`
+with empty records is valid; the gate keeps it off disk
+before commit). Commit-failure semantics: a mid-append
+failure leaves an ACTIVE transaction in the log and the
+error path rolls the in-memory mutations back; the next
+replay does redo-then-undo, so the undo sees the post-redo
+state, not the rolled-back disk state — consistent, and no
+`MR_LSN` stamp happened (the stamp is after a successful
+commit), so the redo is not skipped. Crash contract, per
+commit: crash before the first data record → transaction
+absent, volume unchanged; crash mid-append → durable prefix
+is ACTIVE, next replay undoes it; crash after the Commit
+record but before the checkpoint → committed, redo applies
+it; crash after the checkpoint → same, via the checkpoint's
+tables; a torn spanning record at the tail is simply absent
+— the transaction never happened; a log-write failure fails
+the writer (volume-error semantics), the transaction stays
+ACTIVE, and the rollback path runs with the gate down. Bugs
+fixed en route: a fresh mkntfs `$LogFile` is all `0xFF`
+(`LFS_MAGIC_EMPTY`); `ntfs_logfile_open` returns 0 with state
+`NTFS_LOG_EMPTY` and version 0.0, so the ladder's version
+check refused with `-ENOTSUP` before the writer-open
+`-ENOENT` format branch could run and the mount fell back to
+unjournaled — the ladder now formats an empty log before the
+version check (a zeroed all-0x00 log is still refused as
+present-but-unparseable, by design); and the `index_length`
+semantics above. The test walks the log from the oldest LSN,
+not 0 — 0 starts at the current checkpoint, which the commit's
+own checkpoint moved past the data records, so the walk saw
+only the dumps and the Forget.
+Tests: new `core/tests/test_journal.c` (80 checks, 0
+failures) — `test_create_journaled` (create `sub/j.txt` in a
+driver-made directory: walk shows exactly 13 records — 8
+data in order, Commit, 3 dumps, Forget; `$FILE_NAME` create
+carries "j.txt" in UTF-16LE; SetBits bit is the file's MFT
+number, count 1; both touched records carry an `MR_LSN` at
+or past their touching record; replay redoes exactly 1
+record — the SetBits, which carries no LSN to skip on — and
+writes 0 MFT records and 1 cluster, twice identically; the
+file is present after replay + mount; `ntfsck -n` clean),
+`test_mkdir_unjournaled` (no client records, directory
+present, clean), `test_create_in_root_unjournaled` (create
+in the root succeeds with no client records — pins the
+`-ENOENT` fallback — file present after remount, clean).
+The journaled test fails without the wiring (forced
+unjournaled: walk 0 records, `MR_LSN` 0, replay redoes 0 —
+10 failures), so it is live, not vacuous. Logfile suite
+stays 4900 checks, 0 failures.
+Still to do in Phase 2: step 3 (crash tests in
+`core/tests/test_crash.c`).
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

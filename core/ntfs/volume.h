@@ -10,6 +10,8 @@
 #ifndef _LINUX_NTFS_VOLUME_H
 #define _LINUX_NTFS_VOLUME_H
 
+#include <linux/atomic.h>
+#include <linux/mutex.h>
 #include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
@@ -18,6 +20,15 @@
 #include <linux/errseq.h>
 
 #include "layout.h"
+
+/* $LogFile writer state (docs/JOURNAL-DESIGN.md Phase 2). The handle
+ * (image + opened log + writer) is owned by the volume for the whole
+ * read-write mount: the log io reads/writes through the image (io->ctx),
+ * so the image must outlive every append. NULL while the journal is
+ * inactive (read-only mount, or a log the writer refused — v2.0, v1.0
+ * or unparseable — where make_rw fell back to retiring it). */
+struct ntfs_log_handle;
+struct ntfs_log_writer;
 
 #define NTFS_VOL_UID	BIT(1)
 #define NTFS_VOL_GID	BIT(2)
@@ -86,6 +97,20 @@
  * @lcn_empty_bits_per_page: Number of empty bits per page in the LCN bitmap.
  * @precalc_work: Work structure for background pre-calculation tasks.
  * @preallocated_size: reallocation size (in bytes).
+ * @log_handle: $LogFile writer handle (image + opened log + writer),
+ *   or NULL while the journal is inactive.
+ * @log_writer: $LogFile writer (borrowed from @log_handle), or NULL while
+ *   the journal is inactive.
+ * @log_mft_data_attr: Open-attribute id of $MFT:$DATA in the writer.
+ * @log_mft_bitmap_attr: Open-attribute id of $MFT:$BITMAP in the writer.
+ * @log_txn_open: Number of journal transactions currently open on this
+ *   volume. While > 0 the WAL gate holds $MFT and $MFT:$BITMAP folios
+ *   (and dirty MFT records) off the device: no metadata a transaction
+ *   describes may reach the disk before the log record describing it is
+ *   durable. Set/cleared by the journal glue around begin/commit/abort.
+ * @log_txn_lock: Serializes whole transactions (begin to commit/abort).
+ *   The writer's append path and tables are shared state with no
+ *   internal lock; two concurrent commits would interleave appends.
  */
 struct ntfs_volume {
 	struct super_block *sb;
@@ -149,6 +174,12 @@ struct ntfs_volume {
 	unsigned int *lcn_empty_bits_per_page;
 	struct work_struct precalc_work;
 	loff_t preallocated_size;
+	struct ntfs_log_handle *log_handle;
+	struct ntfs_log_writer *log_writer;
+	uint32_t log_mft_data_attr;
+	uint32_t log_mft_bitmap_attr;
+	atomic_t log_txn_open;
+	struct mutex log_txn_lock;
 };
 
 /*

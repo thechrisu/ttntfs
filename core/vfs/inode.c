@@ -2777,6 +2777,20 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		return 0;
 	}
 
+	/*
+	 * PORT: WAL gate (docs/JOURNAL-DESIGN.md Phase 2). While a create
+	 * transaction is open, this inode's record may be mid-mutation
+	 * with its log records not yet durable; writing it now would put
+	 * unjournaled metadata on the disk ahead of the log. Return
+	 * without writing and leave NInoDirty set: the next writeback,
+	 * after the commit, picks it up — including the $SI sync below,
+	 * which is why the gate sits before it. Do not gate inside
+	 * write_mft_record_nolock itself: the alloc rollback paths call
+	 * it directly and must complete.
+	 */
+	if (atomic_read(&ni->vol->log_txn_open) > 0)
+		return 0;
+
 	/* igrab prevents vi from being evicted while mrec_lock is hold. */
 	if (igrab(vi) != NULL)
 		need_iput = true;
