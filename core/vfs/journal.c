@@ -1234,6 +1234,14 @@ struct ntfs_journal_truncate {
 	 * the resize. */
 	struct mft_attr_snapshot snap;
 	bool snap_ok;
+	/* The $STANDARD_INFORMATION flags as they stood at begin, and
+	 * where they live in the record. A resize that flips the file
+	 * sparse (or back) changes them (FILE_ATTR_SPARSE_FILE) in
+	 * step with the $DATA flag; the stage journals the change so
+	 * the replay keeps the two in agreement. */
+	u32 si_flags_old;
+	u16 si_attr_off;
+	u16 si_value_off;
 	/* The run list as it stood at begin: a copy of ni->runlist.rl
 	 * up to and including its length-0 terminator. The bitmap delta
 	 * is the set difference between this and the live run list. */
@@ -1294,6 +1302,35 @@ int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
 		goto out_free;
 	}
 	err = snapshot_mft_attr(m, AT_DATA, &t->snap);
+	if (!err) {
+		/* Snapshot the $STANDARD_INFORMATION flags too: a
+		 * resize that flips the file sparse changes them, and
+		 * the stage needs the old value for the undo payload.
+		 * The flags live at file_attributes in the $SI value;
+		 * the attribute is always resident and always present
+		 * on a base record — anything else aborts the
+		 * transaction (the resize then proceeds unjournaled). */
+		const struct attr_record *si;
+		u16 si_off = 0;
+
+		si = find_attr(m, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+		if (!si || si->non_resident ||
+		    le16_to_cpu(si->data.resident.value_offset) +
+			    offsetof(struct standard_information,
+				     file_attributes) + sizeof(__le32) >
+			    le32_to_cpu(si->length))
+			err = -ENOENT;
+		else {
+			t->si_attr_off = si_off;
+			t->si_value_off =
+				le16_to_cpu(si->data.resident.value_offset);
+			t->si_flags_old = le32_to_cpu(
+				*(const __le32 *)((const u8 *)si +
+					t->si_value_off +
+					offsetof(struct standard_information,
+						 file_attributes)));
+		}
+	}
 	unmap_mft_record(ni);
 	if (err)
 		goto out_free;
@@ -1584,7 +1621,44 @@ out_rl:
 				off, alloc, valid, data, total,
 				t->snap.alloc, t->snap.valid,
 				t->snap.data, t->snap.total);
+			if (err)
+				goto out;
 		}
+	}
+
+	/* The $STANDARD_INFORMATION flags, when the resize flipped
+	 * them. The live driver writes ni->flags into the $SI at
+	 * inode sync, after this commit; the $DATA flag flips here,
+	 * in the mapped record, during the resize. Without a record
+	 * the replay leaves the $DATA sparse and the $SI not, and
+	 * libntfs-3g refuses the attribute ("corrupt attribute
+	 * flags (0x8000 <> 0x0)"). Stage only on change: a plain
+	 * resize leaves the flags alone. The $SI attribute must
+	 * still sit where begin found it; anything else aborts. */
+	if (le32_to_cpu(ni->flags) != t->si_flags_old) {
+		const struct attr_record *si;
+		u16 si_off = 0;
+		__le32 new_flags = ni->flags;
+		__le32 old_flags = cpu_to_le32(t->si_flags_old);
+
+		si = find_attr(mrec, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+		if (!si || si->non_resident || si_off != t->si_attr_off ||
+		    le16_to_cpu(si->data.resident.value_offset) !=
+			    t->si_value_off) {
+			err = -ENOENT;
+			goto out;
+		}
+		err = ntfs_log_txn_update_resident(
+			t->t, t->vol->log_mft_data_attr,
+			vcn, cluster_off, page_lcn,
+			si_off,
+			t->si_value_off +
+				offsetof(struct standard_information,
+					 file_attributes),
+			&new_flags, sizeof(new_flags),
+			&old_flags, sizeof(old_flags));
+		if (err)
+			goto out;
 	}
 
 out:

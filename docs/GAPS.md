@@ -823,6 +823,27 @@ data_size is not staged (refreshed by `ntfs_inode_sync_filename`
 at parent writeback; the WAL gate holds the file record until
 commit). fallocate and extending writes during writeback are not
 in this class.
+Crash-test fix (2026-11-27, this round): the truncate did not
+journal the file's $STANDARD_INFORMATION flags. The live driver
+sets BOTH the $DATA flag and the $SI flags when a resize flips
+the file sparse (`core/ntfs/attrib.c`: `NInoSetSparse(ni);
+ni->flags |= FILE_ATTR_SPARSE_FILE; a->flags |= ATTR_IS_SPARSE;`
+— and the reverse clears both), but the transaction staged only
+the $DATA flag (via the pairs header). The $SI record copy is
+written at inode sync AFTER the commit, under the WAL gate; a
+crash after the commit but before that writeback flushes leaves
+$DATA sparse + $SI non-sparse, and libntfs-3g refuses the
+attribute: "Inode 65 has corrupt attribute flags (0x8000 <>
+0x0)". The check is one-directional (a file may be sparse
+though its unnamed data is not), and the replayed record's
+bytes are otherwise identical to the live driver's. The fix
+snapshots the $SI flags at begin (from the mapped record, via
+find_attr; a missing or too-short $SI aborts the transaction)
+and stages an UpdateResidentValue record for the 4-byte
+file_attributes field when le32_to_cpu(ni->flags) differs from
+the snapshot, re-finding the $SI in the mapped record at stage
+and verifying it still sits where begin found it. A shrink of a
+sparse file flips the bit the other way — same fix, same record.
 Crash-test fix (2026-11-27, this round): the truncate's $Bitmap
 delta was staged against the wrong bitmap. `stage_bitmap_range`
 used `vol->log_mft_bitmap_attr` ($MFT:$BITMAP, the MFT-record
@@ -847,15 +868,16 @@ opened first and NOT the create's SetBits attribute, and the
 replayed shrink writes two clusters (the $MFT:$BITMAP cluster
 for the create's SetBits and the volume $Bitmap's cluster for the
 truncate's ClearBits), not one.
-Driver tests (`core/tests/test_journal.c`, suite 540 checks, 0
+Driver tests (`core/tests/test_journal.c`, suite 545 checks, 0
 failures): `test_truncate_shrink_journaled` (walk 24: create 14
 + shrink 10; replay redoes 3 — the create's sizes + SetBits and
 the shrink's ClearBits; the shrink's pairs and sizes are skipped
 by the file record's MR_LSN stamp) and
-`test_truncate_extend_journaled` (walk 32: create 14 + shrink 10
-+ extend 8; replay still redoes 3 — the extend's pairs and sizes
-are skipped by the same stamp and it has no $Bitmap record; the
-file is 256 KiB after replay and ntfsck-clean). Negative control
+`test_truncate_extend_journaled` (walk 33: create 14 + shrink 10
++ extend 9 — the extend gains a $SI flags record when the hole
+path flips the file sparse; replay still redoes 3 — the extend's
+pairs, sizes and $SI are skipped by the same stamp and it has no
+$Bitmap record; the file is 256 KiB after replay and ntfsck-clean). Negative control
 (truncate staging stubbed to -ENOENT): the truncates still
 succeed, sizes right, ntfsck clean — only the walk counts and
 redo counts fail, as designed. One nuance the control exposed:

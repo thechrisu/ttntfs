@@ -284,6 +284,10 @@ struct rec_seen {
 	uint32_t clear_bits_bit, clear_bits_count;
 	uint64_t clear_bits_lsn;
 	uint16_t clear_bits_target_attr;
+	/* UpdateResidentValue: the 4-byte redo/undo values (the $SI
+	 * flags the truncate stages when the file flips sparse). */
+	uint32_t res_redo, res_undo;
+	uint64_t res_lsn;
 	/* SetNewAttributeSizes: the $DATA size from redo/undo. */
 	uint64_t sizes_redo_data, sizes_undo_data;
 	uint64_t sizes_redo_total;
@@ -361,6 +365,15 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 			((uint32_t)p[BR_BITS + 2] << 16) |
 			((uint32_t)p[BR_BITS + 3] << 24);
 		s->clear_bits_lsn = r->lsn;
+	}
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->redo_len == 4 &&
+	    r->undo && r->undo_len == 4) {
+		const uint8_t *pr = r->redo, *pu = r->undo;
+		s->res_redo = (uint32_t)pr[0] | ((uint32_t)pr[1] << 8) |
+			((uint32_t)pr[2] << 16) | ((uint32_t)pr[3] << 24);
+		s->res_undo = (uint32_t)pu[0] | ((uint32_t)pu[1] << 8) |
+			((uint32_t)pu[2] << 16) | ((uint32_t)pu[3] << 24);
+		s->res_lsn = r->lsn;
 	}
 	if (r->redo_op == LOP_SetNewAttributeSizes && r->redo && r->redo_len >= NAS_SIZE &&
 	    r->undo && r->undo_len >= NAS_SIZE) {
@@ -2264,22 +2277,32 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 32);
-	if (s.n == 32) {
-		/* The extend's records sit at [24..31]: one open
+	CHECK_EQ(s.n, 33);
+	if (s.n == 33) {
+		/* The extend's records sit at [24..32]: one open
 		 * ($DATA — no $Bitmap record, so $BITMAP never
-		 * opens), then pairs, sizes, Commit, dumps, Forget. */
+		 * opens), then pairs, sizes, the $SI flags record,
+		 * Commit, dumps, Forget. The extend gains the $SI
+		 * record because the hole path flips the file sparse. */
 		CHECK_EQ(s.redo_op[24], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[24], 0x18u);
 		CHECK_EQ(s.redo_op[25], LOP_UpdateMappingPairs);
 		CHECK_EQ(s.target_attr[25], 0x18u);
 		CHECK_EQ(s.redo_op[26], LOP_SetNewAttributeSizes);
 		CHECK_EQ(s.target_attr[26], 0x18u);
-		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[27], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[27], 0x18u);
+		CHECK_EQ(s.redo_op[28], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[29], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[30], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[31], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[32], LOP_ForgetTransaction);
+		/* The $SI record sets the sparse bit (0x200) and
+		 * undoes to clear (0x0) — the $DATA flag flips in
+		 * step, so the two agree after replay either way. */
+		CHECK_EQ(s.res_redo, 0x200u);
+		CHECK_EQ(s.res_undo, 0u);
+		CHECK_EQ(s.res_lsn, s.lsn[27]);
 		/* No bitmap record in the extend: the ClearBits
 		 * fields still hold the shrink's 48-cluster free. */
 		CHECK_EQ(s.clear_bits_count, 48u);
