@@ -823,7 +823,31 @@ data_size is not staged (refreshed by `ntfs_inode_sync_filename`
 at parent writeback; the WAL gate holds the file record until
 commit). fallocate and extending writes during writeback are not
 in this class.
-Driver tests (`core/tests/test_journal.c`, suite 538 checks, 0
+Crash-test fix (2026-11-27, this round): the truncate's $Bitmap
+delta was staged against the wrong bitmap. `stage_bitmap_range`
+used `vol->log_mft_bitmap_attr` ($MFT:$BITMAP, the MFT-record
+allocation bitmap, cluster LCN 2) — correct for the create's
+SetBits (bit 65 = MFT record 65) and the unlink's ClearBits
+(MFT-record bits), wrong for cluster bits. The volume $Bitmap
+had no open attribute at all. The replayed shrink image showed
+it: the freed 48 clusters stayed marked in the volume $Bitmap
+(record 6, LCN 519) while the ClearBits redo changed nothing on
+disk — the $Bitmap was byte-identical between the crashed and
+replayed images. The driver test had encoded the bug (it only
+asserted the target attribute was 0x40) and passed anyway,
+because on a cleanly-synced volume the live sync had already
+cleared the real bitmap and the wrong-cluster writes were no-ops.
+The fix registers a third open attribute, `log_lcn_bitmap_attr`
+($Bitmap:$DATA, record 6), in `ntfs_glue_make_rw`, and
+`stage_bitmap_range` now uses it with a new `cluster_bitmap_coords`
+(`NTFS_I(vol->lcnbmp_ino)`). If record 6 cannot be opened the
+journal retires and the resize proceeds unjournaled. The driver
+test now asserts the ClearBits targets the attribute the truncate
+opened first and NOT the create's SetBits attribute, and the
+replayed shrink writes two clusters (the $MFT:$BITMAP cluster
+for the create's SetBits and the volume $Bitmap's cluster for the
+truncate's ClearBits), not one.
+Driver tests (`core/tests/test_journal.c`, suite 540 checks, 0
 failures): `test_truncate_shrink_journaled` (walk 24: create 14
 + shrink 10; replay redoes 3 — the create's sizes + SetBits and
 the shrink's ClearBits; the shrink's pairs and sizes are skipped

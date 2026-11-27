@@ -111,6 +111,24 @@ static int bitmap_coords(struct ntfs_volume *vol, u64 bit,
 			   vcn_out, cluster_off_out, page_lcn_out);
 }
 
+/*
+ * Coordinates of a CLUSTER bit in the volume $Bitmap ($Bitmap:$DATA,
+ * record 6) — not bitmap_coords(), which maps an MFT-RECORD bit in
+ * $MFT:$BITMAP (record 0, type 0xB0). The two bitmaps live in different
+ * attributes with different run lists: a cluster range staged against
+ * $MFT:$BITMAP lands on the $MFT:$BITMAP's own cluster on replay and
+ * leaves the freed clusters marked allocated in the real $Bitmap — a
+ * leak ntfsck flags after a crash. Only the truncate class stages
+ * cluster bits; create/unlink stage MFT-record bits via bitmap_coords().
+ */
+static int cluster_bitmap_coords(struct ntfs_volume *vol, u64 bit,
+				 u64 *vcn_out, u16 *cluster_off_out,
+				 u64 *page_lcn_out)
+{
+	return attr_coords(vol, NTFS_I(vol->lcnbmp_ino), bit >> 3,
+			   vcn_out, cluster_off_out, page_lcn_out);
+}
+
 /* ---- record scanning ---------------------------------------------------- */
 
 /*
@@ -1428,12 +1446,12 @@ static int stage_bitmap_range(struct ntfs_journal_truncate *t,
 
 		if (chunk > nbits)
 			chunk = nbits;
-		err = bitmap_coords(t->vol, bit,
-				    &vcn, &cluster_off, &page_lcn);
+		err = cluster_bitmap_coords(t->vol, bit,
+					 &vcn, &cluster_off, &page_lcn);
 		if (err)
 			break;
 		err = ntfs_log_txn_set_bitmap(t->t,
-					      t->vol->log_mft_bitmap_attr,
+					      t->vol->log_lcn_bitmap_attr,
 					      vcn, cluster_off, page_lcn,
 					      (u32)bit, (u32)chunk, set);
 		bit += chunk;

@@ -103,6 +103,11 @@ struct ntfs_log_writer;
  *   the journal is inactive.
  * @log_mft_data_attr: Open-attribute id of $MFT:$DATA in the writer.
  * @log_mft_bitmap_attr: Open-attribute id of $MFT:$BITMAP in the writer.
+ * @log_lcn_bitmap_attr: Open-attribute id of $Bitmap:$DATA (the volume
+ *   cluster bitmap, record 6) in the writer. Distinct from
+ *   @log_mft_bitmap_attr ($MFT:$BITMAP, MFT-record bits): records that
+ *   set or clear CLUSTER bits target this one; records that set or clear
+ *   MFT-record bits target @log_mft_bitmap_attr.
  * @log_txn_open: Number of journal transactions currently open on this
  *   volume. While > 0 the WAL gate holds $MFT and $MFT:$BITMAP folios
  *   (and dirty MFT records) off the device: no metadata a transaction
@@ -178,6 +183,7 @@ struct ntfs_volume {
 	struct ntfs_log_writer *log_writer;
 	uint32_t log_mft_data_attr;
 	uint32_t log_mft_bitmap_attr;
+	uint32_t log_lcn_bitmap_attr;
 	atomic_t log_txn_open;
 	struct mutex log_txn_lock;
 };

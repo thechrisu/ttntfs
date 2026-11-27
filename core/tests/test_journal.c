@@ -279,9 +279,11 @@ struct rec_seen {
 	/* SetBits: bit and count from the redo payload. */
 	uint32_t bits_bit, bits_count;
 	uint64_t bits_lsn;
+	uint16_t bits_target_attr;
 	/* ClearBits: the same, for the clear record. */
 	uint32_t clear_bits_bit, clear_bits_count;
 	uint64_t clear_bits_lsn;
+	uint16_t clear_bits_target_attr;
 	/* SetNewAttributeSizes: the $DATA size from redo/undo. */
 	uint64_t sizes_redo_data, sizes_undo_data;
 	uint64_t sizes_redo_total;
@@ -336,6 +338,7 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 	}
 	if (r->redo_op == LOP_SetBitsInNonresidentBitMap && r->redo && r->redo_len >= BR_SIZE) {
 		const uint8_t *p = r->redo;
+		s->bits_target_attr = r->target_attr;
 		s->bits_bit = (uint32_t)p[BR_BITMAP_OFF] |
 			((uint32_t)p[BR_BITMAP_OFF + 1] << 8) |
 			((uint32_t)p[BR_BITMAP_OFF + 2] << 16) |
@@ -348,6 +351,7 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 	}
 	if (r->redo_op == LOP_ClearBitsInNonresidentBitMap && r->redo && r->redo_len >= BR_SIZE) {
 		const uint8_t *p = r->redo;
+		s->clear_bits_target_attr = r->target_attr;
 		s->clear_bits_bit = (uint32_t)p[BR_BITMAP_OFF] |
 			((uint32_t)p[BR_BITMAP_OFF + 1] << 8) |
 			((uint32_t)p[BR_BITMAP_OFF + 2] << 16) |
@@ -2112,14 +2116,20 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(s.n, 24);
 	if (s.n == 24) {
 		/* The opens come in first-use order: the truncate
-		 * stages the $Bitmap record first, so $BITMAP opens
-		 * before $DATA — the reverse of the create. */
+		 * stages the $Bitmap record first, so the volume
+		 * $Bitmap ($Bitmap:$DATA) opens before $MFT:$DATA —
+		 * the reverse of the create. The ClearBits targets
+		 * the attribute the truncate opened first, and that
+		 * attribute is NOT the one the create's SetBits used
+		 * ($MFT:$BITMAP, MFT-record bits). */
 		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x40u);
+		CHECK_EQ(s.target_attr[14], s.clear_bits_target_attr);
+		CHECK(s.target_attr[14] != s.bits_target_attr);
 		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[15], 0x18u);
 		CHECK_EQ(s.redo_op[16], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.target_attr[16], 0x40u);
+		CHECK_EQ(s.target_attr[16], s.clear_bits_target_attr);
+		CHECK(s.clear_bits_target_attr != s.bits_target_attr);
 		CHECK_EQ(s.redo_op[17], LOP_UpdateMappingPairs);
 		CHECK_EQ(s.target_attr[17], 0x18u);
 		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
@@ -2134,6 +2144,20 @@ static void test_truncate_shrink_journaled(void)
 		 * the clear has its own capture.) */
 		CHECK_EQ(s.clear_bits_count, 48u);
 		CHECK_EQ(s.clear_bits_lsn, s.lsn[16]);
+		/* The ClearBits targets the VOLUME $Bitmap
+		 * ($Bitmap:$DATA, record 6) — not $MFT:$BITMAP
+		 * (record 0, type 0xB0), which holds MFT-record
+		 * bits: the assertions above pin that by the
+		 * in-log ids (the create's SetBits is the
+		 * $MFT:$BITMAP one). Staging cluster bits against
+		 * $MFT:$BITMAP applied them to the $MFT:$BITMAP's
+		 * own cluster on replay and left the freed
+		 * clusters marked allocated in the real $Bitmap:
+		 * a leak ntfsck flags after a crash (truncate
+		 * crash sweep, 2026-11-27). The page LCN — the
+		 * $Bitmap's own cluster — is proved by that sweep,
+		 * which replays a torn truncate and checks the
+		 * bitmap on disk. */
 		/* The sizes record names the new data size. */
 		CHECK_EQ(s.sizes_redo_data, 64u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 256u * 1024u);
@@ -2148,13 +2172,17 @@ static void test_truncate_shrink_journaled(void)
 	 * and SetBits, and the truncate's ClearBits. The truncate's
 	 * sizes record is skipped by the file record's MR_LSN stamp
 	 * (the commit stamped it and the sync flushed it), as is the
-	 * pairs record. */
+	 * pairs record. Two clusters are written, not one: the
+	 * create's SetBits lands on the $MFT:$BITMAP cluster and the
+	 * truncate's ClearBits on the volume $Bitmap's own cluster
+	 * — before the bitmap fix both landed on the same (wrong)
+	 * cluster and the count was 1. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
 	CHECK_EQ(an.records_redone, 3u);
 	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -2170,7 +2198,7 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(replay_path(snap2, &an), 0);
 	CHECK_EQ(an.records_redone, 3u);
 	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.clusters_written, 2u);
 
 	unlink(orig);
 	unlink(snap);
@@ -2275,7 +2303,7 @@ out:
 	CHECK_EQ(replay_path(snap1, &an), 0);
 	CHECK_EQ(an.records_redone, 3u);
 	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 

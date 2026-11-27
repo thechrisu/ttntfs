@@ -353,12 +353,11 @@ static int ntfs_glue_make_rw(struct ntfs_volume *vol)
 		int lerr = ntfs_log_writer_open_device(sb->s_bdev, &h);
 
 		if (!lerr) {
-			/* Register the two attributes the create
-			 * transactions target, $MFT:$DATA first (its id is
-			 * what the replay's H1 check keys on). The
-			 * sequence number is record 0's own, read live:
-			 * the replay does not validate it, but Windows
-			 * would, and it costs one map. */
+			/* Register the attributes the transactions target,
+			 * $MFT:$DATA first (its id is what the replay's H1
+			 * check keys on). The sequence number is record 0's
+			 * own, read live: the replay does not validate it,
+			 * but Windows would, and it costs one map. */
 			struct mft_record *m0 = map_mft_record(NTFS_I(vol->mft_ino));
 			uint16_t mft_seq = 1;
 
@@ -378,6 +377,37 @@ static int ntfs_glue_make_rw(struct ntfs_volume *vol)
 								 FILE_MFT, mft_seq,
 								 NULL, 0,
 								 &vol->log_mft_bitmap_attr);
+			/* The volume cluster bitmap, $Bitmap:$DATA (record
+			 * 6): the truncate class stages its cluster-bit
+			 * records against this, not against $MFT:$BITMAP.
+			 * The two bitmaps live in different attributes
+			 * with different run lists; staging a cluster range
+			 * against $MFT:$BITMAP applies the bits to the
+			 * $MFT:$BITMAP's own cluster on replay and leaves
+			 * the freed clusters marked allocated -- a $Bitmap
+			 * leak ntfsck flags after a crash. Its sequence
+			 * number is record 6's own, read live the same
+			 * way. If the $Bitmap inode is missing the mount
+			 * is broken; retire the journal rather than
+			 * registering a bogus attribute. */
+			if (!lerr) {
+				if (!vol->lcnbmp_ino) {
+					lerr = -EIO;
+				} else {
+					struct mft_record *m6 =
+						map_mft_record(NTFS_I(vol->lcnbmp_ino));
+					uint16_t bitmap_seq = 1;
+
+					if (!IS_ERR(m6)) {
+						bitmap_seq = le16_to_cpu(m6->sequence_number);
+						unmap_mft_record(NTFS_I(vol->lcnbmp_ino));
+					}
+					lerr = ntfs_log_writer_open_attr(h->w, ATTR_TYPE_DATA,
+										 FILE_Bitmap, bitmap_seq,
+										 NULL, 0,
+										 &vol->log_lcn_bitmap_attr);
+				}
+			}
 			if (lerr) {
 				ntfs_log_writer_abandon_device(h);
 				h = NULL;
