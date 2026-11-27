@@ -42,6 +42,7 @@
 #include "attrib.h"
 #include "dir.h"
 #include "mft.h"
+#include "time.h"
 #include "journal.h"
 #include "../logfile/ntfs_logfile.h"
 #include "../logfile/logfile_layout.h"
@@ -389,10 +390,20 @@ int ntfs_journal_create_init(struct ntfs_journal_txn *t,
 	return err;
 }
 
-int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
+/* Stage a CreateAttribute record for the attribute just added to
+ * @ni's record, into @t's log transaction. Scans @mrec for (type,
+ * name, name_len) and stages it at its true offset — attributes are
+ * inserted in type order, so the offset must be read after the add,
+ * not assumed. When @index_flag is set and the attribute is a
+ * $FILE_NAME, the staged copy carries RESIDENT_ATTR_IS_INDEXED,
+ * which the live record does not: the replay's link-count bump keys
+ * on it. Returns -ENOENT when the attribute is not in the base
+ * record (it went to an extent). */
+static int stage_create_attr(ntfs_log_txn_t *t, struct ntfs_volume *vol,
 			     struct ntfs_inode *ni,
 			     const struct mft_record *mrec,
-			     __le32 type, const __le16 *name, u8 name_len)
+			     __le32 type, const __le16 *name, u8 name_len,
+			     bool index_flag)
 {
 	const struct attr_record *a;
 	u16 off = 0;
@@ -402,8 +413,6 @@ int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
 	u16 cluster_off;
 	int err;
 
-	if (!t)
-		return -EINVAL;
 	a = find_attr(mrec, type, name, name_len, &off);
 	if (!a)
 		return -ENOENT;
@@ -412,7 +421,7 @@ int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
 	if (!copy)
 		return -ENOMEM;
 	memcpy(copy, a, len);
-	if (type == AT_FILE_NAME) {
+	if (index_flag && type == AT_FILE_NAME) {
 		/*
 		 * The live $FILE_NAME already carries INDEXED
 		 * (attrib.c sets RESIDENT_ATTR_IS_INDEXED for every
@@ -427,13 +436,24 @@ int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
 		if (!c->non_resident)
 			c->data.resident.flags |= RESIDENT_ATTR_IS_INDEXED;
 	}
-	err = mft_coords(t->vol, ni->mft_no, &vcn, &cluster_off, &page_lcn);
+	err = mft_coords(vol, ni->mft_no, &vcn, &cluster_off, &page_lcn);
 	if (!err)
-		err = ntfs_log_txn_create_attr(t->t, t->vol->log_mft_data_attr,
+		err = ntfs_log_txn_create_attr(t, vol->log_mft_data_attr,
 					       vcn, cluster_off, page_lcn,
 					       off, copy, len);
 	kfree(copy);
 	return err;
+}
+
+int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
+			     struct ntfs_inode *ni,
+			     const struct mft_record *mrec,
+			     __le32 type, const __le16 *name, u8 name_len)
+{
+	if (!t)
+		return -EINVAL;
+	return stage_create_attr(t->t, t->vol, ni, mrec, type, name,
+				 name_len, true);
 }
 
 int ntfs_journal_create_ea(struct ntfs_journal_txn *t,
@@ -1277,6 +1297,10 @@ struct ntfs_journal_truncate {
 	 * is the set difference between this and the live run list. */
 	struct runlist_element *old_rl;
 	size_t old_count;
+	/* Joined into an ambient setattr transaction (begin_in): the
+	 * log transaction, the gate and the lock belong to the outer
+	 * transaction, so abort/free must not touch them. */
+	bool joined;
 };
 
 static void free_truncate_snapshot(struct ntfs_journal_truncate *t)
@@ -1289,48 +1313,30 @@ static void free_truncate_snapshot(struct ntfs_journal_truncate *t)
 	t->old_count = 0;
 }
 
-int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
-				struct ntfs_inode *ni,
-				struct ntfs_journal_truncate **out)
+/*
+ * Snapshot the $DATA sizes + pairs, the $SI flags and the run list
+ * before a resize mutates them. The run list must be whole: a
+ * partially mapped list would miss the tail runs the shrink frees.
+ * The snapshot is taken before log_txn_lock — the same window the
+ * create begin has for record 0, and the stage re-verifies the
+ * attribute offset before staging anything. (For a joined truncate
+ * the outer transaction already holds the lock; the snapshot is
+ * then taken under it, which is only safer.) On success the
+ * carrier's snap_ok is set and its snapshots are owned by it.
+ */
+static int truncate_snapshot(struct ntfs_volume *vol,
+			     struct ntfs_inode *ni,
+			     struct ntfs_journal_truncate *t)
 {
-	struct ntfs_journal_truncate *t;
 	struct mft_record *m;
 	int err;
 
-	*out = NULL;
-	if (!vol->log_writer)
-		return 0;
-	/* Regular files only, non-resident $DATA only. A resident
-	 * $DATA, an attribute list (the $DATA may span extent
-	 * records), a compressed or encrypted file: unjournaled. */
-	if (!S_ISREG(VFS_I(ni)->i_mode) || !NInoNonResident(ni) ||
-	    ni->attr_list || NInoCompressed(ni) || NInoEncrypted(ni))
-		return 0;
-	t = kmalloc(sizeof(*t), GFP_NOFS);
-	if (!t)
-		return -ENOMEM;
-	t->vol = vol;
-	t->t = NULL;
-	t->snap.pairs = NULL;
-	t->snap_ok = false;
-	t->old_rl = NULL;
-	t->old_count = 0;
-	/*
-	 * Snapshot the $DATA sizes + pairs and the run list before
-	 * anything mutates. The run list must be whole: a partially
-	 * mapped list would miss the tail runs the shrink frees.
-	 * The snapshot is taken before log_txn_lock — the same
-	 * window the create begin has for record 0, and the stage
-	 * re-verifies the attribute offset before staging anything.
-	 */
 	err = ntfs_attr_map_whole_runlist(ni);
 	if (err)
-		goto out_free;
+		return err;
 	m = map_mft_record(ni);
-	if (IS_ERR(m)) {
-		err = PTR_ERR(m);
-		goto out_free;
-	}
+	if (IS_ERR(m))
+		return PTR_ERR(m);
 	err = snapshot_mft_attr(m, AT_DATA, &t->snap);
 	if (!err) {
 		/* Snapshot the $STANDARD_INFORMATION flags too: a
@@ -1365,13 +1371,15 @@ int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
 	 * size for a sparse/compressed file, the $DATA's allocated
 	 * size otherwise — the rule ntfs_inode_sync_filename
 	 * applies when it refreshes the parent's $FILE_NAME. */
-	if (NInoSparse(ni) || NInoCompressed(ni))
-		t->fn_alloc_old = ni->itype.compressed.size;
-	else
-		t->fn_alloc_old = t->snap.alloc;
+	if (!err) {
+		if (NInoSparse(ni) || NInoCompressed(ni))
+			t->fn_alloc_old = ni->itype.compressed.size;
+		else
+			t->fn_alloc_old = t->snap.alloc;
+	}
 	unmap_mft_record(ni);
 	if (err)
-		goto out_free;
+		return err;
 	t->snap_ok = true;
 	{
 		struct runlist_element *rl;
@@ -1393,11 +1401,41 @@ int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
 			}
 		}
 		up_read(&ni->runlist.lock);
-		if (!t->old_rl) {
-			err = -ENOMEM;
-			goto out_free;
-		}
+		if (!t->old_rl)
+			return -ENOMEM;
 	}
+	return 0;
+}
+
+int ntfs_journal_truncate_begin(struct ntfs_volume *vol,
+				struct ntfs_inode *ni,
+				struct ntfs_journal_truncate **out)
+{
+	struct ntfs_journal_truncate *t;
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	/* Regular files only, non-resident $DATA only. A resident
+	 * $DATA, an attribute list (the $DATA may span extent
+	 * records), a compressed or encrypted file: unjournaled. */
+	if (!S_ISREG(VFS_I(ni)->i_mode) || !NInoNonResident(ni) ||
+	    ni->attr_list || NInoCompressed(ni) || NInoEncrypted(ni))
+		return 0;
+	t = kmalloc(sizeof(*t), GFP_NOFS);
+	if (!t)
+		return -ENOMEM;
+	t->vol = vol;
+	t->t = NULL;
+	t->snap.pairs = NULL;
+	t->snap_ok = false;
+	t->old_rl = NULL;
+	t->old_count = 0;
+	t->joined = false;
+	err = truncate_snapshot(vol, ni, t);
+	if (err)
+		goto out_free;
 	mutex_lock(&vol->log_txn_lock);
 	err = ntfs_log_txn_begin(vol->log_writer, &t->t);
 	if (err) {
@@ -1414,13 +1452,107 @@ out_free:
 	return err;
 }
 
+/* The setattr carrier. Defined here, ahead of
+ * ntfs_journal_truncate_begin_in, which dereferences it; the rest of
+ * the setattr class lives at the end of the file. */
+struct ntfs_journal_setattr {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+	/* The $STANDARD_INFORMATION's first 36 bytes (four times +
+	 * file_attributes) as they stood at begin, built from in-memory
+	 * vi/ni state — never from the mapped record, which lags behind
+	 * the log. */
+	u8 si_old[36];
+	u16 si_attr_off;
+	u16 si_value_off;
+	u32 si_flags_old;	/* CPU order, from si_old's flags */
+	/* The $DATA sizes as they stood at begin, for the $FILE_NAME
+	 * old dup — the same rule ntfs_inode_sync_filename applies
+	 * (0 for a directory, compressed.size for sparse/compressed,
+	 * allocated_size otherwise). */
+	u64 fn_alloc_old;
+	u64 fn_data_old;
+	/* The $EA_INFORMATION as it stood at begin: its 8-byte value.
+	 * Always resident (8 bytes); anything else is a begin failure. */
+	bool ea_info_present;
+	u8 ea_info_old[8];
+	/* The $EA as it stood at begin: a copy of its value. A
+	 * non-resident $EA means the file never begins (this class
+	 * cannot describe it); a length change at stage aborts. */
+	bool ea_present;
+	u16 ea_value_len;
+	u8 *ea_old;
+	/* The joined truncate carrier, or NULL when there was no size
+	 * change or the resize is unjournaled. */
+	struct ntfs_journal_truncate *jt;
+	/* The joined truncate's begin or stage failed: the resize is
+	 * unjournaled, so this transaction must not commit either. */
+	bool truncate_failed;
+};
+
+int ntfs_journal_truncate_begin_in(struct ntfs_journal_setattr *st,
+				   struct ntfs_inode *ni,
+				   struct ntfs_journal_truncate **out)
+{
+	struct ntfs_journal_truncate *t;
+	int err;
+
+	*out = NULL;
+	if (!st)
+		return -EINVAL;
+	/* The same journalability gate as the standalone begin: the
+	 * setattr transaction is already open, so an unjournalable
+	 * resize just means the truncate half is unlogged — the
+	 * caller marks the outer transaction unjournaled too. */
+	if (!S_ISREG(VFS_I(ni)->i_mode) || !NInoNonResident(ni) ||
+	    ni->attr_list || NInoCompressed(ni) || NInoEncrypted(ni))
+		return 0;
+	t = kmalloc(sizeof(*t), GFP_NOFS);
+	if (!t)
+		return -ENOMEM;
+	t->vol = st->vol;
+	t->t = st->t;
+	t->snap.pairs = NULL;
+	t->snap_ok = false;
+	t->old_rl = NULL;
+	t->old_count = 0;
+	t->joined = true;
+	err = truncate_snapshot(st->vol, ni, t);
+	if (err) {
+		free_truncate_snapshot(t);
+		kfree(t);
+		return err;
+	}
+	*out = t;
+	return 0;
+}
+
+void ntfs_journal_truncate_join_free(struct ntfs_journal_truncate *t)
+{
+	if (!t)
+		return;
+	/* The staged records stay in the outer transaction; only the
+	 * snapshots are spent. Never touch the log transaction, the
+	 * gate or the lock here — they belong to the outer
+	 * transaction. */
+	free_truncate_snapshot(t);
+	kfree(t);
+}
+
 void ntfs_journal_truncate_abort(struct ntfs_journal_truncate *t)
 {
 	if (!t)
 		return;
-	(void)ntfs_log_txn_abort(t->t);
-	atomic_dec(&t->vol->log_txn_open);
-	mutex_unlock(&t->vol->log_txn_lock);
+	if (!t->joined) {
+		(void)ntfs_log_txn_abort(t->t);
+		atomic_dec(&t->vol->log_txn_open);
+		mutex_unlock(&t->vol->log_txn_lock);
+	}
+	/* A joined carrier's log transaction belongs to the outer
+	 * setattr transaction, which aborts it; this only frees the
+	 * snapshots. The join path uses join_free for the same
+	 * reason; abort is joined-aware so a stray call cannot
+	 * discard the outer transaction's records. */
 	free_truncate_snapshot(t);
 	kfree(t);
 }
@@ -1536,9 +1668,9 @@ static int stage_bitmap_range(struct ntfs_journal_truncate *t,
 }
 
 /*
- * Stage one parent's $FILE_NAME update for a truncate. The parent's
- * index entry duplicates the file's allocated/data sizes and flags,
- * and the live driver refreshes them at parent writeback
+ * Stage one parent's $FILE_NAME dup update. The parent's index entry
+ * duplicates the file's allocated/data sizes and flags, and the live
+ * driver refreshes them at parent writeback
  * (ntfs_inode_sync_filename) — after the commit, so a crash between
  * the commit and the parent's writeback leaves the entry stale and
  * ntfsck flags the file ("Allocated size is different with
@@ -1550,20 +1682,35 @@ static int stage_bitmap_range(struct ntfs_journal_truncate *t,
  * parent's $INDEX_ROOT, via ntfs_iget — the same route
  * ntfs_inode_sync_filename takes, and the same lock order (the
  * file's mrec_lock is held by the caller; the parent's is taken
- * nested, NTFS_INODE_MUTEX_PARENT). Every $FILE_NAME in the file's
- * record is staged, so hard links update every parent. When the
- * entry lives in an $INDEX_ALLOCATION block, or the parent cannot
- * be reached, this returns -ENOENT and the whole transaction aborts
- * to unjournaled — the resize stands, unjournaled, as before.
+ * nested, NTFS_INODE_MUTEX_PARENT). When the entry lives in an
+ * $INDEX_ALLOCATION block, or the parent cannot be reached, this
+ * returns -ENOENT and the whole transaction aborts to unjournaled.
  * The record is staged only when the duplicated bytes actually
- * change (a no-op truncate stages nothing).
+ * change. Sets *staged_out when a record is staged.
+ *
+ * The old dup takes its times (and the ea/reparse byte) from the
+ * entry — but NOT its old sizes/flags: the parent's record in memory
+ * lags behind the log, because it is only refreshed at parent
+ * writeback, so the entry still holds the values from before the
+ * previous transaction. The old payload therefore takes its
+ * sizes/flags from the caller-supplied begin snapshot, and the new
+ * payload from the caller-supplied current state — the same rule
+ * ntfs_inode_sync_filename applies. Getting the old value from the
+ * entry would make an undo restore the pre-previous state: a
+ * committed shrink followed by a loser's extend would leave the
+ * entry at the pre-shrink size. @flags_old/@flags_new are CPU-order
+ * (le32_to_cpu(ni->flags)); only the FILE_ATTR_VALID_FLAGS bits are
+ * taken from them, the rest of the entry's flags are preserved.
  */
-static int stage_truncate_filename_one(struct ntfs_journal_truncate *t,
-				       struct ntfs_inode *ni,
-				       const struct attr_record *fn_attr,
-				       const struct attr_record *data_attr)
+static int stage_filename_dup(struct ntfs_volume *vol, ntfs_log_txn_t *t,
+			      struct ntfs_inode *ni,
+			      const struct attr_record *fn_attr,
+			      u64 fn_alloc_old, u64 fn_data_old,
+			      u32 flags_old,
+			      u64 fn_alloc_new, u64 fn_data_new,
+			      u32 flags_new,
+			      bool *staged_out)
 {
-	struct ntfs_volume *vol = t->vol;
 	const struct file_name_attr *fn;
 	u32 fn_len, vlen;
 	u64 parent;
@@ -1618,49 +1765,32 @@ static int stage_truncate_filename_one(struct ntfs_journal_truncate *t,
 	if (err)
 		goto out_unmap;
 	/* The entry's dup bytes carry the times (unchanged by a
-	 * truncate) — but NOT the old sizes/flags: the parent's
-	 * record in memory lags behind the log, because it is only
-	 * refreshed at parent writeback, so the entry still holds
-	 * the values from before the previous transaction. The old
-	 * payload therefore takes its sizes/flags from the begin
-	 * snapshot (the state the previous transaction left), and
-	 * the new payload from the file's current state — the same
-	 * rule ntfs_inode_sync_filename applies. Getting the old
-	 * value from the entry would make an undo restore the
-	 * pre-previous state: a committed shrink followed by a
-	 * loser's extend would leave the entry at the pre-shrink
-	 * size. */
+	 * truncate or a setattr — the live driver never updates
+	 * $FILE_NAME times after create/link) and the ea/reparse
+	 * byte; only the sizes/flags come from the caller. */
 	memcpy(old_dup, (const u8 *)e + IE_KEY + FN_DUP_OFFSET,
 	       FN_DUP_SIZE);
 	memcpy(new_dup, old_dup, FN_DUP_SIZE);
-	/* Old: the snapshot's sizes and $SI flags. */
-	v64 = cpu_to_le64(t->fn_alloc_old);
+	/* Old: the snapshot's sizes and flags. */
+	v64 = cpu_to_le64(fn_alloc_old);
 	memcpy(old_dup + dup_alloc, &v64, sizeof(v64));
-	v64 = cpu_to_le64(t->snap.data);
+	v64 = cpu_to_le64(fn_data_old);
 	memcpy(old_dup + dup_data, &v64, sizeof(v64));
 	memcpy(&v32, old_dup + dup_flags, sizeof(v32));
 	old_flags = le32_to_cpu(v32);
 	new_flags = (old_flags & ~le32_to_cpu(FILE_ATTR_VALID_FLAGS)) |
-		    (t->si_flags_old & le32_to_cpu(FILE_ATTR_VALID_FLAGS));
+		    (flags_old & le32_to_cpu(FILE_ATTR_VALID_FLAGS));
 	v32 = cpu_to_le32(new_flags);
 	memcpy(old_dup + dup_flags, &v32, sizeof(v32));
-	/* New: the file's current sizes and flags. The allocated
-	 * size is the compressed size for a sparse/compressed
-	 * file — the $DATA's allocated_size counts the hole. */
-	if (NInoSparse(ni) || NInoCompressed(ni))
-		v64 = cpu_to_le64(ni->itype.compressed.size);
-	else
-		v64 = cpu_to_le64(le64_to_cpu(
-			data_attr->data.non_resident.allocated_size));
+	/* New: the caller's current sizes and flags. */
+	v64 = cpu_to_le64(fn_alloc_new);
 	memcpy(new_dup + dup_alloc, &v64, sizeof(v64));
-	v64 = cpu_to_le64(le64_to_cpu(
-		data_attr->data.non_resident.data_size));
+	v64 = cpu_to_le64(fn_data_new);
 	memcpy(new_dup + dup_data, &v64, sizeof(v64));
 	memcpy(&v32, new_dup + dup_flags, sizeof(v32));
 	old_flags = le32_to_cpu(v32);
 	new_flags = (old_flags & ~le32_to_cpu(FILE_ATTR_VALID_FLAGS)) |
-		    (le32_to_cpu(ni->flags) &
-		     le32_to_cpu(FILE_ATTR_VALID_FLAGS));
+		    (flags_new & le32_to_cpu(FILE_ATTR_VALID_FLAGS));
 	v32 = cpu_to_le32(new_flags);
 	memcpy(new_dup + dup_flags, &v32, sizeof(v32));
 	if (!memcmp(new_dup, old_dup, FN_DUP_SIZE)) {
@@ -1670,15 +1800,46 @@ static int stage_truncate_filename_one(struct ntfs_journal_truncate *t,
 	err = mft_coords(vol, parent, &vcn, &cluster_off, &page_lcn);
 	if (!err)
 		err = ntfs_log_txn_update_filename_root(
-			t->t, vol->log_mft_data_attr,
+			t, vol->log_mft_data_attr,
 			vcn, cluster_off, page_lcn,
 			attr_off, entry_off, new_dup, old_dup);
+	if (!err && staged_out)
+		*staged_out = true;
 out_unmap:
 	unmap_mft_record(index_ni);
 out_unlock:
 	mutex_unlock(&index_ni->mrec_lock);
 	iput(index_vi);
 	return err;
+}
+
+/*
+ * Stage one parent's $FILE_NAME update for a truncate: the truncate
+ * class's values for the shared helper. The new allocated size is
+ * the compressed size for a sparse/compressed file — the $DATA's
+ * allocated_size counts the hole — and the new data size comes from
+ * the mapped $DATA attribute, as before.
+ */
+static int stage_truncate_filename_one(struct ntfs_journal_truncate *t,
+				       struct ntfs_inode *ni,
+				       const struct attr_record *fn_attr,
+				       const struct attr_record *data_attr)
+{
+	u64 fn_alloc_new, fn_data_new;
+	u32 flags_new;
+
+	if (NInoSparse(ni) || NInoCompressed(ni))
+		fn_alloc_new = ni->itype.compressed.size;
+	else
+		fn_alloc_new = le64_to_cpu(
+			data_attr->data.non_resident.allocated_size);
+	fn_data_new = le64_to_cpu(data_attr->data.non_resident.data_size);
+	flags_new = le32_to_cpu(ni->flags);
+	return stage_filename_dup(t->vol, t->t, ni, fn_attr,
+				  t->fn_alloc_old, t->snap.data,
+				  t->si_flags_old,
+				  fn_alloc_new, fn_data_new, flags_new,
+				  NULL);
 }
 
 /*
@@ -1923,4 +2084,476 @@ int ntfs_journal_truncate_commit(struct ntfs_journal_truncate *t,
 	free_truncate_snapshot(t);
 	kfree(t);
 	return err;
+}
+
+/* ---- setattr (Phase 3) -------------------------------------------------- */
+
+static void free_setattr_snapshot(struct ntfs_journal_setattr *st)
+{
+	if (!st)
+		return;
+	kfree(st->ea_old);
+	st->ea_old = NULL;
+}
+
+/*
+ * Build the $STANDARD_INFORMATION's first 36 bytes (four times +
+ * file_attributes) from in-memory state, exactly as
+ * ntfs_inode_sync_standard_information writes them at inode sync:
+ * creation_time from ni->i_crtime, mtime/ctime/atime from the
+ * inode, flags from ni->flags. All little-endian, as stored.
+ */
+static void si_build(struct inode *vi, struct ntfs_inode *ni, u8 out[36])
+{
+	__le64 v64;
+	__le32 v32;
+
+	v64 = utc2ntfs(ni->i_crtime);
+	memcpy(out + 0, &v64, sizeof(v64));
+	v64 = utc2ntfs(inode_get_mtime(vi));
+	memcpy(out + 8, &v64, sizeof(v64));
+	v64 = utc2ntfs(inode_get_ctime(vi));
+	memcpy(out + 16, &v64, sizeof(v64));
+	v64 = utc2ntfs(inode_get_atime(vi));
+	memcpy(out + 24, &v64, sizeof(v64));
+	v32 = ni->flags;
+	memcpy(out + 32, &v32, sizeof(v32));
+}
+
+int ntfs_journal_setattr_begin(struct ntfs_volume *vol,
+			       struct ntfs_inode *ni,
+			       struct ntfs_journal_setattr **out)
+{
+	struct ntfs_journal_setattr *st;
+	struct mft_record *m;
+	struct inode *vi = VFS_I(ni);
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	/* Regular files and directories only, the create class's
+	 * scope. Symlinks and special files proceed unjournaled —
+	 * their reparse staging belongs to their own classes. */
+	if (!S_ISREG(vi->i_mode) && !S_ISDIR(vi->i_mode))
+		return 0;
+	st = kmalloc(sizeof(*st), GFP_NOFS);
+	if (!st)
+		return -ENOMEM;
+	st->vol = vol;
+	st->t = NULL;
+	st->si_attr_off = 0;
+	st->si_value_off = 0;
+	st->si_flags_old = 0;
+	st->fn_alloc_old = 0;
+	st->fn_data_old = 0;
+	st->ea_info_present = false;
+	st->ea_present = false;
+	st->ea_value_len = 0;
+	st->ea_old = NULL;
+	st->jt = NULL;
+	st->truncate_failed = false;
+	/* The $SI snapshot is in-memory state: the mapped record
+	 * lags behind the log, and a mapped snapshot's undo would
+	 * restore the pre-previous state. */
+	si_build(vi, ni, st->si_old);
+	st->si_flags_old = le32_to_cpu(ni->flags);
+	/* The $FILE_NAME old sizes, the sync_filename rule. */
+	if (S_ISDIR(vi->i_mode)) {
+		st->fn_alloc_old = 0;
+		st->fn_data_old = 0;
+	} else {
+		unsigned long flags;
+
+		read_lock_irqsave(&ni->size_lock, flags);
+		if (NInoSparse(ni) || NInoCompressed(ni))
+			st->fn_alloc_old = ni->itype.compressed.size;
+		else
+			st->fn_alloc_old = ni->allocated_size;
+		st->fn_data_old = ni->data_size;
+		read_unlock_irqrestore(&ni->size_lock, flags);
+	}
+	/* The $SI offsets and the $EA pair, from the mapped record.
+	 * A missing or too-short $SI is a begin failure (the resize
+	 * then proceeds unjournaled); a non-resident $EA means the
+	 * file never begins (this class cannot describe it). */
+	m = map_mft_record(ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+		goto out_free;
+	}
+	{
+		const struct attr_record *si;
+		u16 si_off = 0;
+
+		si = find_attr(m, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+		if (!si || si->non_resident ||
+		    le16_to_cpu(si->data.resident.value_offset) + 36 >
+			    le32_to_cpu(si->length)) {
+			err = -ENOENT;
+			goto out_unmap;
+		}
+		st->si_attr_off = si_off;
+		st->si_value_off =
+			le16_to_cpu(si->data.resident.value_offset);
+	}
+	{
+		const struct attr_record *ei, *ea;
+		u16 ei_off = 0, ea_off = 0;
+
+		ei = find_attr(m, AT_EA_INFORMATION, NULL, 0, &ei_off);
+		if (ei) {
+			u16 vlen;
+
+			if (ei->non_resident ||
+			    le16_to_cpu(ei->data.resident.value_length) !=
+				    sizeof(struct ea_information)) {
+				err = -ENOENT;
+				goto out_unmap;
+			}
+			vlen = le16_to_cpu(ei->data.resident.value_offset);
+			memcpy(st->ea_info_old,
+			       (const u8 *)ei + vlen, sizeof(st->ea_info_old));
+			st->ea_info_present = true;
+		}
+		ea = find_attr(m, AT_EA, NULL, 0, &ea_off);
+		if (ea) {
+			u16 vlen;
+
+			if (ea->non_resident) {
+				err = 0;
+				goto out_nonresident;
+			}
+			vlen = le16_to_cpu(ea->data.resident.value_length);
+			st->ea_old = kmalloc(vlen, GFP_NOFS);
+			if (!st->ea_old) {
+				err = -ENOMEM;
+				goto out_unmap;
+			}
+			memcpy(st->ea_old,
+			       (const u8 *)ea +
+				       le16_to_cpu(ea->data.resident.value_offset),
+			       vlen);
+			st->ea_value_len = vlen;
+			st->ea_present = true;
+		}
+	}
+	unmap_mft_record(ni);
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &st->t);
+	if (err) {
+		mutex_unlock(&vol->log_txn_lock);
+		goto out_free;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = st;
+	return 0;
+
+out_nonresident:
+	/* A non-resident $EA: this class cannot describe the file.
+	 * Return 0 with *out NULL — proceed unjournaled, by design,
+	 * not a failure. */
+	unmap_mft_record(ni);
+	free_setattr_snapshot(st);
+	kfree(st);
+	*out = NULL;
+	return 0;
+out_unmap:
+	unmap_mft_record(ni);
+out_free:
+	free_setattr_snapshot(st);
+	kfree(st);
+	return err;
+}
+
+void ntfs_journal_setattr_abort(struct ntfs_journal_setattr *st)
+{
+	if (!st)
+		return;
+	(void)ntfs_log_txn_abort(st->t);
+	atomic_dec(&st->vol->log_txn_open);
+	mutex_unlock(&st->vol->log_txn_lock);
+	free_setattr_snapshot(st);
+	kfree(st);
+}
+
+void ntfs_journal_setattr_mark_truncate_unjournaled(
+	struct ntfs_journal_setattr *st)
+{
+	if (st)
+		st->truncate_failed = true;
+}
+
+/*
+ * Stage the $STANDARD_INFORMATION record: the 36 bytes built from
+ * current in-memory state against the begin snapshot. The $SI must
+ * still sit where begin found it; anything else aborts. Stages
+ * only on change.
+ */
+static int stage_setattr_si(struct ntfs_journal_setattr *st,
+			    struct ntfs_inode *ni,
+			    const struct mft_record *mrec,
+			    u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	u8 si_new[36];
+	const struct attr_record *si;
+	u16 si_off = 0;
+
+	si_build(VFS_I(ni), ni, si_new);
+	if (!memcmp(si_new, st->si_old, sizeof(si_new)))
+		return 0;
+	si = find_attr(mrec, AT_STANDARD_INFORMATION, NULL, 0, &si_off);
+	if (!si || si->non_resident || si_off != st->si_attr_off ||
+	    le16_to_cpu(si->data.resident.value_offset) !=
+		    st->si_value_off)
+		return -ENOENT;
+	return ntfs_log_txn_update_resident(
+		st->t, st->vol->log_mft_data_attr,
+		vcn, cluster_off, page_lcn,
+		si_off, st->si_value_off,
+		si_new, sizeof(si_new), st->si_old, sizeof(st->si_old));
+}
+
+/*
+ * Stage the $EA_INFORMATION and $EA records, net effect. The values
+ * are re-read from the mapped record at stage time — resident $EA
+ * writes land straight in the mapped record, so the stage sees the
+ * final bytes. Cases:
+ *
+ *   - absent at begin, present at stage: CreateAttribute for the
+ *     pair (the create_ea pattern), $EA_INFORMATION first;
+ *   - present at begin, absent at stage: -ENOENT (nothing in a
+ *     setattr removes the pair; refusing to guess);
+ *   - present both times: UpdateResidentValue for each value that
+ *     changed, whole value. A length change aborts (-ENOENT): the
+ *     UpdateResidentValue resize path is unproven here, and adding
+ *     a $LX* entry to a file that already has other EAs grows the
+ *     $EA value. A non-resident $EA at stage aborts the same way.
+ *     An attribute that moved is fine — the current offset is
+ *     staged, and the replay applies the transaction's records in
+ *     order (the $DATA resize records come first and move it to
+ *     exactly that offset).
+ */
+static int stage_setattr_ea(struct ntfs_journal_setattr *st,
+			    struct ntfs_inode *ni,
+			    const struct mft_record *mrec,
+			    u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	const struct attr_record *ei, *ea;
+	u16 ei_off = 0, ea_off = 0;
+	int err;
+
+	ei = find_attr(mrec, AT_EA_INFORMATION, NULL, 0, &ei_off);
+	ea = find_attr(mrec, AT_EA, NULL, 0, &ea_off);
+	if (!st->ea_info_present && !st->ea_present) {
+		if (!ei && !ea)
+			return 0;
+		if (!ei || !ea)
+			return -ENOENT;
+		/* The pair was created by this setattr: stage both
+		 * as CreateAttributes, $EA_INFORMATION first. */
+		err = stage_create_attr(st->t, st->vol, ni, mrec,
+					AT_EA_INFORMATION, NULL, 0, false);
+		if (err)
+			return err;
+		return stage_create_attr(st->t, st->vol, ni, mrec,
+					 AT_EA, NULL, 0, false);
+	}
+	if (!ei || !ea)
+		return -ENOENT;
+	if (ei->non_resident || ea->non_resident)
+		return -ENOENT;
+	if (le16_to_cpu(ea->data.resident.value_length) !=
+	    st->ea_value_len)
+		return -ENOENT;
+	/* $EA_INFORMATION first, then $EA — the create order. Its
+	 * value is always 8 bytes; anything else is a record this
+	 * class cannot describe. */
+	if (le16_to_cpu(ei->data.resident.value_length) !=
+	    sizeof(struct ea_information))
+		return -ENOENT;
+	{
+		const u8 *new_info = (const u8 *)ei +
+			le16_to_cpu(ei->data.resident.value_offset);
+
+		if (memcmp(new_info, st->ea_info_old,
+			   sizeof(st->ea_info_old)) != 0) {
+			err = ntfs_log_txn_update_resident(
+				st->t, st->vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ei_off,
+				le16_to_cpu(ei->data.resident.value_offset),
+				new_info, sizeof(struct ea_information),
+				st->ea_info_old,
+				sizeof(struct ea_information));
+			if (err)
+				return err;
+		}
+	}
+	{
+		const u8 *new_ea = (const u8 *)ea +
+			le16_to_cpu(ea->data.resident.value_offset);
+
+		if (memcmp(new_ea, st->ea_old, st->ea_value_len) != 0) {
+			err = ntfs_log_txn_update_resident(
+				st->t, st->vol->log_mft_data_attr,
+				vcn, cluster_off, page_lcn,
+				ea_off,
+				le16_to_cpu(ea->data.resident.value_offset),
+				new_ea, st->ea_value_len,
+				st->ea_old, st->ea_value_len);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Stage the parent's $FILE_NAME updates for a setattr: one
+ * UpdateFileNameRoot per $FILE_NAME in the file's record (hard links
+ * update every parent), via the shared helper. The new sizes follow
+ * the sync_filename rule (0 for a directory, compressed.size for
+ * sparse/compressed, allocated_size otherwise); the new flags are
+ * the file's current flags.
+ */
+static int stage_setattr_filename(struct ntfs_journal_setattr *st,
+				  struct ntfs_inode *ni,
+				  const struct mft_record *mrec)
+{
+	u64 fn_alloc_new, fn_data_new;
+	u32 flags_new;
+	u16 off = le16_to_cpu(mrec->attrs_offset);
+	u32 used = le32_to_cpu(mrec->bytes_in_use);
+	int err = 0;
+
+	if (S_ISDIR(VFS_I(ni)->i_mode)) {
+		fn_alloc_new = 0;
+		fn_data_new = 0;
+	} else {
+		unsigned long flags;
+
+		read_lock_irqsave(&ni->size_lock, flags);
+		if (NInoSparse(ni) || NInoCompressed(ni))
+			fn_alloc_new = ni->itype.compressed.size;
+		else
+			fn_alloc_new = ni->allocated_size;
+		fn_data_new = ni->data_size;
+		read_unlock_irqrestore(&ni->size_lock, flags);
+	}
+	flags_new = le32_to_cpu(ni->flags);
+	while (off + 8 <= used) {
+		const struct attr_record *at =
+			(const struct attr_record *)((const u8 *)mrec + off);
+		u32 len;
+
+		if (at->type == AT_END)
+			break;
+		len = le32_to_cpu(at->length);
+		if (len < 8 || off + len > used)
+			return -EINVAL;
+		if (at->type == AT_FILE_NAME) {
+			err = stage_filename_dup(st->vol, st->t, ni, at,
+						 st->fn_alloc_old,
+						 st->fn_data_old,
+						 st->si_flags_old,
+						 fn_alloc_new, fn_data_new,
+						 flags_new, NULL);
+			if (err)
+				return err;
+		}
+		off += len;
+	}
+	return err;
+}
+
+static int ntfs_journal_setattr_stage(struct ntfs_journal_setattr *st,
+				      struct ntfs_inode *ni,
+				      const struct mft_record *mrec)
+{
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	err = mft_coords(st->vol, ni->mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (err)
+		return err;
+	/* $SI first (times + flags), then the $EA pair, then the
+	 * parent's $FILE_NAME — the order the driver makes the
+	 * sub-mutations in (the EA and $FILE_NAME bytes land in the
+	 * mapped record during ntfs_vfs_setattr; the $SI bytes are
+	 * built from in-memory state, which is final by now). */
+	err = stage_setattr_si(st, ni, mrec, vcn, cluster_off, page_lcn);
+	if (err)
+		return err;
+	err = stage_setattr_ea(st, ni, mrec, vcn, cluster_off, page_lcn);
+	if (err)
+		return err;
+	return stage_setattr_filename(st, ni, mrec);
+}
+
+static int ntfs_journal_setattr_commit(struct ntfs_journal_setattr *st,
+				       struct ntfs_inode *ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!st)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(st->t, NULL, &last_lsn);
+	if (!err) {
+		/* Stamp MR_LSN into the file's record before the
+		 * metadata flush, as in the other commits. The
+		 * parent is not stamped — the $FILE_NAME redo is
+		 * idempotent, as in truncate. The finish never
+		 * commits an empty transaction, so last_lsn is a
+		 * real LSN here, never 0. */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+	}
+	atomic_dec(&st->vol->log_txn_open);
+	mutex_unlock(&st->vol->log_txn_lock);
+	free_setattr_snapshot(st);
+	kfree(st);
+	return err;
+}
+
+int ntfs_journal_setattr_finish(struct ntfs_journal_setattr *st,
+				struct ntfs_inode *ni,
+				const struct mft_record *mrec)
+{
+	int err;
+
+	if (!st)
+		return -EINVAL;
+	/* The resize is unjournaled: the $DATA part cannot be
+	 * described, so the $SI/$EA/$FILE_NAME records must not
+	 * commit either — the $FILE_NAME new dup would carry the
+	 * new sizes against an old $DATA, the exact mismatch the
+	 * truncate class's $FILE_NAME fix closed. */
+	if (st->truncate_failed)
+		goto out_abort;
+	err = ntfs_journal_setattr_stage(st, ni, mrec);
+	if (err)
+		goto out_abort;
+	/* Nothing staged — a no-op setattr, or a resize that moved
+	 * nothing and no mode/times change: abort, no log churn.
+	 * (Committing an empty transaction writes nothing, but it
+	 * would return last_lsn 0, and stamping that would clear
+	 * the record's MR_LSN.) */
+	if (ntfs_log_txn_is_empty(st->t))
+		goto out_abort;
+	return ntfs_journal_setattr_commit(st, ni);
+
+out_abort:
+	ntfs_journal_setattr_abort(st);
+	return 0;
 }

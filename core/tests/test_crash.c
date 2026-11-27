@@ -907,6 +907,10 @@ struct aftermath {
 	bool mounts;
 	bool file_present;
 	u64 size, alloc;
+	/* The setattr sweep's all-old-or-all-new check. */
+	uint32_t mode, flags;
+	int64_t mtime_sec;
+	int32_t mtime_nsec;
 };
 
 /* @parent NULL looks @name up under the root; otherwise under @parent. */
@@ -937,6 +941,10 @@ static struct aftermath remount(const char *path, const char *parent,
 				a.file_present = true;
 				a.size = at.size;
 				a.alloc = at.alloc_size;
+				a.mode = at.mode;
+				a.flags = at.file_attributes;
+				a.mtime_sec = at.mtime.sec;
+				a.mtime_nsec = at.mtime.nsec;
 			}
 			ntfs_inode_put(f);
 		}
@@ -2768,6 +2776,343 @@ static void test_journaled_truncate_extend_cut_points(void)
 	sweep_truncate_cut_points(true);
 }
 
+/* ---- setattr ---------------------------------------------------------- */
+
+static long crash_run_setattr_journaled(const char *path, long limit)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct ntfs_attr sa;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_lookup(d, "j.txt", &f) == 0) {
+				memset(&sa, 0, sizeof(sa));
+				sa.mode = 0100444;
+				sa.mtime.sec = 1577934245LL;
+				sa.mtime.nsec = 0;
+				sa.atime.sec = 1577934245LL;
+				sa.atime.nsec = 0;
+				ntfs_setattr(f, &sa, NTFS_SETATTR_MODE |
+						NTFS_SETATTR_MTIME |
+						NTFS_SETATTR_ATIME);
+				ntfs_inode_put(f);
+			}
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+/* The setattr sweep. Same shape as the truncate sweep, but the operation
+ * is a journaled chmod + utimens of d/j.txt: a cut before the commit must
+ * replay to the old attributes, a cut after it to the new ones — either
+ * way ntfsck-clean, and mtime/flags after replay are all-old or all-new,
+ * never a mix (the $SI, $EA and $FILE_NAME records are one transaction:
+ * a torn record write cannot produce a file whose mtime moved but whose
+ * flags did not). The mode is checked by the journal test, not here:
+ * remount mounts read-only, so both outcomes report mode 0444. The size
+ * does not move. */
+static void sweep_setattr_cut_points(void)
+{
+	char base[1024], work[1024], probe[1024];
+	const char *tag = "setattr";
+	struct geometry g;
+	struct aftermath old_a;
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+	int64_t old_mtime_sec;
+	int32_t old_mtime_nsec;
+	uint32_t old_flags;
+
+	scratch_path(base, sizeof(base), "sa-base");
+	scratch_path(work, sizeof(work), "sa-work");
+	scratch_path(probe, sizeof(probe), "sa-probe");
+	if (make_base_with_sized_file_in_dir(base, 256 * 1024) != 0) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"mkntfs unavailable\n", tag);
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"ntfsck unavailable at '%s'\n", tag, ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	/* The old attributes, read off a probe copy so the base stays
+	 * untouched: the all-old outcome is these values. Note the
+	 * probe mounts read-only (remount opens the device
+	 * read-only), so mode_of() strips the write bits and the
+	 * mode reads 0444 even though the file is 0644 — the mode
+	 * cannot discriminate old from new through remount, and is
+	 * not used for that here. The discrimination is by mtime
+	 * and $SI flags, which remount reports raw; the mode itself
+	 * is pinned by test_setattr_journaled, which mounts
+	 * read-write. */
+	if (copy_file(base, probe) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	old_a = remount(probe, "d", "j.txt");
+	unlink(probe);
+	if (!old_a.file_present || old_a.size != 256u * 1024u) {
+		FAILF("the base file is absent or not 256 KiB\n");
+		unlink(base);
+		return;
+	}
+	old_mtime_sec = old_a.mtime_sec;
+	old_mtime_nsec = old_a.mtime_nsec;
+	old_flags = old_a.flags;
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_setattr_journaled(work, LONG_MAX);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-%s-uncrashed.img", tmpdir, tag);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled setattr made no writes\n");
+		unlink(base);
+		unlink(work);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  j.txt mode/mtime/flags\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct aftermath a;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		bool pre_bad, post_bad, is_old, is_new;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_setattr_journaled(work, cut);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-cut-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-replayed-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		a = remount(work, "d", "j.txt");
+		/* All-old or all-new, by mtime and $SI flags. The mode
+		 * is not part of the check: remount mounts read-only,
+		 * so mode_of() strips the write bits and both outcomes
+		 * report 0444 (see the probe note above). A torn mix —
+		 * new mtime with old flags, or old mtime with new
+		 * flags — is a transaction that committed halfway and
+		 * fails. */
+		is_old = a.file_present &&
+			a.mtime_sec == old_mtime_sec &&
+			a.mtime_nsec == old_mtime_nsec &&
+			a.flags == old_flags;
+		is_new = a.file_present &&
+			a.mtime_sec == 1577934245LL && a.mtime_nsec == 0 &&
+			a.flags == (old_flags | 0x1u);
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %o/%lld/%#x\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.mode, (long long)a.mtime_sec, a.flags);
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+					tag, cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+					tag, cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+					tag, cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+					tag, cut, (unsigned long long)bad_ino,
+					(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts || !a.file_present) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the "
+					"volume no longer mounts or j.txt is "
+					"absent after replay\n",
+					tag, cut);
+		}
+		checks++;
+		if (a.file_present && a.size != 256u * 1024u) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: j.txt "
+					"is %llu bytes after replay — a setattr "
+					"must not move the size\n",
+					tag, cut, (unsigned long long)a.size);
+		}
+		checks++;
+		if (a.file_present && !is_old && !is_new) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: j.txt "
+					"is %o/%lld/%#x after replay — neither "
+					"all-old (mtime %lld/%#x) nor all-new "
+					"(mtime 1577934245/%#x); the mode reads "
+					"0444 either way through the read-only "
+					"remount\n",
+					tag, cut, a.mode,
+					(long long)a.mtime_sec, a.flags,
+					(long long)old_mtime_sec,
+					old_flags,
+					old_flags | 0x1u);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+					tag, cut, err_rep2, an2.records_redone,
+					an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- --------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; j.txt all-old %d times, all-new %d times\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_%s_cut_points\n", tag);
+}
+
+static void test_journaled_setattr_cut_points(void)
+{
+	sweep_setattr_cut_points();
+}
+
 int main(void)
 {
 	tool_paths();
@@ -2782,6 +3127,7 @@ int main(void)
 	test_journaled_mkdir_cut_points();
 	test_journaled_truncate_shrink_cut_points();
 	test_journaled_truncate_extend_cut_points();
+	test_journaled_setattr_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

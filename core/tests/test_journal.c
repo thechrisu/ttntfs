@@ -288,6 +288,23 @@ struct rec_seen {
 	 * flags the truncate stages when the file flips sparse). */
 	uint32_t res_redo, res_undo;
 	uint64_t res_lsn;
+	/* UpdateResidentValue with a 36-byte payload: the $SI times +
+	 * flags the setattr stages (crtime +0, mtime +8, ctime +16,
+	 * atime +24, flags +32, all little-endian). The last such
+	 * record wins. */
+	uint64_t si_redo_crtime, si_undo_crtime;
+	uint64_t si_redo_mtime, si_undo_mtime;
+	uint64_t si_redo_ctime, si_undo_ctime;
+	uint64_t si_redo_atime, si_undo_atime;
+	uint32_t si_redo_flags, si_undo_flags;
+	uint64_t si_lsn;
+	/* UpdateResidentValue whose payload is the $EA value: the
+	 * $LXMOD entry's 4-byte mode, redo and undo. The last such
+	 * record wins. (The $SI 36-byte record and the 8-byte
+	 * $EA_INFORMATION record carry no $LXMOD entry, so they
+	 * never match.) */
+	uint32_t ea_lxmod_redo, ea_lxmod_undo;
+	uint64_t ea_lsn;
 	/* UpdateFileNameRoot: the duplicated sizes/flags from the
 	 * redo/undo dup payloads (alloc at +0x20, data at +0x28,
 	 * flags at +0x30). The last such record wins. */
@@ -321,6 +338,57 @@ static void set_fn_name(const char *name)
 		fn_name_pat[2 * i + 1] = 0;
 	}
 	fn_name_len = 2 * n;
+}
+
+static uint64_t rd64(const uint8_t *p)
+{
+	return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+		((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+		((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+		((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+/* Find the $LXMOD entry in a packed $EA value and return its 4-byte
+ * mode. An EA entry is: next_entry_offset (u32), flags (u8),
+ * name_length (u8), value_length (u16), name (name_length bytes
+ * plus a NUL), value. Entries are 4-byte aligned; the last has
+ * next_entry_offset 0. */
+static bool find_lxmod(const uint8_t *p, size_t len, uint32_t *mode_out)
+{
+	size_t off = 0;
+
+	while (off + 8 <= len) {
+		uint32_t next = (uint32_t)p[off] | ((uint32_t)p[off + 1] << 8) |
+			((uint32_t)p[off + 2] << 16) | ((uint32_t)p[off + 3] << 24);
+		uint8_t name_len = p[off + 5];
+		uint16_t value_len = (uint16_t)p[off + 6] |
+			((uint16_t)p[off + 7] << 8);
+		size_t value_off;
+
+		if (name_len == 6 && off + 8 + 6 + 1 <= len &&
+		    !memcmp(p + off + 8, "$LXMOD", 6)) {
+			value_off = off + 8 + name_len + 1;
+			if (value_len != 4 || value_off + 4 > len)
+				return false;
+			*mode_out = (uint32_t)p[value_off] |
+				((uint32_t)p[value_off + 1] << 8) |
+				((uint32_t)p[value_off + 2] << 16) |
+				((uint32_t)p[value_off + 3] << 24);
+			return true;
+		}
+		if (next == 0 || next < 8 || off + next > len)
+			return false;
+		off += next;
+	}
+	return false;
+}
+
+/* Unix seconds/nanoseconds to an NTFS timestamp: 100ns intervals
+ * since 1601-01-01. The same arithmetic utc2ntfs does. */
+static uint64_t ntfs_time(int64_t sec, int32_t nsec)
+{
+	return (uint64_t)(sec + 11644473600LL) * 10000000uLL +
+		(uint64_t)(nsec / 100);
 }
 
 static int collect_rec(const struct ntfs_log_record *r, void *ctx)
@@ -381,6 +449,37 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 		s->res_undo = (uint32_t)pu[0] | ((uint32_t)pu[1] << 8) |
 			((uint32_t)pu[2] << 16) | ((uint32_t)pu[3] << 24);
 		s->res_lsn = r->lsn;
+	}
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->redo_len == 36 &&
+	    r->undo && r->undo_len == 36) {
+		const uint8_t *pr = r->redo, *pu = r->undo;
+		/* $SI layout: crtime +0, mtime +8, ctime +16, atime
+		 * +24, flags +32. Read the u64s the same shifted way
+		 * as the dup capture below. */
+		s->si_redo_crtime = rd64(pr + 0);
+		s->si_undo_crtime = rd64(pu + 0);
+		s->si_redo_mtime = rd64(pr + 8);
+		s->si_undo_mtime = rd64(pu + 8);
+		s->si_redo_ctime = rd64(pr + 16);
+		s->si_undo_ctime = rd64(pu + 16);
+		s->si_redo_atime = rd64(pr + 24);
+		s->si_undo_atime = rd64(pu + 24);
+		s->si_redo_flags = (uint32_t)pr[32] | ((uint32_t)pr[33] << 8) |
+			((uint32_t)pr[34] << 16) | ((uint32_t)pr[35] << 24);
+		s->si_undo_flags = (uint32_t)pu[32] | ((uint32_t)pu[33] << 8) |
+			((uint32_t)pu[34] << 16) | ((uint32_t)pu[35] << 24);
+		s->si_lsn = r->lsn;
+	}
+	if (r->redo_op == LOP_UpdateResidentValue && r->redo && r->undo &&
+	    r->redo_len == r->undo_len) {
+		uint32_t redo_mode, undo_mode;
+
+		if (find_lxmod(r->redo, r->redo_len, &redo_mode) &&
+		    find_lxmod(r->undo, r->undo_len, &undo_mode)) {
+			s->ea_lxmod_redo = redo_mode;
+			s->ea_lxmod_undo = undo_mode;
+			s->ea_lsn = r->lsn;
+		}
 	}
 	if (r->redo_op == LOP_UpdateFileNameRoot && r->redo &&
 	    r->redo_len == FN_DUP_SIZE && r->undo &&
@@ -732,6 +831,51 @@ static int size_after_mount(const char *path, const char *parent,
 	err = ntfs_getattr(f, &at);
 	if (!err)
 		*size_out = at.size;
+	ntfs_inode_put(f);
+out_d:
+	if (d && d != root)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* Mount @path, look @name up under @parent (NULL: the root), read its
+ * full attributes (mode, times, flags), unmount. The same shape as
+ * size_after_mount, for the setattr tests' post-replay checks. */
+static int attr_after_mount(const char *path, const char *parent,
+			    const char *name, struct ntfs_attr *at_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err)
+		goto out_dev;
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	d = root;
+	if (parent) {
+		err = ntfs_lookup(root, parent, &d);
+		if (err) {
+			ntfs_inode_put(root);
+			root = NULL;
+			goto out_vol;
+		}
+	}
+	err = ntfs_lookup(d, name, &f);
+	if (err)
+		goto out_d;
+	err = ntfs_getattr(f, at_out);
 	ntfs_inode_put(f);
 out_d:
 	if (d && d != root)
@@ -2173,8 +2317,14 @@ static void test_truncate_shrink_journaled(void)
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* The walk: the create's 14 still-live records, then the
-	 * truncate's 11 (2 open + 4 data + Commit + 3 dumps +
-	 * Forget). The four data records are the $Bitmap ClearBits
+	 * setattr transaction's 13. ntfs_truncate routes through
+	 * ntfs_setattr, so the resize joins the setattr transaction:
+	 * the truncate's 6 (2 open + 4 data) plus the setattr's 2
+	 * (the $SI 36 bytes, then a second UpdateFileNameRoot with
+	 * the same dup — the setattr stages its own $FILE_NAME
+	 * record from its begin snapshot, it does not dedupe
+	 * against the truncate's), plus Commit + 3 dumps + Forget.
+	 * The four truncate data records are the $Bitmap ClearBits
 	 * for the freed run, the UpdateMappingPairs for the shorter
 	 * run list, the SetNewAttributeSizes for the new sizes, and
 	 * the UpdateFileNameRoot for the parent's $FILE_NAME — in
@@ -2182,8 +2332,8 @@ static void test_truncate_shrink_journaled(void)
 	 * them, then the sizes, then the parent's duplicated
 	 * sizes. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 25);
-	if (s.n == 25) {
+	CHECK_EQ(s.n, 27);
+	if (s.n == 27) {
 		/* The opens come in first-use order: the truncate
 		 * stages the $Bitmap record first, so the volume
 		 * $Bitmap ($Bitmap:$DATA) opens before $MFT:$DATA —
@@ -2205,11 +2355,21 @@ static void test_truncate_shrink_journaled(void)
 		CHECK_EQ(s.target_attr[18], 0x18u);
 		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
 		CHECK_EQ(s.target_attr[19], 0x18u);
-		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
+		/* The setattr's two records, staged at finish after
+		 * the truncate's: the $SI 36 bytes (mtime/ctime moved
+		 * by the resize) and a second UpdateFileNameRoot —
+		 * same dup as [19], staged from the setattr's begin
+		 * snapshot. Both address the file's record through
+		 * $MFT:$DATA (0x18). */
+		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[20], 0x18u);
+		CHECK_EQ(s.redo_op[21], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[21], 0x18u);
+		CHECK_EQ(s.redo_op[22], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[23], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[24], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[25], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[26], LOP_ForgetTransaction);
 		/* The $FILE_NAME record names the new sizes (64 KiB)
 		 * and undoes to the old ones (256 KiB); the parent's
 		 * record is addressed through $MFT:$DATA, like the
@@ -2218,7 +2378,10 @@ static void test_truncate_shrink_journaled(void)
 		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
 		CHECK_EQ(s.fn_redo_alloc, 64u * 1024u);
 		CHECK_EQ(s.fn_undo_alloc, 256u * 1024u);
-		CHECK_EQ(s.fnupd_lsn, s.lsn[19]);
+		/* The collector keeps the LAST $FILE_NAME record: the
+		 * setattr's dup at [21], identical to the truncate's
+		 * at [19]. */
+		CHECK_EQ(s.fnupd_lsn, s.lsn[21]);
 		/* The ClearBits frees 48 clusters, one run. (The
 		 * SetBits fields still hold the create's 1-bit record;
 		 * the clear has its own capture.) */
@@ -2248,12 +2411,14 @@ static void test_truncate_shrink_journaled(void)
 	}
 	(void)i;
 
-	/* Replay copy 1: four records redo — the create's sizes
-	 * and SetBits, the truncate's ClearBits, and the truncate's
-	 * $FILE_NAME record. The truncate's sizes record is skipped
+	/* Replay copy 1: five records redo — the create's sizes
+	 * and SetBits, the truncate's ClearBits, and the two
+	 * $FILE_NAME records (the truncate's and the setattr's
+	 * identical second dup). The truncate's sizes record is skipped
 	 * by the file record's MR_LSN stamp (the commit stamped it
-	 * and the sync flushed it), as is the pairs record — but
-	 * the $FILE_NAME record is NOT skipped: the commit stamps
+	 * and the sync flushed it), as is the pairs record and the
+	 * setattr's $SI record — but
+	 * the $FILE_NAME records are NOT skipped: the commit stamps
 	 * MR_LSN only into the file's record, not the parent's, so
 	 * the parent's record carries no stamp to skip on (the same
 	 * as record 0, whose stamp the replay applies itself).
@@ -2268,7 +2433,7 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 4u);
+	CHECK_EQ(an.records_redone, 5u);
 	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
@@ -2280,11 +2445,11 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * four records. Replay is idempotent. */
+	 * five records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 4u);
+	CHECK_EQ(an.records_redone, 5u);
 	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 
@@ -2322,8 +2487,12 @@ static void test_truncate_extend_journaled(void)
 	CHECK(ino > 16);
 
 	/* Shrink journaled, then extend back to 256 KiB journaled: the
-	 * walk then holds the create (14) + shrink (11) + extend (10)
-	 * = 35. The extend is what this test reads. It allocates
+	 * walk then holds the create (14) + shrink transaction (13)
+	 * + extend transaction (12) = 39. Each ntfs_truncate routes
+	 * through ntfs_setattr, so each resize joins its setattr
+	 * transaction and adds the setattr's two records (the $SI
+	 * 36 bytes, then a second UpdateFileNameRoot with the same
+	 * dup). The extend is what this test reads. It allocates
 	 * nothing: the expand takes the hole path (HOLES_OK), so the
 	 * run list gains a 48-cluster hole and the file flips sparse
 	 * — the pairs record carries the old and new header (flags,
@@ -2358,35 +2527,46 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 35);
-	if (s.n == 35) {
-		/* The extend's records sit at [25..34]: one open
+	CHECK_EQ(s.n, 39);
+	if (s.n == 39) {
+		/* The shrink's records sit at [14..26] (its
+		 * $FILE_NAME at [19], its setattr's $SI at [20] and
+		 * second $FILE_NAME at [21], as in the shrink test).
+		 * The extend's records sit at [27..38]: one open
 		 * ($DATA — no $Bitmap record, so $BITMAP never
 		 * opens), then pairs, sizes, the $SI flags, the
-		 * parent's $FILE_NAME, Commit, dumps, Forget. The
-		 * shrink's records sit at [14..24] (its $FILE_NAME
-		 * at [19], as in the shrink test). */
+		 * parent's $FILE_NAME, then the setattr's $SI and
+		 * second $FILE_NAME, Commit, dumps, Forget. */
 		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
 		CHECK_EQ(s.target_attr[19], 0x18u);
-		CHECK_EQ(s.redo_op[25], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[25], 0x18u);
-		CHECK_EQ(s.redo_op[26], LOP_UpdateMappingPairs);
-		CHECK_EQ(s.target_attr[26], 0x18u);
-		CHECK_EQ(s.redo_op[27], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[20], 0x18u);
+		CHECK_EQ(s.redo_op[21], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[21], 0x18u);
+		CHECK_EQ(s.redo_op[27], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[27], 0x18u);
-		CHECK_EQ(s.redo_op[28], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[28], LOP_UpdateMappingPairs);
 		CHECK_EQ(s.target_attr[28], 0x18u);
-		CHECK_EQ(s.redo_op[29], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.redo_op[29], LOP_SetNewAttributeSizes);
 		CHECK_EQ(s.target_attr[29], 0x18u);
-		CHECK_EQ(s.redo_op[30], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[31], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[32], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[33], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[34], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[30], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[30], 0x18u);
+		CHECK_EQ(s.redo_op[31], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[31], 0x18u);
+		CHECK_EQ(s.redo_op[32], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[32], 0x18u);
+		CHECK_EQ(s.redo_op[33], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[33], 0x18u);
+		CHECK_EQ(s.redo_op[34], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[35], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
 		/* The extend's $FILE_NAME record (the last one the
-		 * collector saw) names the new sizes (256 KiB) and
-		 * undoes to the old ones (64 KiB); the sparse flag
-		 * flips with it (0x200 set, 0x0 undone). */
+		 * collector saw — the setattr's second dup at [33])
+		 * names the new sizes (256 KiB) and undoes to the old
+		 * ones (64 KiB); the sparse flag flips with it (0x200
+		 * set, 0x0 undone). */
 		CHECK_EQ(s.fn_redo_data, 256u * 1024u);
 		CHECK_EQ(s.fn_undo_data, 64u * 1024u);
 		CHECK_EQ(s.fn_redo_alloc, 64u * 1024u);
@@ -2397,13 +2577,16 @@ out:
 		 * carry only the sparse bit. */
 		CHECK_EQ(s.fn_redo_flags, 0x200u);
 		CHECK_EQ(s.fn_undo_flags, 0u);
-		CHECK_EQ(s.fnupd_lsn, s.lsn[29]);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[33]);
 		/* The $SI record sets the sparse bit (0x200) and
 		 * undoes to clear (0x0) — the $DATA flag flips in
-		 * step, so the two agree after replay either way. */
+		 * step, so the two agree after replay either way. The
+		 * 4-byte capture ignores the setattr's 36-byte $SI
+		 * record at [32], so this is still the truncate's
+		 * flags record at [30]. */
 		CHECK_EQ(s.res_redo, 0x200u);
 		CHECK_EQ(s.res_undo, 0u);
-		CHECK_EQ(s.res_lsn, s.lsn[28]);
+		CHECK_EQ(s.res_lsn, s.lsn[30]);
 		/* No bitmap record in the extend: the ClearBits
 		 * fields still hold the shrink's 48-cluster free. */
 		CHECK_EQ(s.clear_bits_count, 48u);
@@ -2411,15 +2594,16 @@ out:
 		/* The sizes record names the new data size. */
 		CHECK_EQ(s.sizes_redo_data, 256u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 64u * 1024u);
-		CHECK_EQ(s.sizes_lsn, s.lsn[27]);
+		CHECK_EQ(s.sizes_lsn, s.lsn[29]);
 		/* The pairs record is the $DATA attribute, at the
 		 * same record offset as the sizes record. */
-		CHECK_EQ(s.record_off[26], s.record_off[27]);
+		CHECK_EQ(s.record_off[28], s.record_off[29]);
 	}
 
-	/* Replay: five records redo — the create's sizes and SetBits,
-	 * the shrink's ClearBits, and the two $FILE_NAME records
-	 * (shrink's and extend's). The extend adds no pairs, sizes or
+	/* Replay: seven records redo — the create's sizes and SetBits,
+	 * the shrink's ClearBits, and the four $FILE_NAME records
+	 * (shrink's truncate + setattr dups, extend's truncate +
+	 * setattr dups). The extend adds no pairs, sizes or
 	 * $SI redo: those are skipped by the file record's MR_LSN
 	 * stamp (the commit stamped it and the sync flushed it), and
 	 * it has no $Bitmap record to redo. The $FILE_NAME records
@@ -2430,7 +2614,7 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
+	CHECK_EQ(an.records_redone, 7u);
 	CHECK_EQ(an.mft_records_written, 2u);
 	CHECK_EQ(an.clusters_written, 2u);
 	CHECK_EQ(an.transactions_committed, 0u);
@@ -2540,6 +2724,384 @@ out:
 	unlink(snap0);
 }
 
+/* ---- 15. a chmod + utimens journals ------------------------------------- */
+
+static void test_setattr_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr old, at;
+	struct ntfs_attr sa;
+	uint64_t ino = 0, size = 0;
+	int err, i;
+
+	printf("test_setattr_journaled\n");
+	scratch_path(orig, sizeof(orig), "saorig");
+	scratch_path(snap, sizeof(snap), "sasnap");
+	scratch_path(snap1, sizeof(snap1), "sasnap1");
+	scratch_path(snap2, sizeof(snap2), "sasnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_setattr_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+	CHECK(ino > 16);
+	CHECK_EQ(ntfs_getattr(f, &old), 0);
+	CHECK_EQ(old.mode, 0100644u);
+
+	/* chmod 0644 -> 0444 and utimens to 2020-01-02 03:04:05 UTC, in
+	 * one call. The mode change sets $LXMOD and the READONLY bit
+	 * in $SI; the utimens sets mtime/atime. ctime is not touched
+	 * by this call (the live driver only bumps ctime on a FLAGS
+	 * or SIZE setattr) — the journal reproduces the live bytes,
+	 * so the $SI redo and undo agree on ctime and crtime. */
+	memset(&sa, 0, sizeof(sa));
+	sa.mode = 0100444;
+	sa.mtime.sec = 1577934245LL;	/* 2020-01-02 03:04:05 UTC */
+	sa.mtime.nsec = 0;
+	sa.atime.sec = 1577934245LL;
+	sa.atime.nsec = 0;
+	err = ntfs_setattr(f, &sa, NTFS_SETATTR_MODE | NTFS_SETATTR_MTIME |
+				NTFS_SETATTR_ATIME);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, then the setattr transaction's 9
+	 * (one open + $SI + $EA + $FILE_NAME + Commit + 3 dumps +
+	 * Forget). No $EA_INFORMATION record: the $LXMOD value changes
+	 * but the entry count does not, so its 8 bytes are unchanged.
+	 * No $Bitmap record and no second open: everything the
+	 * setattr stages lives in the file's own record, addressed
+	 * through $MFT:$DATA. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 23);
+	if (s.n == 23) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.redo_op[17], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[19], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[20], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_ForgetTransaction);
+		/* The $SI record (the 36-byte one, at [15]) names the
+		 * new mtime/atime and the READONLY flag, and undoes to
+		 * the create's times and flags. crtime and ctime are
+		 * untouched by this call, so redo and undo agree. */
+		CHECK_EQ(s.si_redo_mtime, ntfs_time(1577934245LL, 0));
+		CHECK_EQ(s.si_undo_mtime, ntfs_time(old.mtime.sec, old.mtime.nsec));
+		CHECK_EQ(s.si_redo_atime, ntfs_time(1577934245LL, 0));
+		CHECK_EQ(s.si_undo_atime, ntfs_time(old.atime.sec, old.atime.nsec));
+		CHECK_EQ(s.si_redo_crtime, ntfs_time(old.crtime.sec, old.crtime.nsec));
+		CHECK_EQ(s.si_undo_crtime, ntfs_time(old.crtime.sec, old.crtime.nsec));
+		CHECK_EQ(s.si_redo_ctime, ntfs_time(old.ctime.sec, old.ctime.nsec));
+		CHECK_EQ(s.si_undo_ctime, ntfs_time(old.ctime.sec, old.ctime.nsec));
+		CHECK_EQ(s.si_redo_flags, old.file_attributes | 0x1u);
+		CHECK_EQ(s.si_undo_flags, old.file_attributes);
+		CHECK_EQ(s.si_lsn, s.lsn[15]);
+		/* The $EA record (at [16]) carries the new $LXMOD. */
+		CHECK_EQ(s.ea_lxmod_redo, 0100444u);
+		CHECK_EQ(s.ea_lxmod_undo, 0100644u);
+		CHECK_EQ(s.ea_lsn, s.lsn[16]);
+		/* The $FILE_NAME record (at [17]) carries the READONLY
+		 * flag and undoes to the create's flags; the sizes do
+		 * not move. */
+		CHECK_EQ(s.fn_redo_flags, old.file_attributes | 0x1u);
+		CHECK_EQ(s.fn_undo_flags, old.file_attributes);
+		CHECK_EQ(s.fn_redo_data, 256u * 1024u);
+		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[17]);
+	}
+	(void)i;
+
+	/* Replay copy 1: three records redo — the create's sizes and
+	 * SetBits, and the setattr's $FILE_NAME record. The $SI and
+	 * $EA records are skipped by the file record's MR_LSN stamp
+	 * (the commit stamped it and the sync flushed it); the
+	 * $FILE_NAME record is NOT skipped, the commit stamps MR_LSN
+	 * only into the file's record, not the parent's. The redo is
+	 * idempotent. One cluster is written: the create's SetBits
+	 * lands on the $MFT:$BITMAP cluster; the $FILE_NAME redo
+	 * writes the parent's MFT record, not a data cluster. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The attributes are the new ones on the replayed volume. */
+	CHECK_EQ(attr_after_mount(snap1, "sub", "j.txt", &at), 0);
+	CHECK_EQ(at.mode, 0100444u);
+	CHECK_EQ(at.mtime.sec, 1577934245LL);
+	CHECK_EQ(at.mtime.nsec, 0);
+	CHECK_EQ(at.atime.sec, 1577934245LL);
+	CHECK_EQ(at.file_attributes, old.file_attributes | 0x1u);
+	CHECK_EQ(at.size, 256u * 1024u);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * three records. Replay is idempotent. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 3u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 1u);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
+/* ---- 16. SIZE + MODE in one call is one transaction --------------------- */
+
+static void test_setattr_size_joins(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev = NULL;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr old, at;
+	struct ntfs_attr sa;
+	uint64_t ino = 0, size = 0;
+	int err, i, commits = 0;
+
+	printf("test_setattr_size_joins\n");
+	scratch_path(orig, sizeof(orig), "sjorig");
+	scratch_path(snap, sizeof(snap), "sjsnap");
+	scratch_path(snap1, sizeof(snap1), "sjsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_setattr_size_joins: mkntfs unavailable\n");
+		return;
+	}
+
+	err = truncate_setup(orig, &dev, &vol, &root, &d, &f, &ino);
+	CHECK_EQ(err, 0);
+	if (err) { unlink(orig); return; }
+	CHECK(ino > 16);
+	CHECK_EQ(ntfs_getattr(f, &old), 0);
+	CHECK_EQ(old.mode, 0100644u);
+
+	/* Shrink to 64 KiB and chmod to 0444 in one call: one
+	 * transaction must hold the truncate's records and the
+	 * setattr's records together. */
+	memset(&sa, 0, sizeof(sa));
+	sa.size = 64 * 1024;
+	sa.mode = 0100444;
+	err = ntfs_setattr(f, &sa, NTFS_SETATTR_SIZE | NTFS_SETATTR_MODE);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(d);
+	d = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: the create's 14, then one 14-record transaction:
+	 * the truncate's 6 (2 open + ClearBits + pairs + sizes +
+	 * $FILE_NAME), the setattr's 3 ($SI + $EA + a second
+	 * $FILE_NAME with the same dup), and one Commit + 3 dumps +
+	 * Forget — not two transactions. The $SI here carries the
+	 * resize's mtime/ctime (current_time) as well as the
+	 * READONLY flag. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 28);
+	if (s.n == 28) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[17], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[18], 0x18u);
+		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[20], 0x18u);
+		CHECK_EQ(s.redo_op[21], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[21], 0x18u);
+		CHECK_EQ(s.redo_op[22], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[22], 0x18u);
+		CHECK_EQ(s.redo_op[23], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[24], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[25], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[26], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[27], LOP_ForgetTransaction);
+		/* Exactly two commits in the whole log: the create's
+		 * and this one. A second transaction for the resize
+		 * would make three. */
+		for (i = 0; i < s.n; i++)
+			if (s.redo_op[i] == LOP_CommitTransaction)
+				commits++;
+		CHECK_EQ(commits, 2);
+		/* The setattr's $SI (at [20], the last 36-byte one)
+		 * carries the READONLY flag; the resize moved the
+		 * times, so redo and undo differ there too. */
+		CHECK_EQ(s.si_redo_flags, old.file_attributes | 0x1u);
+		CHECK_EQ(s.si_undo_flags, old.file_attributes);
+		CHECK(s.si_redo_mtime != s.si_undo_mtime);
+		CHECK_EQ(s.si_lsn, s.lsn[20]);
+		/* The $EA record (at [21]) carries the new $LXMOD. */
+		CHECK_EQ(s.ea_lxmod_redo, 0100444u);
+		CHECK_EQ(s.ea_lxmod_undo, 0100644u);
+		CHECK_EQ(s.ea_lsn, s.lsn[21]);
+		/* The last $FILE_NAME record (the setattr's dup at
+		 * [22]) names the new sizes. */
+		CHECK_EQ(s.fn_redo_data, 64u * 1024u);
+		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[22]);
+	}
+	(void)i;
+
+	/* Replay: five records redo — the create's sizes and SetBits,
+	 * the truncate's ClearBits, and the two $FILE_NAME records
+	 * (the truncate's and the setattr's identical second dup).
+	 * The pairs, sizes, $SI and $EA records are skipped by the
+	 * file record's MR_LSN stamp. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 5u);
+	CHECK_EQ(an.mft_records_written, 2u);
+	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	CHECK_EQ(attr_after_mount(snap1, "sub", "j.txt", &at), 0);
+	CHECK_EQ(at.size, 64u * 1024u);
+	CHECK_EQ(at.mode, 0100444u);
+	CHECK_EQ(at.file_attributes, old.file_attributes | 0x1u);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 17. a setattr on a root file proceeds unjournaled ------------------ */
+
+static void test_setattr_in_root_unjournaled(void)
+{
+	char orig[1024], snap[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_attr at;
+	struct ntfs_attr sa;
+	int err;
+
+	printf("test_setattr_in_root_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "sruorig");
+	scratch_path(snap, sizeof(snap), "srusnap");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_setattr_in_root_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* The create in root is itself unjournaled (the root's index
+	 * lives in $INDEX_ALLOCATION), so the walk is empty before the
+	 * setattr — the same baseline the root-create test pins. */
+	err = ntfs_create(root, "r.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err)
+		goto out;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	/* chmod + utimens on the root file: the $FILE_NAME stage cannot
+	 * find the entry in the root's $INDEX_ROOT (it is in
+	 * $INDEX_ALLOCATION), so the transaction aborts and the op
+	 * proceeds unjournaled — it must succeed, not fail -ENOENT. */
+	memset(&sa, 0, sizeof(sa));
+	sa.mode = 0100444;
+	sa.mtime.sec = 1577934245LL;	/* 2020-01-02 03:04:05 UTC */
+	sa.mtime.nsec = 0;
+	err = ntfs_setattr(f, &sa, NTFS_SETATTR_MODE | NTFS_SETATTR_MTIME);
+	CHECK_EQ(err, 0);
+	if (!err)
+		CHECK_EQ(ntfs_volume_sync(vol), 0);
+	ntfs_inode_put(f);
+	f = NULL;
+	ntfs_inode_put(root);
+	root = NULL;
+	CHECK_EQ(copy_file(orig, snap), 0);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* Still empty: the setattr added no client records. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	/* The op still landed: mode and mtime are the new ones after a
+	 * remount, and the volume is clean. */
+	CHECK_EQ(attr_after_mount(snap, NULL, "r.txt", &at), 0);
+	CHECK_EQ(at.mode, 0100444u);
+	CHECK_EQ(at.mtime.sec, 1577934245LL);
+	CHECK_EQ(at.mtime.nsec, 0);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	return;
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	unlink(orig);
+	unlink(snap);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -2558,6 +3120,9 @@ int main(void)
 	test_truncate_shrink_journaled();
 	test_truncate_extend_journaled();
 	test_truncate_resident_unjournaled();
+	test_setattr_journaled();
+	test_setattr_size_joins();
+	test_setattr_in_root_unjournaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

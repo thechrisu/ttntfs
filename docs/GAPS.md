@@ -947,7 +947,47 @@ what found the three crash-test fixes above (wrong bitmap
 target, missing $SI flags, missing parent $FILE_NAME) — the
 first sweep run had 21 shrink cuts and 20 extend cuts still bad
 after replay; after the three fixes, 0.
-Next: the setattr class.
+Setattr class — landed 2026-11-27 (fork commit, this round): one
+transaction per `ntfs_setattr` call, begin in `api.c` before the
+FLAGS/CRTIME mutations, carrier threaded through
+`ntfs_vfs_setattr` → `ntfs_setattr_size` → `ntfs_truncate_vfs`
+(joins via `ntfs_journal_truncate_begin_in`), stage + commit in
+`api.c`; `$SI` as one 36-byte UpdateResidentValue built from
+in-memory state; `$EA` as whole-value UpdateResidentValue on pure
+replace, CreateAttribute ×2 when absent at begin, abort on
+length-grow or non-resident; parent `$FILE_NAME` via a shared
+`stage_filename_dup` helper. `ntfs_truncate` routes through
+`ntfs_setattr`, so a SIZE-only call also gets a setattr transaction
+(the truncate's mtime/ctime update is real): the truncate walks move
+shrink 25 → 27, extend 35 → 39, and each setattr transaction stages
+its own `$SI` record plus a second `$FILE_NAME` dup identical to the
+truncate's. A resize that cannot be journaled (resident `$DATA`,
+attribute list, compressed/encrypted) marks the outer transaction
+unjournaled — the first implementation missed this (begin_in returns
+0 with a NULL carrier for an unjournalable resize, which the join
+caller did not check), and the resident test caught it: the setattr
+was committing the parent's `$FILE_NAME` with the new sizes while
+the resize was unlogged. A failing resize also now aborts/drops its
+transaction instead of leaking the lock and gate (pre-existing in
+the standalone truncate path, fixed in the same change). Evidence:
+`test_journal.c` 707 checks, 0 failures (new `test_setattr_journaled`,
+`test_setattr_size_joins`, `test_setattr_in_root_unjournaled`; `$SI`
+36-byte redo/undo capture, `$LXMOD` capture, `attr_after_mount`);
+`test_crash.c` 2958 checks, 0 failures (`test_journaled_setattr_cut_points`,
+38 cuts; 2 inconsistent before replay, 0 still bad after it; j.txt
+all-old 8 times, all-new 30 times). Negative control (staging stubbed
+to `-ENOENT`): the setattr and join tests fail on walk/replay counts
+only (16 vs 23/27/28/39, replay 2 vs 3/5/7) while the values stay
+right — the op succeeds unjournaled. Follow-ups recorded in the
+design row, not this class: `$FILE_NAME` times never update on
+setattr (live-driver bug, probed), parent `$SI` mtime on
+create/unlink/rename (Phase 2 gap), `$SI` ctime on rename, `$EA`
+length-grow (needs a logfile-level resize-path test), extending writes
+during writeback (still unjournaled). Pre-existing edge, not fixed
+here: a same-size standalone truncate can commit an empty transaction
+and stamp MR_LSN = 0, clearing the record's stamp; the setattr
+finish avoids it via the empty-transaction check.
+Next: the xattr class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

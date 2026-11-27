@@ -221,7 +221,8 @@ int ntfs_vfs_fsync(struct inode *vi, bool datasync)
 	return ret;
 }
 
-static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
+static int ntfs_setattr_size(struct inode *vi, struct iattr *attr,
+			     struct ntfs_journal_setattr *st)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	int err;
@@ -272,7 +273,7 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 		truncate_setsize(vi, attr->ia_size);
 	}
 
-	err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
+	err = ntfs_truncate_vfs(vi, attr->ia_size, old_size, st);
 	if (err)
 		i_size_write(vi, old_size);
 	filemap_invalidate_unlock(vi->i_mapping);
@@ -290,7 +291,8 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
  * NOTE: Changes in inode size are not supported yet for compressed or
  * encrypted files.
  */
-int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr)
+int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr,
+		     struct ntfs_journal_setattr *st)
 {
 	int err = 0;
 	unsigned int ia_valid = attr->ia_valid;
@@ -306,7 +308,7 @@ int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr)
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
 	if (ia_valid & ATTR_SIZE) {
-		err = ntfs_setattr_size(vi, attr);
+		err = ntfs_setattr_size(vi, attr, st);
 		if (err)
 			goto out;
 

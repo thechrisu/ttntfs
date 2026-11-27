@@ -1620,6 +1620,11 @@ static int txn_append_open_records(ntfs_log_txn_t *t)
 	return err;
 }
 
+bool ntfs_log_txn_is_empty(ntfs_log_txn_t *t)
+{
+	return !t || !t->nstaged;
+}
+
 int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 			uint64_t *last_lsn_out)
 {
@@ -1628,9 +1633,7 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 	size_t pos = 0;
 	uint32_t appended = 0;
 	uint64_t clsn = 0;
-	int err = 0;
-
-	if (!t || t->done)
+	int err = 0;	if (!t || t->done)
 		return -EINVAL;
 	w = t->w;
 	t->done = true;

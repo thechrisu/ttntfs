@@ -346,7 +346,14 @@ struct ntfs_inode *ntfs_new_extent_inode(struct super_block *sb, u64 mft_no);
 void ntfs_clear_extent_inode(struct ntfs_inode *ni);
 int ntfs_read_inode_mount(struct inode *vi);
 int ntfs_show_options(struct seq_file *sf, struct dentry *root);
-int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size);
+struct ntfs_journal_setattr;
+
+/* The setattr transaction @st, or NULL for a standalone truncate:
+ * when non-NULL the resize is staged into it (begin_in, no separate
+ * commit) and a staging failure marks it unjournaled instead of
+ * committing a partial transaction. */
+int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size,
+		      struct ntfs_journal_setattr *st);
 
 int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr);

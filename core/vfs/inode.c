@@ -2447,7 +2447,8 @@ int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 	return err;
 }
 
-int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
+int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size,
+		      struct ntfs_journal_setattr *st)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
@@ -2465,17 +2466,40 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 	 * warn and proceed unjournaled. A resident $DATA, an
 	 * attribute list, a compressed/encrypted file or no writer
 	 * also begins NULL and proceeds unjournaled.
+	 *
+	 * Joined (st != NULL, the setattr class): the resize is
+	 * staged into the ambient setattr transaction instead, with
+	 * no separate commit — the outer commit owns the gate, the
+	 * lock and the MR_LSN stamp. A begin or stage failure marks
+	 * the outer transaction unjournaled (it must not commit the
+	 * parent's $FILE_NAME with the new sizes while the resize
+	 * itself is unlogged); the resize still stands.
 	 */
-	err = ntfs_journal_truncate_begin(vol, ni, &jt);
-	if (err)
-		ntfs_error(vol->sb,
-			   "journal begin failed (%d); truncating unjournaled.\n",
-			   err);
+	if (st) {
+		err = ntfs_journal_truncate_begin_in(st, ni, &jt);
+		/* begin_in returns 0 with jt NULL when the resize is
+		 * unjournalable (resident $DATA, attribute list,
+		 * compressed/encrypted) — that is not a join, and
+		 * the outer transaction must not commit the parent's
+		 * $FILE_NAME with the new sizes while the resize
+		 * itself is unlogged. Mark it unjournaled either
+		 * way; the resize still stands. */
+		if (err || !jt) {
+			ntfs_journal_setattr_mark_truncate_unjournaled(st);
+			jt = NULL;
+		}
+	} else {
+		err = ntfs_journal_truncate_begin(vol, ni, &jt);
+		if (err)
+			ntfs_error(vol->sb,
+				   "journal begin failed (%d); truncating unjournaled.\n",
+				   err);
+	}
 
 	mutex_lock(&ni->mrec_lock);
 	err = __ntfs_attr_truncate_vfs(ni, new_size, i_size);
 	if (err)
-		goto out_unlock;
+		goto out_fail;
 	if (jt) {
 		/*
 		 * Stage the resize's records from the live record,
@@ -2498,11 +2522,20 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 		mrec = NULL;
 		if (err)
 			goto out_abort;
-		err = ntfs_journal_truncate_commit(jt, ni);
-		jt = NULL;
-		if (err) {
-			NVolSetErrors(vol);
-			goto out_unlock;
+		if (st) {
+			/* Joined: drop the carrier — its snapshots
+			 * are spent and the staged records live on in
+			 * the outer transaction, which commits (or
+			 * aborts) them with the rest of the setattr. */
+			ntfs_journal_truncate_join_free(jt);
+			jt = NULL;
+		} else {
+			err = ntfs_journal_truncate_commit(jt, ni);
+			jt = NULL;
+			if (err) {
+				NVolSetErrors(vol);
+				goto out_unlock;
+			}
 		}
 	}
 	mutex_unlock(&ni->mrec_lock);
@@ -2511,11 +2544,35 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 	return 0;
 
 out_abort:
-	ntfs_journal_truncate_abort(jt);
+	if (st) {
+		ntfs_journal_setattr_mark_truncate_unjournaled(st);
+		ntfs_journal_truncate_join_free(jt);
+	} else {
+		ntfs_journal_truncate_abort(jt);
+	}
 	jt = NULL;
 	/* The resize stands, it is just not logged: a staging
 	 * failure is not a truncate failure. */
 	err = 0;
+	goto out_unlock;
+
+out_fail:
+	/* The resize itself failed: the transaction is aborted
+	 * (standalone — it holds the lock and the gate) or the join
+	 * carrier is dropped and the outer transaction marked
+	 * unjournaled (joined — the caller aborts it when the
+	 * setattr fails). Without this the standalone transaction
+	 * would leak its lock and gate, deadlocking the next
+	 * journaled operation. */
+	if (jt) {
+		if (st) {
+			ntfs_journal_setattr_mark_truncate_unjournaled(st);
+			ntfs_journal_truncate_join_free(jt);
+		} else {
+			ntfs_journal_truncate_abort(jt);
+		}
+		jt = NULL;
+	}
 out_unlock:
 	mutex_unlock(&ni->mrec_lock);
 	if (err < 0)

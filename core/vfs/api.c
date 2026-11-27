@@ -41,6 +41,7 @@
 #include "dir.h"
 #include "reparse.h"
 #include "vfs.h"
+#include "journal.h"	/* PORT: Phase 3 setattr journaling */
 #undef ntfs_attr
 #undef ntfs_getattr
 #undef ntfs_setattr
@@ -270,6 +271,7 @@ int ntfs_setattr(ntfs_inode_t *h, const struct ntfs_attr *attr, uint32_t valid)
 {
 	struct inode *vi = VI(h);
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_journal_setattr *st = NULL;
 	struct iattr ia = { 0 };
 	int err = 0;
 
@@ -298,6 +300,23 @@ int ntfs_setattr(ntfs_inode_t *h, const struct ntfs_attr *attr, uint32_t valid)
 		return -EINVAL;
 
 	inode_lock(vi);
+	/*
+	 * PORT: journal the setattr (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Begin before the FLAGS/CRTIME mutations below: the begin
+	 * snapshots the $SI 36 bytes, the $EA pair and the $DATA sizes
+	 * as they stand before this call. A begin failure is not a
+	 * setattr failure — the driver set attributes unjournaled for
+	 * years — so warn and proceed unjournaled with st NULL. A
+	 * symlink, a special file, a non-resident $EA or no writer
+	 * also begins NULL and proceeds unjournaled.
+	 */
+	err = ntfs_journal_setattr_begin(ni->vol, ni, &st);
+	if (err) {
+		ntfs_error(ni->vol->sb,
+			   "journal begin failed (%d); setting attributes unjournaled.\n",
+			   err);
+		err = 0;
+	}
 	if (valid & NTFS_SETATTR_SIZE) {
 		ia.ia_valid |= ATTR_SIZE;
 		ia.ia_size = attr->size;
@@ -339,7 +358,36 @@ int ntfs_setattr(ntfs_inode_t *h, const struct ntfs_attr *attr, uint32_t valid)
 		mark_inode_dirty(vi);
 	}
 	if (ia.ia_valid)
-		err = ntfs_vfs_setattr(vi, &ia);
+		err = ntfs_vfs_setattr(vi, &ia, st);
+	if (st) {
+		/*
+		 * Stage the $SI/$EA/$FILE_NAME records from the live
+		 * record and commit — or abort when the setattr failed,
+		 * the stage failed, the resize was unjournaled, or
+		 * nothing was staged. The finish maps the record, so
+		 * it runs under mrec_lock, the same order the truncate
+		 * commit uses. A commit failure marks the volume: the
+		 * next mount's replay undoes the partial transaction
+		 * and restores the old attributes.
+		 */
+		struct mft_record *mrec;
+
+		mutex_lock(&ni->mrec_lock);
+		if (err) {
+			ntfs_journal_setattr_abort(st);
+		} else {
+			mrec = map_mft_record(ni);
+			if (IS_ERR(mrec)) {
+				ntfs_journal_setattr_abort(st);
+			} else {
+				err = ntfs_journal_setattr_finish(st, ni, mrec);
+				unmap_mft_record(ni);
+				if (err)
+					NVolSetErrors(ni->vol);
+			}
+		}
+		mutex_unlock(&ni->mrec_lock);
+	}
 	inode_unlock(vi);
 	return err;
 }

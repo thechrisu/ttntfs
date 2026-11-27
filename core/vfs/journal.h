@@ -352,18 +352,18 @@ int ntfs_journal_rename_commit(struct ntfs_journal_unlink *u,
  * unjournaled — the resident path needs its own verification (the
  * replay's UpdateResidentValue handles length changes, but the
  * header fields it must also move have not been proven). The
- * parent index entry's duplicated $FILE_NAME (its data_size copy)
- * is NOT staged: it is refreshed by ntfs_inode_sync_filename at
- * the parent's writeback, outside this transaction's window — the
- * same class as the create path's parent $SI mtime gap, and the
- * WAL gate holds the file record until the commit, so the sizes
- * can never reach the disk ahead of the transaction. Extending
- * writes during writeback are also not journaled: they allocate
- * clusters without a user-visible transaction boundary, and
- * journaling them is a separate design problem (see GAPS.md §1.2).
+ * parent index entry's duplicated $FILE_NAME IS staged (an
+ * UpdateFileNameRoot per $FILE_NAME, sizes/flags from the begin
+ * snapshot and current state, times from the entry — the crash
+ * tests proved the unjournaled refresh leaves ntfsck failures
+ * behind). Extending writes during writeback are also not
+ * journaled: they allocate clusters without a user-visible
+ * transaction boundary, and journaling them is a separate design
+ * problem (see GAPS.md §1.2).
  */
 
 struct ntfs_journal_truncate;
+struct ntfs_journal_setattr;
 
 /* Begin a truncate transaction, or NULL (0) when there is nothing to
  * journal: no writer, not a regular file, $DATA resident, in an
@@ -379,10 +379,13 @@ void ntfs_journal_truncate_abort(struct ntfs_journal_truncate *t);
 /* Stage the resize's records after __ntfs_attr_truncate_vfs succeeds:
  * Set/ClearBits for the $Bitmap delta (old vs new run list, split at
  * bitmap-page boundaries), UpdateMappingPairs when the pairs changed,
- * SetNewAttributeSizes when the sizes changed. Returns -ENOENT when
- * the $DATA cannot be staged (it left the base record, or the resize
- * converted it resident); the caller then aborts and proceeds
- * unjournaled — the resize stands, it is just not logged. */
+ * SetNewAttributeSizes when the sizes changed, an UpdateResidentValue
+ * for the $SI flags when the resize flipped them, and an
+ * UpdateFileNameRoot per $FILE_NAME for the parent's duplicated
+ * sizes/flags. Returns -ENOENT when the $DATA cannot be staged (it
+ * left the base record, or the resize converted it resident); the
+ * caller then aborts and proceeds unjournaled — the resize stands,
+ * it is just not logged. */
 int ntfs_journal_truncate_stage(struct ntfs_journal_truncate *t,
 				struct ntfs_inode *ni,
 				const struct mft_record *mrec);
@@ -401,5 +404,115 @@ int ntfs_journal_truncate_stage(struct ntfs_journal_truncate *t,
  * cases. */
 int ntfs_journal_truncate_commit(struct ntfs_journal_truncate *t,
 				 struct ntfs_inode *ni);
+
+/* Join a truncate into an ambient setattr transaction (Phase 3,
+ * setattr class): the same snapshot as
+ * ntfs_journal_truncate_begin, but the records are staged into the
+ * setattr transaction's log transaction (@st), with no lock, no
+ * gate, no commit and no stamp of its own — the outer setattr
+ * commit owns all of those. The caller drops the carrier with
+ * ntfs_journal_truncate_join_free() after a successful stage, or
+ * aborts the outer transaction when the stage fails (a resize the
+ * log cannot describe must not leave the outer transaction holding
+ * the parent's $FILE_NAME with the new sizes — the replay would
+ * apply them against the old $DATA and ntfsck would flag the
+ * mismatch). */
+int ntfs_journal_truncate_begin_in(struct ntfs_journal_setattr *st,
+				   struct ntfs_inode *ni,
+				   struct ntfs_journal_truncate **out);
+
+/* Drop a joined truncate carrier after its stage (success or
+ * failure): frees the snapshots only. The staged records stay in
+ * the outer transaction; the log, the gate and the lock are the
+ * outer transaction's. */
+void ntfs_journal_truncate_join_free(struct ntfs_journal_truncate *t);
+
+/* ---- Setattr (Phase 3, fifth class) -------------------------------------
+ *
+ * One transaction per ntfs_setattr call, begun in the public
+ * ntfs_setattr (core/vfs/api.c) before the FLAGS/CRTIME mutations,
+ * threaded explicitly through ntfs_vfs_setattr -> ntfs_setattr_size
+ * -> ntfs_truncate_vfs (which joins the truncate transaction into
+ * it, above). It stages, in order:
+ *
+ *   - the truncate's records first, when the size changed (bitmap,
+ *     pairs, sizes, $SI flags, parent $FILE_NAME — the truncate
+ *     class's own staging, into this transaction);
+ *   - an UpdateResidentValue for the $STANDARD_INFORMATION's first
+ *     36 bytes (four times + file_attributes), built from in-memory
+ *     vi/ni state — old at begin, new at stage — never from the
+ *     mapped record, which lags behind the log: a previous committed
+ *     transaction's $SI may not have been flushed yet, so a mapped
+ *     snapshot's undo would restore the pre-previous state;
+ *   - UpdateResidentValue records for $EA_INFORMATION and $EA (whole
+ *     values, net effect — the three ntfs_set_ea() calls' intermediate
+ *     grows never reach the disk), when both old and new are resident
+ *     with unchanged length (a pure $LXMOD replace — the case for all
+ *     driver-created files); CreateAttribute records for the pair
+ *     when it was absent at begin and present at stage;
+ *   - an UpdateFileNameRoot for the parent's $FILE_NAME (times from
+ *     the entry — the live driver never updates $FILE_NAME times on
+ *     setattr, see below — sizes/flags from the begin snapshot and
+ *     current state, the truncate's rule), staged only on change.
+ *
+ * The live driver updates $SI on setattr but never the file's own
+ * $FILE_NAME times nor the parent index entry times (probed
+ * 2026-11-27: a utimens left record 65's $FILE_NAME mtime and the
+ * parent's entry at the create time while $SI carried the new one).
+ * The journal reproduces the live bytes, so the staged $FILE_NAME
+ * keeps the entry's times. Fixing that staleness is a live-driver
+ * bug (a missing update_fnames equivalent), not part of this class;
+ * see GAPS.md §1.2.
+ *
+ * Lifetime: begin before the FLAGS/CRTIME mutations (it takes
+ * vol->log_txn_lock and raises the WAL gate, and snapshots the $SI
+ * bytes, the $DATA sizes and the $EA pair as they stand), stage +
+ * commit-or-abort after ntfs_vfs_setattr returns
+ * (ntfs_journal_setattr_finish), or abort on any error. Only
+ * regular files and directories begin (the create class's scope);
+ * symlinks and special files proceed unjournaled. A staging failure
+ * (-ENOENT: entry in an $INDEX_ALLOCATION block, $FILE_NAME outside
+ * the base record, non-resident $EA, or an $EA value whose length
+ * grew — the UpdateResidentValue resize path is unproven here)
+ * aborts the transaction and the setattr proceeds unjournaled. A
+ * resize the truncate staging could not describe (its begin or
+ * stage failed) marks the transaction unjournaled for the same
+ * reason: the outer transaction must never commit the parent's
+ * $FILE_NAME with the new sizes while the $DATA resize itself is
+ * unlogged. A no-op setattr (nothing staged) aborts instead of
+ * committing — no log churn.
+ *
+ * The commit stamps MR_LSN = the last LSN into the file's record
+ * only, as in truncate: the parent's $FILE_NAME redo is idempotent
+ * and replays, which the truncate tests pin.
+ */
+
+/* Begin a setattr transaction, or NULL (0) when there is nothing to
+ * journal: no writer, not a regular file or directory. On error the
+ * gate was never raised and the lock was never taken; the caller
+ * proceeds unjournaled. */
+int ntfs_journal_setattr_begin(struct ntfs_volume *vol,
+			       struct ntfs_inode *ni,
+			       struct ntfs_journal_setattr **out);
+
+/* Abort: write nothing, lower the WAL gate, release the lock. */
+void ntfs_journal_setattr_abort(struct ntfs_journal_setattr *st);
+
+/* Mark the transaction unjournaled because the joined truncate's
+ * begin or stage failed: the resize stands, unlogged, so the outer
+ * transaction must not commit either (see above). The finish
+ * aborts on this flag. */
+void ntfs_journal_setattr_mark_truncate_unjournaled(
+	struct ntfs_journal_setattr *st);
+
+/* Stage the $SI, $EA and $FILE_NAME records after ntfs_vfs_setattr
+ * returned, then commit — or abort when the stage fails, when the
+ * truncate was marked unjournaled, or when nothing was staged.
+ * @mrec is the file's mapped record. Returns the commit error (the
+ * caller must set the volume error flag), or 0 when the transaction
+ * was committed or aborted unjournaled. */
+int ntfs_journal_setattr_finish(struct ntfs_journal_setattr *st,
+				struct ntfs_inode *ni,
+				const struct mft_record *mrec);
 
 #endif /* NTFS_JOURNAL_H */

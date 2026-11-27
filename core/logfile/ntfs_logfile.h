@@ -444,6 +444,14 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 			uint64_t *last_lsn_out);
 int ntfs_log_txn_abort(ntfs_log_txn_t *t);
 
+/* True when no record was ever staged into @t. The setattr class uses
+ * it for its no-op decision: a transaction that staged nothing is
+ * aborted, not committed — committing is a log no-op (it writes
+ * nothing and returns last_lsn 0), but a caller that stamped that 0
+ * as MR_LSN would clear the record's stamp, so the empty case must
+ * never reach a commit. */
+bool ntfs_log_txn_is_empty(ntfs_log_txn_t *t);
+
 #ifdef __cplusplus
 }
 #endif

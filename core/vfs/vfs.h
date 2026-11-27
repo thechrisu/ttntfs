@@ -106,7 +106,9 @@ u64 ntfs_vfs_parent_ino(struct inode *vi);
 /* ---- file.c ----------------------------------------------------------- */
 
 int ntfs_vfs_fsync(struct inode *vi, bool datasync);
-int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr);
+struct ntfs_journal_setattr;
+int ntfs_vfs_setattr(struct inode *vi, struct iattr *attr,
+		     struct ntfs_journal_setattr *st);
 int ntfs_vfs_fallocate(struct inode *vi, int mode, loff_t offset, loff_t len);
 int ntfs_vfs_trim_prealloc(struct inode *vi);
 
