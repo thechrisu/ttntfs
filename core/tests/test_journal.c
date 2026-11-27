@@ -31,6 +31,27 @@
  *                        pins the -ENOENT fallback: a mutation the log
  *                        cannot describe must never fail the operation.
  *
+ * Phase 3 (docs/JOURNAL-DESIGN.md §5) wires the transaction API into
+ * ntfs_vfs_unlink:
+ *
+ *   unlink_journaled   a regular-file unlink writes exactly one
+ *                        transaction to $LogFile (one open record,
+ *                        DeleteIndexEntryRoot, DeleteAttribute, Commit,
+ *                        three table dumps, Forget); the create's
+ *                        records are dispensable once the unlink's
+ *                        checkpoint lands, so the walk holds only the
+ *                        unlink's 8. Replaying the snapshot redoes
+ *                        nothing — the unlink's records are skipped on
+ *                        their MR_LSN stamps — the file is gone and
+ *                        ntfsck -n is clean.
+ *   unlink_in_root_unjournaled
+ *                        an unlink in the root writes no client records
+ *                        (its entry lives in the root's
+ *                        $INDEX_ALLOCATION block) and still succeeds.
+ *   rmdir_journaled    an rmdir of an empty driver-made directory
+ *                        journals the same two records as a file
+ *                        unlink.
+ *
  * The snapshot is copied after create+sync while the original is still
  * mounted, so the copy holds the flushed metadata and the still-dirty
  * log: exactly what a crash at that instant would leave. The original
@@ -823,6 +844,296 @@ static void test_create_in_root_unjournaled(void)
 	unlink(snap);
 }
 
+/* ---- 4. a regular-file unlink journals --------------------------------- */
+
+static void test_unlink_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t ino = 0, sub_ino = 0, mrlsn_file = 0, mrlsn_dir = 0,
+		lsn_del_idx = 0, lsn_del_attr = 0;
+	int err, i;
+
+	printf("test_unlink_journaled\n");
+	scratch_path(orig, sizeof(orig), "uorig");
+	scratch_path(snap, sizeof(snap), "usnap");
+	scratch_path(snap1, sizeof(snap1), "usnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_unlink_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(f);
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* The unlink: ntfs_unlink looks the file up, deletes the name,
+	 * and iputs it — the evict then deallocates the record, clears
+	 * the $MFT bitmap bit and frees the clusters, unjournaled. */
+	CHECK_EQ(ntfs_unlink(d, "j.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk from the oldest LSN holds 22 records: the create's
+	 * 14 that are still live (its 2 open records are already
+	 * dispensable — oldest sits at its first data record — so 9
+	 * data + Commit + 3 dumps + Forget) plus the unlink's 8 (1
+	 * open + 2 data + Commit + 3 dumps + Forget). The create's
+	 * records stay live because the MFT pages they dirtied were
+	 * never flushed to disk — no checkpoint is emitted after a
+	 * sync, so the dirty-page table still names the create's
+	 * LSNs as the oldest for those pages. That is correct NTFS
+	 * behaviour: a crash before those pages flush needs the
+	 * create's redo records. The unlink's records follow at
+	 * positions 14..21. */
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 22);
+	if (s.n == 22) {
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[16], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[17], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[18], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[19], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[20], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_ForgetTransaction);
+		/* Both delete records target $MFT:$DATA (0x18): the
+		 * index entry lives in the parent's record, the
+		 * $FILE_NAME in the file's own. */
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		/* The file's record is at vcn ino/4 (1024-byte records
+		 * in 4096-byte clusters), the parent's at sub_ino/4. */
+		CHECK_EQ(s.target_vcn[15], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[16], ino / 4);
+		lsn_del_idx = s.lsn[15];
+		lsn_del_attr = s.lsn[16];
+	}
+
+	/* Both touched records carry an MR_LSN at or past the record
+	 * that touched them — even though the file's record was
+	 * deallocated afterwards by evict, the stamp survives in it. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_del_attr);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_del_idx);
+
+	/* Replay copy 1: the unlink's two records are skipped on
+	 * their MR_LSN stamps, but the create's records are still
+	 * live (see above) so the replay redoes exactly its two
+	 * idempotent ones — SetNewAttributeSizes (MFT record 0)
+	 * and SetBitsInNonresidentBitMap (the $MFT bitmap cluster).
+	 * The SetBits redo is the known evict gap: it sets the
+	 * bitmap bit for a record the clean unmount already freed,
+	 * so ntfsck on the replayed image reports it (exit 4) —
+	 * journaling the evict-time deallocation is the follow-up
+	 * commit, which will flip this to a clean replay. On a real
+	 * crash the bit was never cleared on disk, so the redo is
+	 * a no-op there; the gap is only visible when replaying a
+	 * cleanly-unmounted image whose log still holds the create.
+	 */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	/* The file is gone on the replayed volume. */
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "j.txt"), -ENOENT);
+
+	/* The file is gone on the live snapshot too, and it is clean. */
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	(void)i;
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
+/* ---- 5. an unlink in the root falls back to unjournaled --------------- */
+
+static void test_unlink_in_root_unjournaled(void)
+{
+	char orig[1024], snap[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *f = NULL;
+	struct rec_seen s;
+	int err;
+
+	printf("test_unlink_in_root_unjournaled\n");
+	scratch_path(orig, sizeof(orig), "ruorig");
+	scratch_path(snap, sizeof(snap), "rusnap");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_unlink_in_root_unjournaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	/* Create in the root (unjournaled — see test 3), then unlink
+	 * it: the entry lives in the root's $INDEX_ALLOCATION block,
+	 * which the unlink transaction cannot describe, so it aborts
+	 * and the unlink proceeds unjournaled instead of failing. */
+	err = ntfs_create(root, "r.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(ntfs_unlink(root, "r.txt"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 0);
+
+	CHECK_EQ(lookup_after_mount(snap, "r.txt"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+}
+
+/* ---- 6. an rmdir journals like an unlink ------------------------------ */
+
+static void test_rmdir_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *e = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	uint64_t sub_ino = 0, sub2_ino = 0;
+	int err;
+
+	printf("test_rmdir_journaled\n");
+	scratch_path(orig, sizeof(orig), "dorig");
+	scratch_path(snap, sizeof(snap), "dsnap");
+	scratch_path(snap1, sizeof(snap1), "dsnap1");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_rmdir_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+	err = ntfs_mkdir(d, "sub2", 0100755, &e);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub2_ino = ntfs_inode_number(e);
+	ntfs_inode_put(e);
+	e = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* rmdir of the empty driver-made directory: the same two
+	 * records as a file unlink (index entry + $FILE_NAME). */
+	CHECK_EQ(ntfs_rmdir(d, "sub2"), 0);
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (e) { ntfs_inode_put(e); e = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 8);
+	if (s.n == 8) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.target_vcn[1], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[2], sub2_ino / 4);
+	}
+
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK(!an.needs_chkdsk);
+
+	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "sub2"), -ENOENT);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -830,6 +1141,9 @@ int main(void)
 	test_create_journaled();
 	test_mkdir_unjournaled();
 	test_create_in_root_unjournaled();
+	test_unlink_journaled();
+	test_unlink_in_root_unjournaled();
+	test_rmdir_journaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

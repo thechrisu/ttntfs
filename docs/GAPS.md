@@ -598,8 +598,55 @@ transaction's checkpoint lands (oldest advances past it), and
 `txn_append_open_records` emits one open record per
 transaction, not per writer lifetime (an unlink transaction is
 1 open + 2 data + Commit + 3 dumps + Forget = 8 records).
-Driver glue (wiring into `ntfs_vfs_unlink` plus driver tests)
-follows in the next commit.
+Driver glue landed 2026-11-27 (commit, this round):
+`ntfs_journal_unlink_begin/abort/commit/check/stage_index/
+stage_attr` in `core/vfs/journal.c` (+ API in
+`core/vfs/journal.h`), wired into `ntfs_vfs_unlink`
+(`core/vfs/namei.c`, which gains a `jtp` parameter; the three
+rename call sites pass NULL). The begin runs before the mrec
+locks (lock order `log_txn_lock` → `mrec_lock`, as in
+`__ntfs_create`); the staging calls sit before
+`ntfs_index_remove` and `ntfs_attr_record_rm`, so the logged
+bytes are the bytes the driver actually removes. On commit
+failure the caller sets `NVolSetErrors` and returns the error —
+the next mount's replay undoes the partial transaction and
+restores the file, the correct outcome for a failed unlink.
+New driver tests `test_unlink_journaled`,
+`test_unlink_in_root_unjournaled`, `test_rmdir_journaled`
+(`core/tests/test_journal.c`, suite 171 checks, 0 failures):
+the journaled unlink writes exactly one 8-record transaction;
+the walk from the oldest LSN holds 22 records — the create's
+14 still-live ones (its 2 open records are already dispensable)
+plus the unlink's 8 — because the MFT pages the create
+dirtied were never flushed and no checkpoint is emitted after
+a sync, so the dirty-page table still names the create's LSNs
+as the oldest for those pages (correct NTFS behaviour: a crash
+before those pages flush needs the create's redo records). The
+unlink's two data records are skipped on replay by their
+`MR_LSN` stamps; the create's two idempotent records are
+redone (sizes + SetBits). Two bugs found by the tests and fixed
+in this commit: `stage_attr` tested `actx->mrec !=
+actx->base_mrec`, but the search context only fills
+`base_mrec` on the external (attribute-list) path, so it
+rejected every attribute of a plain file — the test is now
+`actx->ntfs_ino == ni` (the base inode while the search stays
+in the base record); and the `journal.c` comments claiming the
+live $FILE_NAME carries no `INDEXED` flag were stale —
+attrib.c sets `RESIDENT_ATTR_IS_INDEXED` for every
+`AT_FILE_NAME` it adds, so the copy's explicit flag set is a
+no-op on live-created names. The root-unlink and root-rmdir
+cases stay unjournaled by design (their entries live in the
+root's `$INDEX_ALLOCATION` blocks) and still succeed.
+Known gap, next commit: the evict-time deallocation (free
+clusters, clear the $MFT bitmap bit, deallocate the record)
+is NOT in the unlink transaction. Replaying a
+cleanly-unmounted image redoes the create's SetBits onto the
+freed record, so `ntfsck` reports the resurrected bit (exit 4)
+— the driver test pins this as the current behaviour. On a
+real crash the bit was never cleared on disk, so the redo is a
+no-op there; the gap is only visible when replaying a clean
+image whose log still holds the create. The crash tests (next)
+decide whether the deallocation gets its own transaction.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

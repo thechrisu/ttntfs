@@ -900,7 +900,8 @@ static int ntfs_test_inode_attr(struct inode *vi, void *data)
  * Return 0 on success and -errno on error.
  */
 static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
-		__le16 *name, u8 name_len, bool need_lock)
+		__le16 *name, u8 name_len, bool need_lock,
+		struct ntfs_journal_unlink **jtp)
 {
 	struct ntfs_attr_search_ctx *actx = NULL;
 	struct file_name_attr *fn = NULL;
@@ -910,6 +911,10 @@ static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	struct mft_record *ni_mrec;
 	struct super_block *sb;
 	bool link_count_zero = false;
+	/* The journal transaction, when the caller opened one: staging
+	 * failures abort it (and the delete proceeds unjournaled, as
+	 * before Phase 2) instead of failing the delete. */
+	struct ntfs_journal_unlink *jt = jtp ? *jtp : NULL;
 
 	ntfs_debug("Entering.\n");
 
@@ -924,6 +929,23 @@ static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 		ni = ni->ext.base_ntfs_ino;
 	if (dir_ni->nr_extents == -1)
 		dir_ni = dir_ni->ext.base_ntfs_ino;
+	/*
+	 * PORT: journal gate (docs/JOURNAL-DESIGN.md Phase 3). A target
+	 * carrying a reparse point or an object ID also loses an $Extend
+	 * index entry below, which the unlink transaction cannot
+	 * describe yet — abort the transaction now, before anything
+	 * mutates, and delete unjournaled.
+	 */
+	if (jt) {
+		err = ntfs_journal_unlink_check(jt, ni);
+		if (err) {
+			ntfs_journal_unlink_abort(jt);
+			jt = NULL;
+			if (jtp)
+				*jtp = NULL;
+			err = 0;
+		}
+	}
 	/*
 	 * Search for FILE_NAME attribute with such name. If it's in POSIX or
 	 * WIN32_AND_DOS namespace, then simply remove it from index and inode.
@@ -1009,9 +1031,44 @@ search:
 	if (err)
 		goto err_out;
 
+	/*
+	 * PORT: journal the index removal (docs/JOURNAL-DESIGN.md
+	 * Phase 3). Stage before the removal, from the live bytes:
+	 * the entry is gone afterwards. Any staging failure aborts
+	 * the transaction and the delete proceeds unjournaled.
+	 */
+	if (jt) {
+		err = ntfs_journal_unlink_stage_index(jt, dir_ni, fn,
+				le32_to_cpu(actx->attr->data.resident.value_length));
+		if (err) {
+			ntfs_journal_unlink_abort(jt);
+			jt = NULL;
+			if (jtp)
+				*jtp = NULL;
+			err = 0;
+		}
+	}
+
 	err = ntfs_index_remove(dir_ni, fn, le32_to_cpu(actx->attr->data.resident.value_length));
 	if (err)
 		goto err_out;
+
+	/*
+	 * PORT: journal the $FILE_NAME removal, same rule: stage
+	 * before the removal, from the live attribute. The replay's
+	 * DeleteAttribute decrements the link count, so the count
+	 * update below needs no record of its own.
+	 */
+	if (jt) {
+		err = ntfs_journal_unlink_stage_attr(jt, ni, actx);
+		if (err) {
+			ntfs_journal_unlink_abort(jt);
+			jt = NULL;
+			if (jtp)
+				*jtp = NULL;
+			err = 0;
+		}
+	}
 
 	err = ntfs_attr_record_rm(actx);
 	if (err)
@@ -1402,6 +1459,7 @@ int ntfs_vfs_unlink(struct inode *dir, const char *name, int len, bool rmdir)
 {
 	struct ntfs_volume *vol = NTFS_SB(dir->i_sb);
 	struct inode *vi;
+	struct ntfs_journal_unlink *ut = NULL;
 	__le16 *uname;
 	int uname_len, err;
 
@@ -1442,16 +1500,62 @@ int ntfs_vfs_unlink(struct inode *dir, const char *name, int len, bool rmdir)
 
 	ntfs_vfs_set_dirty(vol);
 
-	err = ntfs_delete(NTFS_I(vi), NTFS_I(dir), uname, uname_len, true);
-	kmem_cache_free(ntfs_name_cache, uname);
+	/*
+	 * PORT: journal the unlink (docs/JOURNAL-DESIGN.md Phase 3).
+	 * Begin before the mrec locks: the lock order is log_txn_lock
+	 * then mrec_lock, as in __ntfs_create. A begin failure is not
+	 * an unlink failure — the driver unlinked unjournaled for
+	 * years — so warn and proceed unjournaled. The locks are taken
+	 * here, not inside ntfs_delete, so they stay held across the
+	 * commit: a concurrent unjournaled mutation of the directory
+	 * between the delete and the commit could shift the staged
+	 * index entry's offset. Rename's ntfs_delete calls pass NULL
+	 * and are unaffected.
+	 */
+	err = ntfs_journal_unlink_begin(vol, &ut);
 	if (err)
-		goto out;
+		ntfs_error(vol->sb,
+			   "journal begin failed (%d); unlinking unjournaled.\n",
+			   err);
+
+	mutex_lock_nested(&NTFS_I(vi)->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+	mutex_lock_nested(&NTFS_I(dir)->mrec_lock, NTFS_INODE_MUTEX_PARENT);
+	err = ntfs_delete(NTFS_I(vi), NTFS_I(dir), uname, uname_len, false,
+			  &ut);
+	kmem_cache_free(ntfs_name_cache, uname);
+	if (err) {
+		if (ut)
+			ntfs_journal_unlink_abort(ut);
+		goto out_unlock;
+	}
+	if (ut) {
+		err = ntfs_journal_unlink_commit(ut, NTFS_I(vi),
+						 NTFS_I(dir));
+		/* Commit consumed the transaction either way. */
+		ut = NULL;
+		if (err) {
+			/*
+			 * The log could not take the transaction: the
+			 * in-memory unlink stands, but the volume is
+			 * suspect — mark it, as every other metadata
+			 * I/O failure does. The next mount replays the
+			 * partial transaction's undo and restores the
+			 * file, which is the correct outcome for a
+			 * failed unlink.
+			 */
+			NVolSetErrors(vol);
+			goto out_unlock;
+		}
+	}
 
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	mark_inode_dirty(dir);
 	inode_set_ctime_to_ts(vi, inode_get_ctime(dir));
 	if (vi->i_nlink)
 		mark_inode_dirty(vi);
+out_unlock:
+	mutex_unlock(&NTFS_I(dir)->mrec_lock);
+	mutex_unlock(&NTFS_I(vi)->mrec_lock);
 out:
 	iput(vi);
 	return err;
@@ -1577,7 +1681,8 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 				goto err_out;
 		}
 
-		err = ntfs_delete(new_ni, new_dir_ni, uname_new, new_name_len, false);
+		err = ntfs_delete(new_ni, new_dir_ni, uname_new, new_name_len, false,
+				NULL);
 		if (err)
 			goto err_out;
 	} else {
@@ -1594,13 +1699,15 @@ static int __ntfs_vfs_rename(struct inode *old_dir, struct inode *old_inode,
 	if (err)
 		goto err_out;
 
-	err = ntfs_delete(old_ni, old_dir_ni, uname_old, old_name_len, false);
+	err = ntfs_delete(old_ni, old_dir_ni, uname_old, old_name_len, false,
+			NULL);
 	if (err) {
 		int err2;
 
 		ntfs_error(sb, "Failed to delete old ntfs inode(%llu) in old dir, err : %d\n",
 				old_ni->mft_no, err);
-		err2 = ntfs_delete(old_ni, new_dir_ni, uname_new, new_name_len, false);
+		err2 = ntfs_delete(old_ni, new_dir_ni, uname_new, new_name_len,
+				   false, NULL);
 		if (err2)
 			ntfs_error(sb, "Failed to delete old ntfs inode in new dir, err : %d\n",
 					err2);

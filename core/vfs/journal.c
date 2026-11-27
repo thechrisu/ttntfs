@@ -12,11 +12,15 @@
  * they happen:
  *
  *   - the $FILE_NAME CreateAttribute copy carries
- *     RESIDENT_ATTR_IS_INDEXED, which the live record does not (the
- *     driver never sets it). The replay's link-count bump keys on it,
- *     so without it a replayed create would land with link_count 0.
- *     The replayed record is one flag bit more correct than the live
- *     one; the live record gains the flag in a later commit, not here.
+ *     RESIDENT_ATTR_IS_INDEXED. The live record carries it too
+ *     (attrib.c sets it for every AT_FILE_NAME it adds), so the
+ *     copy is identical here; the flag is set explicitly anyway
+ *     because the replay's link-count bump keys on it — without
+ *     it a replayed create would land with link_count 0. The
+ *     unlink's DeleteAttribute relies on the same flag: the
+ *     replay decrements the link count when it removes an
+ *     INDEXED $FILE_NAME, so no separate record carries the
+ *     count.
  *   - $EA is logged net: $EA_INFORMATION + $EA with their final values,
  *     one CreateAttribute each. The three ntfs_set_ea() calls grow the
  *     $EA value twice in memory; those intermediate grows never reach
@@ -381,12 +385,13 @@ int ntfs_journal_create_attr(struct ntfs_journal_txn *t,
 	memcpy(copy, a, len);
 	if (type == AT_FILE_NAME) {
 		/*
-		 * The live $FILE_NAME carries no INDEXED flag (the driver
-		 * never sets RESIDENT_ATTR_IS_INDEXED); the log copy must
-		 * carry it, because the replay's link-count bump keys on
-		 * it — without it a replayed create lands with
-		 * link_count 0. Only the copy is touched; the live record
-		 * keeps its bytes.
+		 * The live $FILE_NAME already carries INDEXED
+		 * (attrib.c sets RESIDENT_ATTR_IS_INDEXED for every
+		 * AT_FILE_NAME it adds); set it on the copy anyway,
+		 * because the replay's link-count bump keys on it —
+		 * without it a replayed create lands with
+		 * link_count 0. Only the copy is touched; the live
+		 * record keeps its bytes.
 		 */
 		struct attr_record *c = (struct attr_record *)copy;
 
@@ -604,5 +609,267 @@ int ntfs_journal_create_mft_sizes(struct ntfs_journal_txn *t)
 		err = stage_mft_attr(t, m0, AT_BITMAP, &t->snap_bmp,
 				     vcn, cluster_off, page_lcn);
 	unmap_mft_record(NTFS_I(t->vol->mft_ino));
+	return err;
+}
+
+/* ---- unlink (Phase 3) ---------------------------------------------------- */
+
+struct ntfs_journal_unlink {
+	struct ntfs_volume *vol;
+	ntfs_log_txn_t *t;
+};
+
+int ntfs_journal_unlink_begin(struct ntfs_volume *vol,
+			      struct ntfs_journal_unlink **out)
+{
+	struct ntfs_journal_unlink *u;
+	int err;
+
+	*out = NULL;
+	if (!vol->log_writer)
+		return 0;
+	u = kmalloc(sizeof(*u), GFP_NOFS);
+	if (!u)
+		return -ENOMEM;
+	u->vol = vol;
+	u->t = NULL;
+	mutex_lock(&vol->log_txn_lock);
+	err = ntfs_log_txn_begin(vol->log_writer, &u->t);
+	if (err) {
+		mutex_unlock(&vol->log_txn_lock);
+		kfree(u);
+		return err;
+	}
+	atomic_inc(&vol->log_txn_open);
+	*out = u;
+	return 0;
+}
+
+void ntfs_journal_unlink_abort(struct ntfs_journal_unlink *u)
+{
+	if (!u)
+		return;
+	(void)ntfs_log_txn_abort(u->t);
+	atomic_dec(&u->vol->log_txn_open);
+	mutex_unlock(&u->vol->log_txn_lock);
+	kfree(u);
+}
+
+int ntfs_journal_unlink_commit(struct ntfs_journal_unlink *u,
+			       struct ntfs_inode *ni,
+			       struct ntfs_inode *dir_ni)
+{
+	uint64_t last_lsn = 0;
+	struct mft_record *m;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	err = ntfs_log_txn_commit(u->t, NULL, &last_lsn);
+	if (!err) {
+		/*
+		 * Stamp MR_LSN into both touched records before the
+		 * metadata flush, as in the create commit: without the
+		 * stamp a second replay would re-apply the delete
+		 * records onto records that no longer carry the
+		 * attribute or the entry, and refuse the log. The
+		 * records were just touched by the delete and are hot
+		 * in cache; a map failure here is a volume error, not
+		 * a reason to leave the stamp half done.
+		 */
+		m = map_mft_record(ni);
+		if (IS_ERR(m))
+			err = PTR_ERR(m);
+		else {
+			m->lsn = cpu_to_le64(last_lsn);
+			mark_mft_record_dirty(ni);
+			unmap_mft_record(ni);
+		}
+		if (!err) {
+			m = map_mft_record(dir_ni);
+			if (IS_ERR(m))
+				err = PTR_ERR(m);
+			else {
+				m->lsn = cpu_to_le64(last_lsn);
+				mark_mft_record_dirty(dir_ni);
+				unmap_mft_record(dir_ni);
+			}
+		}
+	}
+	atomic_dec(&u->vol->log_txn_open);
+	mutex_unlock(&u->vol->log_txn_lock);
+	kfree(u);
+	return err;
+}
+
+int ntfs_journal_unlink_check(struct ntfs_journal_unlink *u,
+			      struct ntfs_inode *ni)
+{
+	struct mft_record *m;
+	int err = 0;
+
+	if (!u)
+		return -EINVAL;
+	/*
+	 * A reparse point or an object ID means ntfs_delete also
+	 * removes an $Extend index entry, which this class cannot
+	 * describe — the unlink must proceed unjournaled. The flags
+	 * are the authority for reparse points (ntfs_delete_reparse_index
+	 * keys on them); the record scan covers object IDs, which have
+	 * no such flag. An unreadable record is the same answer: a
+	 * record that cannot be read cannot be journaled.
+	 */
+	if (ni->flags & FILE_ATTR_REPARSE_POINT)
+		return -ENOENT;
+	m = map_mft_record(ni);
+	if (IS_ERR(m))
+		return -ENOENT;
+	if (find_attr(m, AT_REPARSE_POINT, NULL, 0, NULL) ||
+	    find_attr(m, AT_OBJECT_ID, NULL, 0, NULL))
+		err = -ENOENT;
+	unmap_mft_record(ni);
+	return err;
+}
+
+int ntfs_journal_unlink_stage_index(struct ntfs_journal_unlink *u,
+				    struct ntfs_inode *dir_ni,
+				    const struct file_name_attr *fn,
+				    u32 fn_len)
+{
+	struct mft_record *dir_mrec;
+	const struct attr_record *a;
+	const struct index_root *ir;
+	const struct index_header *ih;
+	const u8 *value, *entries, *end;
+	const struct index_entry *e;
+	u16 attr_off = 0;
+	u8 *copy;
+	u32 len;
+	u64 vcn, page_lcn;
+	u16 cluster_off, entry_off;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	dir_mrec = map_mft_record(dir_ni);
+	if (IS_ERR(dir_mrec))
+		return -ENOENT;
+	a = find_attr(dir_mrec, AT_INDEX_ROOT, I30, 4, &attr_off);
+	if (!a || a->non_resident) {
+		err = -ENOENT;
+		goto out;
+	}
+	value = (const u8 *)a +
+		le16_to_cpu(a->data.resident.value_offset);
+	ir = (const struct index_root *)value;
+	ih = &ir->index;
+	/* Same bounds as the create index scan: entries_offset and
+	 * index_length are measured from the index header start. */
+	entries = (const u8 *)ih + le32_to_cpu(ih->entries_offset);
+	end = (const u8 *)ih + le32_to_cpu(ih->index_length);
+	if (entries < value ||
+	    end > value + le32_to_cpu(a->data.resident.value_length)) {
+		err = -EINVAL;
+		goto out;
+	}
+	/* Match by the whole $FILE_NAME value, not by mref: a hard
+	 * link in the same directory has the same parent and the
+	 * same target record, but a different name. The entry key
+	 * is the $FILE_NAME value; key length first, then bytes. */
+	for (e = (const struct index_entry *)entries;
+	     (const u8 *)e + 16 <= end;) {
+		u16 elen = le16_to_cpu(e->length);
+
+		if (elen < 16 || (const u8 *)e + elen > end) {
+			err = -EINVAL;
+			goto out;
+		}
+		if (e->flags & INDEX_ENTRY_END)
+			break;
+		if (le16_to_cpu(e->key_length) == fn_len &&
+		    !memcmp((const u8 *)e + 16, fn, fn_len)) {
+			len = elen;
+			goto found;
+		}
+		e = (const struct index_entry *)((const u8 *)e + elen);
+	}
+	/* Not in the root: the entry lives in an $INDEX_ALLOCATION
+	 * block, which this class cannot describe. */
+	err = -ENOENT;
+	goto out;
+
+found:
+	copy = kmalloc(len, GFP_NOFS);
+	if (!copy) {
+		err = -ENOMEM;
+		goto out;
+	}
+	memcpy(copy, e, len);
+	/* aoff is the entry's offset from the attribute record's start. */
+	entry_off = (u16)((const u8 *)e - (const u8 *)a);
+	err = mft_coords(u->vol, dir_ni->mft_no, &vcn, &cluster_off,
+			 &page_lcn);
+	if (!err)
+		err = ntfs_log_txn_delete_index_root(u->t,
+						     u->vol->log_mft_data_attr,
+						     vcn, cluster_off, page_lcn,
+						     attr_off, entry_off,
+						     copy, len);
+	kfree(copy);
+out:
+	unmap_mft_record(dir_ni);
+	return err;
+}
+
+int ntfs_journal_unlink_stage_attr(struct ntfs_journal_unlink *u,
+				   struct ntfs_inode *ni,
+				   struct ntfs_attr_search_ctx *actx)
+{
+	const struct attr_record *a;
+	u8 *copy;
+	u32 len;
+	u64 vcn, page_lcn;
+	u16 cluster_off, off;
+	int err;
+
+	if (!u)
+		return -EINVAL;
+	/*
+	 * The attribute must live in the base record of the inode
+	 * being deleted: the delete records address it by its offset
+	 * in that record, and an extent record would need the
+	 * extent's own coordinates. $FILE_NAME attributes live in
+	 * the base record in practice; anything else proceeds
+	 * unjournaled.
+	 *
+	 * The test is actx->ntfs_ino, not actx->base_mrec: the
+	 * search context only fills base_ntfs_ino/base_mrec on the
+	 * external (attribute-list) path, so for a plain file
+	 * without an $ATTRIBUTE_LIST base_mrec stays NULL and a
+	 * base_mrec comparison rejects every attribute. The
+	 * context's ntfs_ino is the base inode while the search
+	 * stays in the base record and switches to the extent inode
+	 * when it walks into one, so ntfs_ino == ni is exactly
+	 * "found in the base record".
+	 */
+	if (actx->ntfs_ino != ni)
+		return -ENOENT;
+	a = actx->attr;
+	off = (u16)((const u8 *)a - (const u8 *)actx->mrec);
+	len = le32_to_cpu(a->length);
+	if (len < 8 || off + len > le32_to_cpu(actx->mrec->bytes_in_use))
+		return -EINVAL;
+	copy = kmalloc(len, GFP_NOFS);
+	if (!copy)
+		return -ENOMEM;
+	memcpy(copy, a, len);
+	err = mft_coords(u->vol, ni->mft_no,
+			 &vcn, &cluster_off, &page_lcn);
+	if (!err)
+		err = ntfs_log_txn_delete_attr(u->t,
+					       u->vol->log_mft_data_attr,
+					       vcn, cluster_off, page_lcn,
+					       off, copy, len);
+	kfree(copy);
 	return err;
 }
