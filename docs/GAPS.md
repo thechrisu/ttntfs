@@ -932,7 +932,22 @@ first Open record (16, not 14) — oldest_lsn lands on the first
 record of the oldest transaction when no later transaction
 dirties; the opens are dispensable and the replay skips them,
 so this is benign.
-Next: the truncate crash tests, then setattr.
+Crash tests (`core/tests/test_crash.c`, suite 2579 checks, 0
+failures, landed as their own commit 2026-11-27): the truncate
+class is crash-clean. `test_journaled_truncate_shrink_cut_points`
+(256 KiB -> 64 KiB, 43 cuts sampled at every write; 5
+inconsistent before replay, 0 still bad after it; j.txt 64 KiB
+33 times, 256 KiB 10 times) and
+`test_journaled_truncate_extend_cut_points` (64 KiB -> 256 KiB,
+38 cuts; 4 inconsistent before replay, 0 still bad after it;
+j.txt 64 KiB 6 times, 256 KiB 32 times). Per cut: pre-replay
+ntfsck + coverage, replay, post-replay ntfsck + coverage +
+remount size/alloc lookup + second replay no-op. The sweeps are
+what found the three crash-test fixes above (wrong bitmap
+target, missing $SI flags, missing parent $FILE_NAME) — the
+first sweep run had 21 shrink cuts and 20 extend cuts still bad
+after replay; after the three fixes, 0.
+Next: the setattr class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
