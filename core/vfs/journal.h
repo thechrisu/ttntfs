@@ -83,6 +83,18 @@ int ntfs_journal_create_index(struct ntfs_journal_txn *t,
 int ntfs_journal_create_bitmap(struct ntfs_journal_txn *t,
 			       struct ntfs_volume *vol, u64 mft_no);
 
+/* Stage the $MFT extension the record allocation just performed, if
+ * any: a SetNewAttributeSizes record for record 0's $DATA (and, when
+ * the allocation itself grew, an UpdateMappingPairs record before it),
+ * plus a SetNewAttributeSizes record for record 0's $BITMAP when its
+ * sizes grew. Called right after ntfs_mft_record_alloc, before any
+ * other staging, so the redo order is: extend $MFT, then initialise
+ * the new record. Returns 0 when nothing extended. Returns -ENOENT
+ * when record 0 or either attribute cannot be read (the caller then
+ * aborts and proceeds unjournaled — a create the log cannot describe
+ * must never be half-journaled). */
+int ntfs_journal_create_mft_sizes(struct ntfs_journal_txn *t);
+
 /* Commit: append the staged records, the Commit record, a checkpoint
  * and the Forget record; stamp MR_LSN = the last LSN into the new
  * record and the parent record; lower the WAL gate; release the lock.

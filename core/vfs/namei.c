@@ -385,6 +385,21 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	}
 
 	/*
+	 * PORT: journal the $MFT extension the allocation just
+	 * performed, if any (docs/JOURNAL-DESIGN.md Phase 2 step 3):
+	 * record 0's $DATA sizes (and its runs, when the allocation
+	 * itself grew) and $BITMAP's sizes. Staged before the
+	 * Initialize record, so the redo order is: extend $MFT, then
+	 * initialise the new record. A -ENOENT here aborts the
+	 * transaction and the create proceeds unjournaled, exactly as
+	 * for an undescribable sub-mutation.
+	 */
+	err = journal_stage(jt ? ntfs_journal_create_mft_sizes(jt) : 0,
+			    &jt);
+	if (err)
+		goto err_out;
+
+	/*
 	 * Prevent iget and writeback from finding this inode.
 	 * Caller must call d_instantiate_new instead of d_instantiate.
 	 */

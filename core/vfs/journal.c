@@ -37,12 +37,26 @@
 #include "ntfs.h"
 #include "attrib.h"
 #include "dir.h"
+#include "mft.h"
 #include "journal.h"
 #include "../logfile/ntfs_logfile.h"
+
+struct mft_attr_snapshot {
+	u64 alloc, valid, data, total;
+	u16 attr_off;		/* attribute offset in record 0 */
+	u16 pairs_off;		/* mapping-pairs offset within the attribute */
+	u16 pairs_len;		/* mapping-pairs byte length */
+	u8 *pairs;		/* kmalloc'd copy of the pairs */
+};
 
 struct ntfs_journal_txn {
 	struct ntfs_volume *vol;
 	ntfs_log_txn_t *t;
+	/* Record 0's $DATA and $BITMAP as they stood at begin, before
+	 * the allocation. The staging call compares the live record 0
+	 * against these and logs what moved. */
+	struct mft_attr_snapshot snap_data, snap_bmp;
+	bool snap_ok;
 };
 
 /* ---- coordinates ------------------------------------------------------- */
@@ -135,6 +149,55 @@ static const struct attr_record *find_attr(const struct mft_record *m,
 
 /* ---- transaction lifetime ---------------------------------------------- */
 
+/*
+ * Snapshot one non-resident attribute of record 0 (its sizes and its
+ * mapping pairs) into @snap. The caller maps record 0; this only reads
+ * it. The compressed size lives at offset 0x40 and is present only
+ * when the attribute is at least 0x48 long (AT_NONRESIDENT_EX_SIZE);
+ * shorter attributes carry 0 there.
+ */
+static int snapshot_mft_attr(const struct mft_record *m0, __le32 type,
+			     struct mft_attr_snapshot *snap)
+{
+	const struct attr_record *a;
+	u16 off = 0;
+	u32 len;
+	u16 pairs_off;
+
+	a = find_attr(m0, type, NULL, 0, &off);
+	if (!a || !a->non_resident)
+		return -ENOENT;
+	len = le32_to_cpu(a->length);
+	pairs_off = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+	if (pairs_off >= len)
+		return -EIO;
+	snap->alloc = le64_to_cpu(a->data.non_resident.allocated_size);
+	snap->valid = le64_to_cpu(a->data.non_resident.initialized_size);
+	snap->data = le64_to_cpu(a->data.non_resident.data_size);
+	/* compressed_size exists only when the mapping pairs start
+	 * after it (pairs_off >= 0x48). A short-form attribute — the
+	 * $MFT $DATA is one, pairs at 0x40, length exactly 0x48 — has
+	 * no such field: offset 0x40 IS the pairs. Reading it as a
+	 * size would log the pairs bytes as the total, and the replay
+	 * would write them back over the pairs if they changed. */
+	snap->total = pairs_off >= 0x48 ?
+		le64_to_cpu(a->data.non_resident.compressed_size) : 0;
+	snap->attr_off = off;
+	snap->pairs_off = pairs_off;
+	snap->pairs_len = (u16)(len - pairs_off);
+	snap->pairs = kmalloc(snap->pairs_len, GFP_NOFS);
+	if (!snap->pairs)
+		return -ENOMEM;
+	memcpy(snap->pairs, (const u8 *)a + pairs_off, snap->pairs_len);
+	return 0;
+}
+
+static void free_snapshot(struct mft_attr_snapshot *snap)
+{
+	kfree(snap->pairs);
+	snap->pairs = NULL;
+}
+
 int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 			      struct ntfs_journal_txn **out)
 {
@@ -149,6 +212,9 @@ int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 		return -ENOMEM;
 	jt->vol = vol;
 	jt->t = NULL;
+	jt->snap_data.pairs = NULL;
+	jt->snap_bmp.pairs = NULL;
+	jt->snap_ok = false;
 	mutex_lock(&vol->log_txn_lock);
 	err = ntfs_log_txn_begin(vol->log_writer, &jt->t);
 	if (err) {
@@ -156,6 +222,37 @@ int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 		kfree(jt);
 		return err;
 	}
+	/*
+	 * Snapshot record 0's $DATA and $BITMAP before the allocation:
+	 * ntfs_mft_record_alloc extends $MFT (sizes, and the runs when
+	 * the allocation itself grows) and the $MFT bitmap (its sizes
+	 * every 8 records), and the log must describe the change from
+	 * these values to the post-alloc ones. A snapshot failure is a
+	 * begin failure: the create proceeds unjournaled rather than
+	 * half-journaled. Record 0 is mapped only for the copy.
+	 */
+	{
+		struct mft_record *m0 = map_mft_record(NTFS_I(vol->mft_ino));
+
+		if (IS_ERR(m0))
+			err = PTR_ERR(m0);
+		else {
+			err = snapshot_mft_attr(m0, AT_DATA, &jt->snap_data);
+			if (!err)
+				err = snapshot_mft_attr(m0, AT_BITMAP,
+							&jt->snap_bmp);
+			unmap_mft_record(NTFS_I(vol->mft_ino));
+		}
+	}
+	if (err) {
+		free_snapshot(&jt->snap_data);
+		free_snapshot(&jt->snap_bmp);
+		(void)ntfs_log_txn_abort(jt->t);
+		mutex_unlock(&vol->log_txn_lock);
+		kfree(jt);
+		return err;
+	}
+	jt->snap_ok = true;
 	atomic_inc(&vol->log_txn_open);
 	*out = jt;
 	return 0;
@@ -166,6 +263,8 @@ void ntfs_journal_create_abort(struct ntfs_journal_txn *t)
 	if (!t)
 		return;
 	(void)ntfs_log_txn_abort(t->t);
+	free_snapshot(&t->snap_data);
+	free_snapshot(&t->snap_bmp);
 	atomic_dec(&t->vol->log_txn_open);
 	mutex_unlock(&t->vol->log_txn_lock);
 	kfree(t);
@@ -197,6 +296,8 @@ int ntfs_journal_create_commit(struct ntfs_journal_txn *t,
 		if (parent_mrec)
 			parent_mrec->lsn = cpu_to_le64(last_lsn);
 	}
+	free_snapshot(&t->snap_data);
+	free_snapshot(&t->snap_bmp);
 	atomic_dec(&t->vol->log_txn_open);
 	mutex_unlock(&t->vol->log_txn_lock);
 	kfree(t);
@@ -402,4 +503,106 @@ int ntfs_journal_create_bitmap(struct ntfs_journal_txn *t,
 	return ntfs_log_txn_set_bitmap(t->t, vol->log_mft_bitmap_attr,
 				       vcn, cluster_off, page_lcn,
 				       (u32)mft_no, 1, true);
+}
+
+/*
+ * Stage one record-0 attribute's extension: the mapping pairs first
+ * (redo order is extend the runs, then the sizes that name them),
+ * then the sizes. The records target the $MFT:$DATA open attribute —
+ * the record is addressed through $MFT:$DATA's runs — and select the
+ * attribute inside record 0 by its offset (roff): that is how a
+ * SetNewAttributeSizes for $MFT:$BITMAP is expressed, since the
+ * replay's H1 check requires the target to be $MFT:$DATA. The
+ * pairs/sizes the log carries are the live bytes read from record 0,
+ * never reconstructed.
+ */
+static int stage_mft_attr(struct ntfs_journal_txn *t,
+			  const struct mft_record *m0, __le32 type,
+			  const struct mft_attr_snapshot *snap,
+			  u64 vcn, u16 cluster_off, u64 page_lcn)
+{
+	const struct attr_record *a;
+	u16 off = 0, pairs_off;
+	u32 len;
+	u64 alloc, valid, data, total;
+	int err;
+
+	a = find_attr(m0, type, NULL, 0, &off);
+	if (!a || !a->non_resident)
+		return -ENOENT;
+	len = le32_to_cpu(a->length);
+	pairs_off = le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+	if (off != snap->attr_off || pairs_off != snap->pairs_off)
+		return -ENOENT;
+	if (pairs_off >= len)
+		return -EIO;
+	if (len - pairs_off != snap->pairs_len ||
+	    memcmp((const u8 *)a + pairs_off, snap->pairs,
+		   snap->pairs_len) != 0) {
+		err = ntfs_log_txn_update_mapping_pairs(
+			t->t, t->vol->log_mft_data_attr, vcn, cluster_off,
+			page_lcn, off, pairs_off,
+			(const u8 *)a + pairs_off, (u16)(len - pairs_off),
+			snap->pairs, snap->pairs_len);
+		if (err)
+			return err;
+	}
+	alloc = le64_to_cpu(a->data.non_resident.allocated_size);
+	valid = le64_to_cpu(a->data.non_resident.initialized_size);
+	data = le64_to_cpu(a->data.non_resident.data_size);
+	/* Same rule as the snapshot: compressed_size exists only
+	 * when the pairs start after it (pairs_off >= 0x48). A
+	 * short-form attribute's offset 0x40 is the pairs, and
+	 * reading it as a size would stage a spurious sizes record
+	 * on every create (the snapshot reads 0, this reads the
+	 * pairs bytes). */
+	total = pairs_off >= 0x48 ?
+		le64_to_cpu(a->data.non_resident.compressed_size) : 0;
+	if (alloc != snap->alloc || valid != snap->valid ||
+	    data != snap->data || total != snap->total) {
+		err = ntfs_log_txn_set_attr_sizes(
+			t->t, t->vol->log_mft_data_attr, vcn, cluster_off,
+			page_lcn, off, alloc, valid, data, total,
+			snap->alloc, snap->valid, snap->data, snap->total);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+int ntfs_journal_create_mft_sizes(struct ntfs_journal_txn *t)
+{
+	struct mft_record *m0;
+	u64 vcn, page_lcn;
+	u16 cluster_off;
+	int err;
+
+	if (!t || !t->snap_ok)
+		return -ENOENT;
+	/*
+	 * Record 0's MR_LSN is not stamped by the commit (only the new
+	 * record and the parent are): the sizes/pairs records are
+	 * idempotent (absolute sizes, whole pairs), and the replay's
+	 * apply stamps record 0's MR_LSN itself, so a second replay
+	 * skips them. A concurrent unjournaled operation (e.g. mkdir)
+	 * extending $MFT inside the begin→staging window would be
+	 * folded into these records: redo stays correct, but undo
+	 * would restore the pre-mkdir sizes — it needs a simultaneous
+	 * crash in a microscopic window, the same class as the
+	 * documented $SI mtime gap, and the log_txn_lock serialises
+	 * all journaled creates against each other.
+	 */
+	err = mft_coords(t->vol, 0, &vcn, &cluster_off, &page_lcn);
+	if (err)
+		return err;
+	m0 = map_mft_record(NTFS_I(t->vol->mft_ino));
+	if (IS_ERR(m0))
+		return -ENOENT;
+	err = stage_mft_attr(t, m0, AT_DATA, &t->snap_data,
+			     vcn, cluster_off, page_lcn);
+	if (!err)
+		err = stage_mft_attr(t, m0, AT_BITMAP, &t->snap_bmp,
+				     vcn, cluster_off, page_lcn);
+	unmap_mft_record(NTFS_I(t->vol->mft_ino));
+	return err;
 }

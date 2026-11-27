@@ -223,6 +223,11 @@ struct rec_seen {
 	/* SetBits: bit and count from the redo payload. */
 	uint32_t bits_bit, bits_count;
 	uint64_t bits_lsn;
+	/* SetNewAttributeSizes: the $DATA size from redo/undo. */
+	uint64_t sizes_redo_data, sizes_undo_data;
+	uint64_t sizes_redo_total;
+	uint64_t sizes_lsn;
+	int sizes_count;
 };
 
 static int collect_rec(const struct ntfs_log_record *r, void *ctx)
@@ -260,6 +265,36 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 			((uint32_t)p[BR_BITS + 3] << 24);
 		s->bits_lsn = r->lsn;
 	}
+	if (r->redo_op == LOP_SetNewAttributeSizes && r->redo && r->redo_len >= NAS_SIZE &&
+	    r->undo && r->undo_len >= NAS_SIZE) {
+		const uint8_t *pr = r->redo, *pu = r->undo;
+		s->sizes_redo_data = (uint64_t)pr[NAS_DATA] |
+			((uint64_t)pr[NAS_DATA + 1] << 8) |
+			((uint64_t)pr[NAS_DATA + 2] << 16) |
+			((uint64_t)pr[NAS_DATA + 3] << 24) |
+			((uint64_t)pr[NAS_DATA + 4] << 32) |
+			((uint64_t)pr[NAS_DATA + 5] << 40) |
+			((uint64_t)pr[NAS_DATA + 6] << 48) |
+			((uint64_t)pr[NAS_DATA + 7] << 56);
+		s->sizes_undo_data = (uint64_t)pu[NAS_DATA] |
+			((uint64_t)pu[NAS_DATA + 1] << 8) |
+			((uint64_t)pu[NAS_DATA + 2] << 16) |
+			((uint64_t)pu[NAS_DATA + 3] << 24) |
+			((uint64_t)pu[NAS_DATA + 4] << 32) |
+			((uint64_t)pu[NAS_DATA + 5] << 40) |
+			((uint64_t)pu[NAS_DATA + 6] << 48) |
+			((uint64_t)pu[NAS_DATA + 7] << 56);
+		s->sizes_redo_total = (uint64_t)pr[NAS_TOTAL] |
+			((uint64_t)pr[NAS_TOTAL + 1] << 8) |
+			((uint64_t)pr[NAS_TOTAL + 2] << 16) |
+			((uint64_t)pr[NAS_TOTAL + 3] << 24) |
+			((uint64_t)pr[NAS_TOTAL + 4] << 32) |
+			((uint64_t)pr[NAS_TOTAL + 5] << 40) |
+			((uint64_t)pr[NAS_TOTAL + 6] << 48) |
+			((uint64_t)pr[NAS_TOTAL + 7] << 56);
+		s->sizes_lsn = r->lsn;
+		s->sizes_count++;
+	}
 	s->n++;
 	return 0;
 }
@@ -295,8 +330,8 @@ static int walk_log(const char *path, struct rec_seen *s)
 	 * Walk from the oldest LSN, not 0: 0 starts at the current
 	 * checkpoint, which the commit's own checkpoint moved past the
 	 * data records — the walk would see only the dumps and the
-	 * Forget. The oldest LSN is the dirty-page table's oldest
-	 * entry, the Initialize record's LSN.
+	 * Forget. The oldest LSN is the restart area's client oldest,
+	 * the transaction's first record (the first Open record).
 	 */
 	{
 		struct ntfs_logfile_info info;
@@ -347,6 +382,87 @@ static int read_mft_lsn(const char *path, uint64_t mft_no, uint64_t *lsn_out)
 			((uint64_t)buf[11] << 24) | ((uint64_t)buf[12] << 32) |
 			((uint64_t)buf[13] << 40) | ((uint64_t)buf[14] << 48) |
 			((uint64_t)buf[15] << 56);
+	}
+	free(buf);
+out_img:
+	ntfs_image_close(&img);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* Read record 0's unnamed $DATA attribute from the image at @path:
+ * its offset in the record, its allocated/data sizes, and the image's
+ * MFT record size. */
+static int read_mft0_data_attr(const char *path, uint16_t *off_out,
+			       uint64_t *alloc_out, uint64_t *data_out,
+			       uint32_t *rec_size_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+	struct ntfs_image img;
+	struct ntfs_image_io io;
+	struct ntfs_log_apply ap;
+	uint8_t *buf;
+	int err;
+
+	*off_out = 0;
+	*alloc_out = 0;
+	*data_out = 0;
+	*rec_size_out = 0;
+	if (!dev)
+		return -EIO;
+	io.ctx = dev;
+	io.pread = img_pread;
+	io.pwrite = NULL;
+	io.sync = NULL;
+	memset(&img, 0, sizeof(img));
+	err = ntfs_image_open_io(&img, &io, dev->size_bytes, false);
+	if (err)
+		goto out_dev;
+	*rec_size_out = img.mft_record_size;
+	buf = malloc(img.mft_record_size);
+	if (!buf) {
+		err = -ENOMEM;
+		goto out_img;
+	}
+	ntfs_image_apply(&img, &ap);
+	err = ap.read_mft_record(ap.ctx, 0, buf);
+	if (!err) {
+		uint16_t off = (uint16_t)buf[0x14] | ((uint16_t)buf[0x15] << 8);
+		uint32_t used = (uint32_t)buf[0x18] | ((uint32_t)buf[0x19] << 8) |
+			((uint32_t)buf[0x1a] << 16) | ((uint32_t)buf[0x1b] << 24);
+		err = -ENOENT;
+		while (off + 8 <= used) {
+			uint32_t type = (uint32_t)buf[off] |
+				((uint32_t)buf[off + 1] << 8) |
+				((uint32_t)buf[off + 2] << 16) |
+				((uint32_t)buf[off + 3] << 24);
+			uint32_t len = (uint32_t)buf[off + 4] |
+				((uint32_t)buf[off + 5] << 8) |
+				((uint32_t)buf[off + 6] << 16) |
+				((uint32_t)buf[off + 7] << 24);
+			if (type == 0xffffffff)
+				break;
+			if (len < 8 || off + len > used) {
+				err = -EIO;
+				break;
+			}
+			/* Unnamed $DATA: type 0x80, non-resident, name_length 0. */
+			if (type == 0x80 && buf[off + 8] && buf[off + 9] == 0) {
+				uint64_t a = 0, d = 0;
+				int i;
+				for (i = 0; i < 8; i++) {
+					a |= (uint64_t)buf[off + 0x28 + i] << (8 * i);
+					d |= (uint64_t)buf[off + 0x30 + i] << (8 * i);
+				}
+				*off_out = off;
+				*alloc_out = a;
+				*data_out = d;
+				err = 0;
+				break;
+			}
+			off += (uint16_t)len;
+		}
 	}
 	free(buf);
 out_img:
@@ -490,12 +606,16 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: exactly one transaction, 2 open + 8 data + Commit +
-	 * 3 dumps + Forget, in the order the create staged them. */
+	/* The walk: exactly one transaction, 2 open + 9 data + Commit +
+	 * 3 dumps + Forget, in the order the create staged them. The
+	 * ninth data record is the $MFT $DATA size extension, staged
+	 * first so the redo extends $MFT before it initialises the new
+	 * record. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 15);
-	if (s.n == 15) {
-		static const uint16_t want_op[8] = {
+	CHECK_EQ(s.n, 16);
+	if (s.n == 16) {
+		static const uint16_t want_op[9] = {
+			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
 			LOP_CreateAttribute, LOP_CreateAttribute,
@@ -507,23 +627,23 @@ out:
 		CHECK_EQ(s.target_attr[0], 0x18u);
 		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[1], 0x40u);
-		for (i = 0; i < 8; i++) {
+		for (i = 0; i < 9; i++) {
 			CHECK_EQ(s.redo_op[i + 2], want_op[i]);
-			/* First seven target $MFT:$DATA (0x18); the
+			/* First eight target $MFT:$DATA (0x18); the
 			 * SetBits targets $MFT:$BITMAP (0x40). */
-			CHECK_EQ(s.target_attr[i + 2], i < 7 ? 0x18u : 0x40u);
+			CHECK_EQ(s.target_attr[i + 2], i < 8 ? 0x18u : 0x40u);
 		}
-		CHECK_EQ(s.redo_op[10], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[11], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[12], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[13], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[14], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[11], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[12], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
 		/* The $FILE_NAME create is the last CreateAttribute, the
 		 * record right before the index entry. */
-		lsn_fn = s.lsn[7];
-		lsn_index = s.lsn[8];
-		CHECK_EQ(s.redo_op[7], LOP_CreateAttribute);
-		CHECK_EQ(s.redo_op[8], LOP_AddIndexEntryRoot);
+		lsn_fn = s.lsn[8];
+		lsn_index = s.lsn[9];
+		CHECK_EQ(s.redo_op[8], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_AddIndexEntryRoot);
 	}
 	/* The name appears in exactly one CreateAttribute's redo: the
 	 * $FILE_NAME one, and it is the record before the index entry. */
@@ -532,9 +652,27 @@ out:
 	/* The SetBits names the new record number, one bit. */
 	CHECK_EQ(s.bits_bit, (uint32_t)ino);
 	CHECK_EQ(s.bits_count, 1u);
-	CHECK_EQ(s.bits_lsn, s.lsn[9]);
+	CHECK_EQ(s.bits_lsn, s.lsn[10]);
 	/* The SetBits targets the bitmap's first cluster. */
-	CHECK_EQ(s.target_vcn[9], 0u);
+	CHECK_EQ(s.target_vcn[10], 0u);
+	/* The $MFT $DATA size extension: exactly one record, staged
+	 * first, its redo the live size, its undo one record less. */
+	{
+		uint16_t data_off = 0;
+		uint64_t alloc = 0, data = 0;
+		uint32_t rec_size = 0;
+		CHECK_EQ(read_mft0_data_attr(snap, &data_off, &alloc, &data, &rec_size), 0);
+		CHECK_EQ(s.sizes_count, 1);
+		CHECK_EQ(s.sizes_lsn, s.lsn[2]);
+		CHECK_EQ(s.record_off[2], data_off);
+		CHECK_EQ(s.target_vcn[2], 0u);
+		CHECK_EQ(s.sizes_redo_data, data);
+		CHECK_EQ(s.sizes_undo_data, data - rec_size);
+		/* Short-form $DATA: no compressed_size field, so the
+		 * total is 0 — not the pairs bytes that live at 0x40. */
+		CHECK_EQ(s.sizes_redo_total, 0u);
+		CHECK(rec_size == 1024u);
+	}
 
 	/* Both touched records carry an MR_LSN at or past the record
 	 * that touched them: the replay's skip check. */
@@ -546,12 +684,14 @@ out:
 	CHECK(mrlsn_dir >= lsn_index);
 
 	/* Replay copy 1: the MFT records were already flushed, so only
-	 * the SetBits — which carries no LSN to skip on — redoes. */
+	 * the two records that carry no LSN to skip on redo — the $MFT
+	 * $DATA size extension and the SetBits — and the extension
+	 * writes MFT record 0. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 1u);
-	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
 	CHECK_EQ(an.clusters_written, 1u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
@@ -561,12 +701,12 @@ out:
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * single record. Replay is idempotent. */
+	 * two records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 1u);
-	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
 	CHECK_EQ(an.clusters_written, 1u);
 
 	unlink(orig);

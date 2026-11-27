@@ -474,17 +474,55 @@ control: disabling the emission fails the new test with
 `-EINVAL`, plus the count assertions that depend on the open
 records). Crash sweep after fix 1: 379 checks, 8 failures —
 cuts 22/25 now replay (were refused) but still fail `ntfsck`
-with "Failed to open inode(65)", which is fix 2. Still to do
-in step 3: fix 2 (journal the `$MFT` `$DATA` size extension
-the create performs — the step-2 note "`$MFT` extension is
-unjournaled but self-consistent" is wrong: the extension
-lands on disk, replay never restores it, and the new record
-lies beyond `$MFT`'s stated size so `ntfsck` refuses it),
-fix 3 (analysis counts a phantom active transaction when a
-close checkpoint's table dumps re-allocate the just-freed
-transaction-table entry — benign for state, wrong
-accounting), then the crash sweep itself, which lands when
-it goes green.
+with "Failed to open inode(65)", which is fix 2. Fix 2, landed 2026-11-27 (commit, this round): the create
+transaction now journals the `$MFT` `$DATA` size extension as a
+`SetNewAttributeSizes` record, staged first so the redo extends
+`$MFT` before it initialises the new record, plus an
+`UpdateMappingPairs` record when the runs change (once per 16
+records of growth) and the same sizes record for `$MFT:$BITMAP`
+when its sizes grow (every 8 records). New builders
+`ntfs_log_txn_set_attr_sizes` /
+`ntfs_log_txn_update_mapping_pairs` in
+`core/logfile/logfile_write.c`; `ntfs_journal_create_begin`
+snapshots record 0's `$DATA` and `$BITMAP` before the allocation
+and `ntfs_journal_create_mft_sizes` stages after it
+(`core/vfs/journal.c`, `core/vfs/namei.c`); a snapshot failure or
+an unreadable/moved attribute aborts to unjournaled, never fails
+the create. The sizes record is idempotent (absolute sizes) and
+the replay apply stamps record 0's `MR_LSN` itself, so record 0
+needs no commit-time stamp. The sweep exposed a second bug in
+the same work: for a short-form attribute (the `$MFT` `$DATA` is
+one — pairs at 0x40, length exactly 0x48) offset 0x40 IS the
+mapping pairs, not a `compressed_size` field, so logging the
+pairs bytes as the record's total and writing them back on
+replay clobbers the pairs whenever they change. Fixed in three
+places — the snapshot and the staging comparison in
+`core/vfs/journal.c` now read the total from `compressed_size`
+only when the pairs start after it (`pairs_off >= 0x48`, else 0),
+and the replay apply in `core/logfile/logfile_replay.c` writes
+`NAS_TOTAL` only on the same condition (the old length-only
+check was true for every short-form attribute). Without the
+snapshot side the staging comparison disagreed with the snapshot
+and staged a spurious `$BITMAP` sizes record on every create. A
+journaled create is now 16 records (was 15). New unit test
+`test_journal_create_mft_sizes` (logfile suite 4977 checks, 0
+failures): pairs + sizes replay to a grown `$DATA` with the pairs
+intact, second replay redoes nothing; negative control (disabling
+the replay fix) fails the pairs check and the second replay then
+fails `-EINVAL` on the undecodable pairs. Driver test
+`test_journal.c` updated to 16 records with sizes assertions (95
+checks, 0 failures), including that the logged total is 0, not
+the pairs bytes. Crash sweep after fix 2: 379 checks, 2 failures
+— only cut 46 remains (see below). Still to do in step 3: fix 3
+(analysis counts a phantom active transaction when a close
+checkpoint's table dumps re-allocate the just-freed
+transaction-table entry — benign for state, wrong accounting),
+fix 4 (cut 46: the unmount clears the dirty flag in `$MFT`
+record 3 and its mirror sync is a separate bio, so a crash
+between them leaves `$MFTMirr` stale by one flag bit and the
+replay never heals it — the replay must sync the mirror for
+records 0–3 it did not itself touch), then the crash sweep
+itself, which lands when it goes green.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

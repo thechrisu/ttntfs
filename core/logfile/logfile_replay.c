@@ -1162,7 +1162,11 @@ static int do_action(struct replay *r, uint32_t target_attr, const struct action
 			lf_put64(attr + AT_ALLOCATED_SIZE, lf_get64(data + NAS_ALLOC));
 			lf_put64(attr + AT_DATA_SIZE, lf_get64(data + NAS_DATA));
 			lf_put64(attr + AT_INITIALIZED_SIZE, lf_get64(data + NAS_VALID));
-			if (dlen >= NAS_SIZE && lf_get32(attr + AT_LENGTH) >= AT_NONRESIDENT_EX_SIZE)
+			/* compressed_size exists only when the mapping pairs
+			 * start after it. A short-form attribute is exactly
+			 * 0x48 long with its pairs at 0x40, so the length
+			 * check alone would write the total over the pairs. */
+			if (dlen >= NAS_SIZE && lf_get16(attr + AT_MAPPING_PAIRS_OFFSET) >= AT_NONRESIDENT_EX_SIZE)
 				lf_put64(attr + AT_COMPRESSED_SIZE, lf_get64(data + NAS_TOTAL));
 			break;
 		case LOP_AddIndexEntryRoot: {

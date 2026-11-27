@@ -3211,6 +3211,126 @@ static void test_journal_create_commit(void)
 	free(buf);
 }
 
+/* A SetNewAttributeSizes + UpdateMappingPairs pair replays to a grown
+ * $DATA, and the sizes record must not clobber the pairs: the $DATA
+ * attribute is short-form (pairs at 0x40, length exactly 0x48), so
+ * its offset 0x40 is the pairs, not a compressed_size field — any
+ * value written there, even the zero total a short-form attribute
+ * carries, would zero the pairs header. */
+static void test_journal_create_mft_sizes(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct rec_seen s;
+	uint64_t first_lsn;
+	uint8_t got[VRS];
+	int err;
+
+	printf("test_journal_create_mft_sizes\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	{
+		static const uint8_t old_pairs[7] = { 0x41, 16, 16, 0, 0, 0, 0 };
+		static const uint8_t new_pairs[7] = { 0x41, 17, 16, 0, 0, 0, 0 };
+		/* Pairs first, then sizes — the order the create path
+		 * stages them, so the redo extends the runs before it
+		 * grows the sizes. Record 0's $DATA is at 0x38, its
+		 * pairs at AT_NONRESIDENT_SIZE (0x40). */
+		CHECK_EQ(ntfs_log_txn_update_mapping_pairs(t, 0x18, 0, 0,
+							     MFT_LCN, 0x38,
+							     AT_NONRESIDENT_SIZE,
+							     new_pairs, 7,
+							     old_pairs, 7), 0);
+		/* Short-form: no compressed_size field, total is 0. */
+		CHECK_EQ(ntfs_log_txn_set_attr_sizes(t, 0x18, 0, 0, MFT_LCN,
+						      0x38,
+						      17 * VCS, 66560, 66560, 0,
+						      16 * VCS, 65536, 65536, 0), 0);
+	}
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	/* Walk from the first record: 1 open + 2 data + Commit +
+	 * 3 table dumps + Forget. Only $MFT:$DATA is touched, so
+	 * there is a single open record. */
+	log = open_log(&m, &io);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
+	CHECK_EQ(s.n, 8);
+	if (s.n == 8) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.redo_op[2], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.record_off[1], 0x38u);
+		CHECK_EQ(s.record_off[2], 0x38u);
+	}
+	ntfs_logfile_close(log);
+
+	/* Dry run: exactly the 2 records redo. */
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	CHECK_EQ(res.records_redone, 2);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Real run: record 0 written, no clusters. */
+	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 2);
+	CHECK_EQ(res.mft_records_written, 1);
+	CHECK_EQ(res.clusters_written, 0);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Record 0: $DATA grown to 17 clusters, pairs intact. */
+	{
+		static const uint8_t new_pairs[7] = { 0x41, 17, 16, 0, 0, 0, 0 };
+		uint8_t *a;
+		CHECK_EQ(v_read_mft(&v, 0, got), 0);
+		CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+		lf_put16(got + MR_FIXUP_OFFSET_3, 0x0001);
+		a = got + 0x38;
+		CHECK_EQ(lf_get32(a + AT_TYPE), (uint32_t)ATTR_TYPE_DATA);
+		CHECK_EQ(lf_get64(a + AT_ALLOCATED_SIZE), (uint64_t)17 * VCS);
+		CHECK_EQ(lf_get64(a + AT_DATA_SIZE), (uint64_t)66560);
+		CHECK_EQ(lf_get64(a + AT_INITIALIZED_SIZE), (uint64_t)66560);
+		CHECK_EQ(lf_get64(a + AT_HIGHEST_VCN), (uint64_t)16);
+		CHECK(memcmp(a + AT_NONRESIDENT_SIZE, new_pairs, 7) == 0);
+	}
+
+	/* Second replay: record 0 already carries the sizes record's
+	 * LSN, so both records are skipped and nothing is rewritten. */
+	err = ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res);
+	CHECK_EQ(err, 0);
+	CHECK_EQ(res.records_redone, 0);
+	CHECK_EQ(res.mft_records_written, 0);
+	CHECK_EQ(res.clusters_written, 0);
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
 /* Abort writes nothing: the volume is byte-identical and replay sees no
  * transaction at all. */
 static void test_journal_create_abort(void)
@@ -3625,6 +3745,7 @@ int main(void)
 	test_writer_wrap_readback();
 	test_writer_clean_close();
 	test_journal_create_commit();
+	test_journal_create_mft_sizes();
 	test_journal_create_abort();
 	test_journal_create_uncommitted();
 	test_journal_create_first_txn_uncommitted();

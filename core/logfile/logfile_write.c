@@ -1308,6 +1308,61 @@ int ntfs_log_txn_set_bitmap(ntfs_log_txn_t *t, uint32_t bitmap_attr,
 		       &page_lcn, br, BR_SIZE, br, BR_SIZE);
 }
 
+/*
+ * SetNewAttributeSizes: the attribute at @record_off in the MFT record
+ * at @target_vcn takes the new sizes on redo and the old sizes on undo.
+ * The payload is always NAS_SIZE (32) bytes: the three sizes plus the
+ * compressed size at NAS_TOTAL, which the replay applies only when the
+ * attribute is long enough to carry it (AT_NONRESIDENT_EX_SIZE).
+ * The target is the $MFT:$DATA open attribute — the record is addressed
+ * through $MFT:$DATA's runs, whatever attribute inside record 0 the
+ * sizes belong to (see ntfs_journal_create_mft_sizes).
+ */
+int ntfs_log_txn_set_attr_sizes(ntfs_log_txn_t *t, uint32_t mft_attr,
+				uint64_t target_vcn, uint16_t cluster_off,
+				uint64_t page_lcn, uint16_t record_off,
+				uint64_t new_alloc, uint64_t new_valid,
+				uint64_t new_data, uint64_t new_total,
+				uint64_t old_alloc, uint64_t old_valid,
+				uint64_t old_data, uint64_t old_total)
+{
+	uint8_t redo[NAS_SIZE], undo[NAS_SIZE];
+
+	lf_put64(redo + NAS_ALLOC, new_alloc);
+	lf_put64(redo + NAS_VALID, new_valid);
+	lf_put64(redo + NAS_DATA, new_data);
+	lf_put64(redo + NAS_TOTAL, new_total);
+	lf_put64(undo + NAS_ALLOC, old_alloc);
+	lf_put64(undo + NAS_VALID, old_valid);
+	lf_put64(undo + NAS_DATA, old_data);
+	lf_put64(undo + NAS_TOTAL, old_total);
+	return txn_add(t, LOP_SetNewAttributeSizes, LOP_SetNewAttributeSizes,
+		       mft_attr, 1, record_off, 0, cluster_off, target_vcn,
+		       &page_lcn, redo, NAS_SIZE, undo, NAS_SIZE);
+}
+
+/*
+ * UpdateMappingPairs: the mapping pairs of the attribute at
+ * @record_off in the MFT record at @target_vcn are replaced wholesale
+ * — @new_pairs at @attr_off on redo, @old_pairs on undo. The pairs
+ * are the attribute's full run list, not a delta; the replay
+ * recomputes highest_vcn from them.
+ */
+int ntfs_log_txn_update_mapping_pairs(ntfs_log_txn_t *t, uint32_t mft_attr,
+				      uint64_t target_vcn, uint16_t cluster_off,
+				      uint64_t page_lcn, uint16_t record_off,
+				      uint16_t attr_off,
+				      const void *new_pairs, uint16_t new_len,
+				      const void *old_pairs, uint16_t old_len)
+{
+	if (!new_pairs || !new_len || !old_pairs || !old_len)
+		return -EINVAL;
+	return txn_add(t, LOP_UpdateMappingPairs, LOP_UpdateMappingPairs,
+		       mft_attr, 1, record_off, attr_off, cluster_off,
+		       target_vcn, &page_lcn, new_pairs, new_len,
+		       old_pairs, old_len);
+}
+
 /* Append one staged record; update the transaction-table entry. */
 static int txn_append_one(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len,
 			  uint64_t *lsn_out)
