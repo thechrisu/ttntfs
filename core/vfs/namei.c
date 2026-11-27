@@ -363,9 +363,9 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	 * and insert_inode_hash) and before the directory is marked
 	 * dirty. A begin failure is not a create failure — the driver
 	 * created unjournaled for years — so warn and proceed
-	 * unjournaled. Symlinks, devices and other non-regular,
-	 * non-directory files never begin (jt stays NULL); regular
-	 * files and directories do (Phase 3 mkdir).
+	 * unjournaled. Regular files, directories, symlinks and device
+	 * nodes begin (Phase 3 mkdir, symlink, reparse); anything else
+	 * never begins (jt stays NULL).
 	 */
 	err = ntfs_journal_create_begin(vol, mode, &jt);
 	if (err)
@@ -654,6 +654,19 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 			err = ntfs_reparse_set_wsl_not_symlink(ni, mode);
 			if (!err)
 				rollback_reparse = true;
+			/*
+			 * PORT: journal the device reparse
+			 * (docs/JOURNAL-DESIGN.md Phase 3 reparse, mknod
+			 * half): the $REPARSE_POINT, its $R index entry
+			 * and the $SI flags, staged the same way as the
+			 * symlink branch above — create_reparse reads the
+			 * tag from ni->reparse_tag, which the reparse set
+			 * just populated, and the $SI flags from ni->flags.
+			 */
+			if (!err) {
+				err = journal_stage(jt ? ntfs_journal_create_reparse(jt, vol, ni, ni_mrec) : 0,
+						    &jt);
+			}
 		}
 		if (err)
 			goto err_out;

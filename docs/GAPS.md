@@ -1138,11 +1138,35 @@ commit (this round): one cut-point sweep in core/tests/test_crash.c
 0 still bad after it; link all-old 13 times, all-new 33 times; per
 cut the $R entry count agrees with the link (1 when present, 0 when
 gone). Evidence: `test_crash` 8012 checks, 0 failures (was 7641).
-The sweep found no bug. Follow-ups, not this class: the mknod half (device
-creation still never begins — its reparse staging is the next commit
-of this class); no VFS operation sets reparse data on an existing
-file, so there is no standalone reparse-set class to journal.
-Next: the reparse class, mknod half, then the reparse crash tests.
+The sweep found no bug. Phase 3, reparse (mknod half) — glue landed
+2026-11-27 (commit, this round): creating a device node is now one
+journaled transaction. `ntfs_journal_create_begin` begins for
+S_ISBLK/S_ISCHR/S_ISSOCK/S_ISFIFO, and the device branch of
+`__ntfs_create` stages `ntfs_journal_create_reparse` right after
+`ntfs_reparse_set_wsl_not_symlink` — the same three records as the
+symlink branch ($REPARSE_POINT, the $R entry, the $SI flags). It
+works as-is because the reparse set populates `ni->reparse_tag`
+(through `ntfs_set_ntfs_reparse_data`) and `ni->flags` gains
+FILE_ATTR_REPARSE_POINT there; the $SI staging reads old from the
+mapped record (FILE_ATTR_SYSTEM, the device branch's RECALL_ON_OPEN
+write goes to the $SI copy, not the record) and new from `ni->flags`
+(RECALL_ON_OPEN|REPARSE_POINT). The commit path is mode-agnostic
+(commit + MR_LSN stamps into the file, the parent and $Reparse),
+and a device create already staged $DATA, $EA and $FILE_NAME, so
+begin + the one staging call close the class. Evidence:
+`test_journal.c` 1575 checks, 0 failures (was 1480; new
+test_mknod_journaled: walk 19 records — 2 opens + 12 data ($MFT
+$DATA sizes, Initialize, $SD, $DATA, $REPARSE_POINT, $R entry, $SI
+flags, $EA_INFORMATION, $EA, $FILE_NAME, $I30 entry, SetBits) +
+Commit + 3 dumps + Forget; $SI redo 0x40400 undo 0x4; MR_LSN
+stamped into the file, the parent and $Reparse; replay redoes 2;
+device reads back S_IFCHR|0644 with REPARSE_POINT and RECALL_ON_OPEN
+on its $SI, tag 0x80000025 and $R count 1; second replay redoes 2
+and the $R entry is still exactly one; `ntfsck` clean). Crash tests
+in the follow-up commit (this round). Follow-ups, not this class:
+no VFS operation sets reparse data on an existing file, so there is
+no standalone reparse-set class to journal.
+Next: the reparse crash tests, then the compressed-write class.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

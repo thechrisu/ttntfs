@@ -247,12 +247,16 @@ int ntfs_journal_create_begin(struct ntfs_volume *vol, mode_t mode,
 	 * staged in __ntfs_create, next to the $DATA staging for files).
 	 * Phase 3 symlink: symlinks begin too (their $REPARSE_POINT,
 	 * $R index entry and $SI flags are staged in __ntfs_create,
-	 * next to the $DATA/$INDEX_ROOT staging). Devices and other
-	 * non-regular, non-directory, non-symlink files never begin —
-	 * their reparse staging belongs to their own classes, and a
-	 * transaction that cannot describe them would abort anyway. */
+	 * next to the $DATA/$INDEX_ROOT staging). Phase 3 reparse,
+	 * mknod half: device nodes begin too — their $REPARSE_POINT,
+	 * $R index entry and $SI flags are staged the same way, in
+	 * the device branch of __ntfs_create. Anything else never
+	 * begins: a transaction that cannot describe it would abort
+	 * anyway. */
 	if (!vol->log_writer || (!S_ISREG(mode) && !S_ISDIR(mode) &&
-				 !S_ISLNK(mode)))
+				 !S_ISLNK(mode) && !S_ISBLK(mode) &&
+				 !S_ISCHR(mode) && !S_ISSOCK(mode) &&
+				 !S_ISFIFO(mode)))
 		return 0;
 	jt = kmalloc(sizeof(*jt), GFP_NOFS);
 	if (!jt)

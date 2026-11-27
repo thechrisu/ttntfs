@@ -5621,6 +5621,222 @@ out:
 	unlink(snap1);
 }
 
+/* One journaled mknod in a driver-made directory: a char device
+ * "dev" (S_IFCHR|0644), tag IO_REPARSE_TAG_LX_CHR (0x80000025).
+ * The device branch of __ntfs_create stages the same three reparse
+ * records as the symlink branch — $REPARSE_POINT, $R entry, $SI
+ * flags — plus the $EA pair a symlink skips, so the walk is the
+ * file create's 16 records plus the three reparse ones. */
+static void test_mknod_journaled(void)
+{
+	char orig[1024], snap[1024], snap1[1024], snap2[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	ntfs_inode_t *ext = NULL, *rp = NULL;
+	struct rec_seen s;
+	struct ntfs_logfile_analysis an;
+	struct ntfs_attr at;
+	uint64_t ino = 0, sub_ino = 0, rp_ino = 0;
+	uint64_t mrlsn_file = 0, mrlsn_dir = 0, mrlsn_rp = 0,
+		 lsn_fn = 0, lsn_index = 0, lsn_r = 0;
+	int err, i;
+
+	printf("test_mknod_journaled\n");
+	scratch_path(orig, sizeof(orig), "mkorig");
+	scratch_path(snap, sizeof(snap), "mksnap");
+	scratch_path(snap1, sizeof(snap1), "mksnap1");
+	scratch_path(snap2, sizeof(snap2), "mksnap2");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_mknod_journaled: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	sub_ino = ntfs_inode_number(d);
+
+	err = ntfs_mknod(d, "dev", S_IFCHR | 0644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ino = ntfs_inode_number(f);
+	CHECK(ino > 16);
+	ntfs_inode_put(f);
+	f = NULL;
+	/* $Reparse's record number, for the MR_LSN and $R-entry
+	 * checks below: $Extend/$Reparse, by name. */
+	err = ntfs_lookup(root, "$Extend", &ext);
+	CHECK_EQ(err, 0);
+	if (!err) {
+		err = ntfs_lookup(ext, "$Reparse", &rp);
+		CHECK_EQ(err, 0);
+		if (!err)
+			rp_ino = ntfs_inode_number(rp);
+		ntfs_inode_put(rp);
+		rp = NULL;
+		ntfs_inode_put(ext);
+		ext = NULL;
+	}
+	CHECK(rp_ino != 0);
+	if (err) { goto out; }
+
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+
+	/* Snapshot after sync, original still mounted: flushed metadata
+	 * plus the still-dirty log — what a crash at this instant leaves. */
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk: exactly one transaction, 2 open + 12 data + Commit +
+	 * 3 dumps + Forget. The data records, in staging order: the
+	 * $MFT $DATA size extension, Initialize, $SD, $DATA,
+	 * $REPARSE_POINT, $R entry, $SI flags, $EA_INFORMATION, $EA,
+	 * $FILE_NAME, $I30 entry, SetBits. */
+	set_fn_name("dev");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
+		static const uint16_t want_op[12] = {
+			LOP_SetNewAttributeSizes,
+			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_AddIndexEntryRoot, LOP_UpdateResidentValue,
+			LOP_CreateAttribute, LOP_CreateAttribute,
+			LOP_CreateAttribute, LOP_AddIndexEntryRoot,
+			LOP_SetBitsInNonresidentBitMap,
+		};
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		for (i = 0; i < 12; i++) {
+			CHECK_EQ(s.redo_op[i + 2], want_op[i]);
+			/* First eleven target $MFT:$DATA (0x18); the
+			 * SetBits targets $MFT:$BITMAP (0x40). */
+			CHECK_EQ(s.target_attr[i + 2], i < 11 ? 0x18u : 0x40u);
+		}
+		CHECK_EQ(s.redo_op[14], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[15], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[16], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[17], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[18], LOP_ForgetTransaction);
+		/* The $R entry and the $SI flags sit between the
+		 * $REPARSE_POINT create and the $EA ones; the
+		 * $FILE_NAME create is the last CreateAttribute, the
+		 * record right before the parent index entry. */
+		lsn_r = s.lsn[7];
+		lsn_fn = s.lsn[11];
+		lsn_index = s.lsn[12];
+		CHECK_EQ(s.redo_op[11], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[12], LOP_AddIndexEntryRoot);
+	}
+	/* The name appears in exactly one CreateAttribute's redo: the
+	 * $FILE_NAME one. */
+	CHECK_EQ(s.fn_name_hits, 1);
+	CHECK_EQ(s.fn_lsn, lsn_fn);
+	/* The SetBits names the new record number, one bit. */
+	CHECK_EQ(s.bits_bit, (uint32_t)ino);
+	CHECK_EQ(s.bits_count, 1u);
+	CHECK_EQ(s.bits_lsn, s.lsn[13]);
+	CHECK_EQ(s.target_vcn[13], 0u);
+	/* The $SI flags record: the device branch set
+	 * FILE_ATTRIBUTE_RECALL_ON_OPEN (0x40000) and the reparse
+	 * set flipped FILE_ATTR_REPARSE_POINT (0x400) on, over the
+	 * as-added $SI, which carried FILE_ATTR_SYSTEM (0x4) — the
+	 * device branch overwrites the $SI copy, not the record. */
+	CHECK_EQ(s.res_redo, 0x40400u);
+	CHECK_EQ(s.res_undo, 0x4u);
+	CHECK_EQ(s.res_lsn, s.lsn[8]);
+	/* The $MFT $DATA size extension: exactly one record, staged
+	 * first, its redo the live size, its undo one record less. */
+	{
+		uint16_t data_off = 0;
+		uint64_t alloc = 0, data = 0;
+		uint32_t rec_size = 0;
+
+		CHECK_EQ(read_mft0_data_attr(snap, &data_off, &alloc, &data,
+					     &rec_size), 0);
+		CHECK_EQ(s.sizes_count, 1);
+		CHECK_EQ(s.sizes_lsn, s.lsn[2]);
+		CHECK_EQ(s.record_off[2], data_off);
+		CHECK_EQ(s.target_vcn[2], 0u);
+		CHECK_EQ(s.sizes_redo_data, data);
+		CHECK_EQ(s.sizes_undo_data, data - rec_size);
+		CHECK_EQ(s.sizes_redo_total, 0u);
+		CHECK(rec_size == 1024u);
+	}
+	/* All three touched records carry an MR_LSN at or past the
+	 * record that touched them: the replay's skip check. The
+	 * $Reparse stamp is the new one — without it the replay
+	 * would re-apply the $R entry and duplicate it. */
+	CHECK_EQ(read_mft_lsn(snap, ino, &mrlsn_file), 0);
+	CHECK(mrlsn_file != 0);
+	CHECK(mrlsn_file >= lsn_fn);
+	CHECK_EQ(read_mft_lsn(snap, sub_ino, &mrlsn_dir), 0);
+	CHECK(mrlsn_dir != 0);
+	CHECK(mrlsn_dir >= lsn_index);
+	CHECK_EQ(read_mft_lsn(snap, rp_ino, &mrlsn_rp), 0);
+	CHECK(mrlsn_rp != 0);
+	CHECK(mrlsn_rp >= lsn_r);
+
+	/* Replay copy 1: the MFT records were already flushed, so only
+	 * the two records that carry no LSN to skip on redo — the $MFT
+	 * $DATA size extension and the SetBits. */
+	CHECK_EQ(copy_file(snap, snap1), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap1, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.transactions_committed, 0u);
+	CHECK_EQ(an.transactions_active, 0u);
+
+	/* The device reads back after a remount, with its mode, the
+	 * reparse flag and RECALL_ON_OPEN on its $SI, its LX_CHR tag,
+	 * and its $R entry in place. */
+	CHECK_EQ(attr_after_mount(snap1, "sub", "dev", &at), 0);
+	CHECK_EQ(at.mode, 020644u);
+	CHECK(at.file_attributes & 0x400u);
+	CHECK(at.file_attributes & 0x40000u);
+	CHECK_EQ(at.reparse_tag, 0x80000025u);
+	CHECK_EQ(reparse_index_count_entries(snap1, rp_ino, 0x80000025u, ino), 1);
+	CHECK_EQ(run_ntfsck_clean(snap1), 0);
+
+	/* Replay copy 2: the same dirty snapshot replays to the same
+	 * two records. Replay is idempotent — and the $R entry is not
+	 * duplicated: it is still exactly one. */
+	CHECK_EQ(copy_file(snap, snap2), 0);
+	memset(&an, 0, sizeof(an));
+	CHECK_EQ(replay_path(snap2, &an), 0);
+	CHECK_EQ(an.records_redone, 2u);
+	CHECK_EQ(an.mft_records_written, 1u);
+	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(reparse_index_count_entries(snap2, rp_ino, 0x80000025u, ino), 1);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap1);
+	unlink(snap2);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -5659,6 +5875,7 @@ int main(void)
 	test_symlink_dir_journaled();
 	test_symlink_in_root_unjournaled();
 	test_unlink_reparse_journaled();
+	test_mknod_journaled();
 	printf("test_journal: %d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
