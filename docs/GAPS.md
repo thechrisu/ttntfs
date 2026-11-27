@@ -788,8 +788,8 @@ as designed. (A first stub that replaced the whole
 `journal_stage` call instead made every mkdir fail with
 -ENOENT — the abort-and-swallow lives in `journal_stage`
 itself, so a control must stub the staging call inside it.)
-Crash tests (`core/tests/test_crash.c`, this round, land as
-their own commit next): `test_journaled_mkdir_cut_points`
+Crash tests (`core/tests/test_crash.c`, this round, landed as
+their own commit): `test_journaled_mkdir_cut_points`
 (mkdir d/e, 56 cut points sampled at every write, 6
 inconsistent before replay, 0 still bad after it; d/e present
 34 times, absent 22). Whole test_crash binary: 1808 checks, 0
