@@ -40,6 +40,7 @@ while IFS= read -r f; do
 	if ! "$CLANG" --target=x86_64-apple-darwin -E -nostdinc \
 		-I "$HERE/darwin-stubs" \
 		-iquote "$ROOT/core/ntfs" \
+		-iquote "$ROOT/core/vfs" \
 		-I "$ROOT/platform/include" -I "$ROOT/core/include" \
 		-I "$ROOT/core/logfile" -I "$ROOT/tools/common" \
 		"$ROOT/$f" -o /dev/null 2>"$tmp"; then
