@@ -5631,6 +5631,591 @@ static void test_journaled_ea_remove_root_cut_points(void)
 	sweep_ea_cut_points(EA_REMOVE_ROOT);
 }
 
+/* ---- compressed-write ------------------------------------------------- */
+
+enum cwrite_op {
+	CWRITE_OVERWRITE,	/* overwrite the first 64 KiB block */
+	CWRITE_APPEND,		/* append one 64 KiB block at EOF */
+	CWRITE_TWO_BLOCK	/* overwrite 64 KiB at offset 32 KiB */
+};
+
+/* Deterministic incompressible bytes: the same LCG the journal tests
+ * use, so the setup file's blocks store raw and the overwrite's 'B'
+ * block is the only one that compresses. */
+static void cwrite_fill_random(unsigned char *p, size_t n, unsigned seed)
+{
+	unsigned s = seed | 1;
+
+	while (n--) {
+		s = s * 1103515245u + 12345u;
+		*p++ = (unsigned char)(s >> 16);
+	}
+}
+
+extern const struct xattr_handler *const ntfs_xattr_handlers[];
+
+/* Set the compressed flag on a file's $DATA, through the same
+ * system.ntfs_attrib handler a user sets it with. Not journaled:
+ * the EA class does not journal the flags path. */
+static int cwrite_set_compressed(ntfs_inode_t *h)
+{
+	uint32_t v = 0x800u; /* FILE_ATTRIBUTE_COMPRESSED */
+
+	return ntfs_xattr_handlers[0]->set(ntfs_xattr_handlers[0], NULL, NULL,
+					    (struct inode *)h,
+					    "system.ntfs_attrib",
+					    &v, sizeof(v), 0);
+}
+
+/*
+ * Base image for the compressed-write sweeps: a driver-made
+ * subdirectory "sub" holding a compressed file "j.txt" with 200 KiB
+ * of incompressible bytes (three full 64 KiB compression blocks plus
+ * an 8 KiB tail, stored raw). Setting the flag converts the file to
+ * non-resident eagerly, so the sweep's write is an ordinary
+ * non-resident compressed write, not a conversion — the conversion
+ * stays unjournaled by design and is not swept here.
+ */
+static int make_base_cwrite(const char *path)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	unsigned char *buf;
+	ssize_t w;
+	int err;
+
+	if (make_image(path) != 0)
+		return -EIO;
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) {
+		ntfs_bdev_close(dev);
+		return err;
+	}
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out;
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	if (err)
+		goto out;
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	if (err)
+		goto out;
+	err = cwrite_set_compressed(f);
+	if (err)
+		goto out;
+	buf = malloc(200 * 1024);
+	if (!buf) {
+		err = -ENOMEM;
+		goto out;
+	}
+	cwrite_fill_random(buf, 200 * 1024, 12345);
+	w = ntfs_write(f, buf, 200 * 1024, 0);
+	free(buf);
+	if (w != 200 * 1024) {
+		err = w < 0 ? (int)w : -EIO;
+		goto out;
+	}
+	err = 0;
+out:
+	if (f)
+		ntfs_inode_put(f);
+	if (d)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* One journaled compressed write of sub/j.txt with the device dying
+ * after @limit writes, counting only from the moment the volume is
+ * mounted. Returns the number of writes the operation, sync and
+ * unmount attempted. */
+static long crash_run_cwrite_journaled(const char *path, long limit,
+				       enum cwrite_op op)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	unsigned char *buf;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = limit;
+	buf = malloc(64 * 1024);
+	if (buf) {
+		if (ntfs_volume_root(vol, &root) == 0) {
+			if (ntfs_lookup(root, "sub", &d) == 0) {
+				if (ntfs_lookup(d, "j.txt", &f) == 0) {
+					switch (op) {
+					case CWRITE_OVERWRITE:
+						memset(buf, 'B', 64 * 1024);
+						ntfs_write(f, buf, 64 * 1024, 0);
+						break;
+					case CWRITE_APPEND:
+						memset(buf, 'C', 64 * 1024);
+						ntfs_write(f, buf, 64 * 1024,
+							   200u * 1024);
+						break;
+					case CWRITE_TWO_BLOCK:
+						memset(buf, 'D', 64 * 1024);
+						ntfs_write(f, buf, 64 * 1024,
+							   32u * 1024);
+						break;
+					}
+					ntfs_inode_put(f);
+				}
+				ntfs_inode_put(d);
+			}
+			ntfs_inode_put(root);
+		}
+		free(buf);
+	}
+	ntfs_volume_sync(vol);
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return write_count;
+}
+
+/* Mount @path, read sub/j.txt whole into @buf (capacity @cap) and
+ * report its size and allocated size. Returns 0 on success. */
+static int cwrite_read_after_mount(const char *path, unsigned char *buf,
+				   size_t cap, u64 *size_out, u64 *alloc_out)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct ntfs_attr at;
+	ssize_t r;
+	int err;
+
+	dev = ntfs_bdev_open_path(path, false);
+	if (!dev)
+		return -EIO;
+	err = ntfs_mount(dev, &mopts, &vol);
+	if (err) {
+		ntfs_bdev_close(dev);
+		return err;
+	}
+	err = ntfs_volume_root(vol, &root);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(root, "sub", &d);
+	if (err)
+		goto out_vol;
+	err = ntfs_lookup(d, "j.txt", &f);
+	if (err)
+		goto out_d;
+	err = ntfs_getattr(f, &at);
+	if (err)
+		goto out_f;
+	if (at.size > cap) {
+		err = -EIO;
+		goto out_f;
+	}
+	r = ntfs_read(f, buf, at.size, 0);
+	err = r == (ssize_t)at.size ? 0 : (r < 0 ? (int)r : -EIO);
+	if (!err) {
+		*size_out = at.size;
+		*alloc_out = at.alloc_size;
+	}
+out_f:
+	if (f)
+		ntfs_inode_put(f);
+out_d:
+	if (d)
+		ntfs_inode_put(d);
+	if (root)
+		ntfs_inode_put(root);
+out_vol:
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return err;
+}
+
+/* The compressed-write sweep. Same shape as the truncate sweep, but
+ * the operation is a journaled compressed write of sub/j.txt, and
+ * the verdict adds the content check the truncate sweep cannot
+ * make: the file data is not journaled, so a torn write would show
+ * up as content that is neither the old bytes nor the new ones.
+ * The writer makes that impossible by construction — a rewritten
+ * block always goes to NEW clusters, written before the old ones
+ * are punched — so after replay the content must be all-old or
+ * all-new, and it must agree with the size and the allocation:
+ * a cut that replays to the new size but reads the old bytes (or
+ * the old allocation) has replayed a half-transaction.
+ *
+ *   - overwrite: the first 64 KiB block goes from raw (16 clusters)
+ *     to one cluster of 'B's; size stays 200 KiB, alloc drops.
+ *   - append: one 'C' block at EOF; the old 8 KiB tail block is
+ *     freed and the new block takes one cluster; size 200 -> 264 KiB.
+ *   - two-block: 64 KiB of 'D's at offset 32 KiB, spanning the
+ *     boundary between blocks 0 and 1; size stays 200 KiB, both
+ *     blocks rewrite to new clusters. */
+static void sweep_cwrite_cut_points(enum cwrite_op op)
+{
+	char base[1024], work[1024];
+	const char *tag = op == CWRITE_OVERWRITE ? "cwrite-overwrite" :
+			  op == CWRITE_APPEND ? "cwrite-append" :
+						"cwrite-two-block";
+	struct geometry g;
+	long total, cut, step;
+	int n_pre_bad = 0, n_post_bad = 0, n_old = 0, n_new = 0;
+	u64 old_size = 200u * 1024u;
+	u64 new_size = op == CWRITE_APPEND ? 264u * 1024u : 200u * 1024u;
+	u64 old_alloc = 0, new_alloc = 0;
+	unsigned char *old_buf = NULL, *new_buf = NULL, *got = NULL;
+
+	scratch_path(base, sizeof(base),
+		     op == CWRITE_OVERWRITE ? "cw-base" :
+		     op == CWRITE_APPEND ? "cwa-base" : "cwt-base");
+	scratch_path(work, sizeof(work),
+		     op == CWRITE_OVERWRITE ? "cw-work" :
+		     op == CWRITE_APPEND ? "cwa-work" : "cwt-work");
+	if (make_base_cwrite(base) != 0) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"mkntfs unavailable\n", tag);
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_%s_cut_points: "
+				"ntfsck unavailable at '%s'\n", tag, ntfsck_path);
+		unlink(base);
+		return;
+	}
+	/* The uncrashed baseline must itself be clean, or every verdict below
+	 * is measuring the wrong thing. */
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+
+	/* The expected contents, both sides: the old bytes are the
+	 * 200 KiB of random seed 12345; the new bytes are the same
+	 * with the written range replaced by the fill byte. */
+	old_buf = malloc(264 * 1024);
+	new_buf = malloc(264 * 1024);
+	got = malloc(264 * 1024);
+	if (!old_buf || !new_buf || !got) {
+		FAILF("out of memory\n");
+		goto out_free;
+	}
+	cwrite_fill_random(old_buf, 264 * 1024, 12345);
+	memcpy(new_buf, old_buf, 264 * 1024);
+	switch (op) {
+	case CWRITE_OVERWRITE:
+		memset(new_buf, 'B', 64 * 1024);
+		break;
+	case CWRITE_APPEND:
+		memset(new_buf + 200 * 1024, 'C', 64 * 1024);
+		break;
+	case CWRITE_TWO_BLOCK:
+		memset(new_buf + 32 * 1024, 'D', 64 * 1024);
+		break;
+	}
+
+	/* The two allocation reference points: the base's, and the
+	 * uncrashed run's. The sweep asserts each cut lands on one
+	 * of them — never a third value, which would mean the
+	 * bitmap/pairs/sizes replayed out of step. */
+	{
+		u64 sz = 0, al = 0;
+
+		if (cwrite_read_after_mount(base, got, 264 * 1024, &sz, &al) == 0) {
+			old_alloc = al;
+			if (sz != old_size) {
+				FAILF("base j.txt is %llu bytes, not 200 KiB\n",
+				      (unsigned long long)sz);
+				goto out_free;
+			}
+		} else {
+			FAILF("could not read the base j.txt\n");
+			goto out_free;
+		}
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); goto out_free; }
+	total = crash_run_cwrite_journaled(work, LONG_MAX, op);
+	if (getenv("NTFS_CRASH_KEEP_UNCRASHED")) {
+		char kept[1024];
+
+		snprintf(kept, sizeof(kept),
+			 "%s/ttntfs-crash-keep-%s-uncrashed.img", tmpdir, tag);
+		if (copy_file(work, kept) == 0)
+			fprintf(stderr, "  kept uncrashed image at %s\n", kept);
+	}
+	if (total <= 0) {
+		FAILF("journaled compressed write made no writes\n");
+		goto out_free;
+	}
+	{
+		u64 sz = 0, al = 0;
+
+		if (cwrite_read_after_mount(work, got, 264 * 1024, &sz, &al) == 0) {
+			new_alloc = al;
+			if (sz != new_size) {
+				FAILF("uncrashed journaled compressed write "
+				      "left j.txt at %llu bytes, not %llu\n",
+				      (unsigned long long)sz,
+				      (unsigned long long)new_size);
+				goto out_free;
+			}
+			if (memcmp(got, new_buf, (size_t)new_size) != 0) {
+				FAILF("uncrashed journaled compressed write "
+				      "left the wrong content\n");
+				goto out_free;
+			}
+		} else {
+			FAILF("could not read the uncrashed j.txt\n");
+			goto out_free;
+		}
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  j.txt size/alloc/content\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- -------------------------\n");
+
+	/* Sample every write: the torn window is narrow, and a sparse
+	 * sweep can miss it entirely (the rename sweeps proved that). */
+	step = 1;
+	for (cut = 1; cut <= total; cut += step) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		u64 bad_lcn = 0, bad_ino = 0;
+		u64 sz = 0, al = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2, err_rd;
+		bool pre_bad, post_bad, is_old, is_new, side_ok;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_cwrite_journaled(work, cut, op);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_CUT");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-cut-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept crashed image "
+							"at %s\n", kept);
+			}
+		}
+
+		/* The raw crash state, before replay touches it. */
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+
+		{
+			const char *keep = getenv("NTFS_CRASH_KEEP_REPLAYED");
+
+			if (keep && atoi(keep) == cut) {
+				char kept[1024];
+
+				snprintf(kept, sizeof(kept),
+					 "%s/ttntfs-crash-keep-%s-replayed-%ld.img",
+					 tmpdir, tag, cut);
+				if (copy_file(work, kept) == 0)
+					fprintf(stderr, "  kept replayed image "
+							"at %s\n", kept);
+			}
+		}
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1);
+		if (post_bad)
+			n_post_bad++;
+
+		/* A second replay of the same image must be a no-op: the
+		 * first one marked the log clean. */
+		err_rep2 = replay_image(work, &an2);
+
+		err_rd = cwrite_read_after_mount(work, got, 264 * 1024, &sz, &al);
+		is_old = err_rd == 0 && sz == old_size && al == old_alloc &&
+			 memcmp(got, old_buf, (size_t)old_size) == 0;
+		is_new = err_rd == 0 && sz == new_size && al == new_alloc &&
+			 memcmp(got, new_buf, (size_t)new_size) == 0;
+		/* The size, the allocation and the content must all
+		 * agree on the same side: a cut that replays to the
+		 * new size but reads the old bytes has replayed a
+		 * half-transaction. */
+		side_ok = is_old || is_new;
+		if (is_old)
+			n_old++;
+		else if (is_new)
+			n_new++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %llu/%llu/%s\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], err_rd == 0 ? "yes" : "NO",
+		       (unsigned long long)sz,
+		       (unsigned long long)al,
+		       is_old ? "old" : is_new ? "new" : "MIXED");
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+				tag, cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+				tag, cut, an.message);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+				tag, cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+				tag, cut, (unsigned long long)bad_ino,
+				(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (err_rd != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: the "
+					"volume no longer mounts or j.txt is "
+					"absent after replay\n",
+				tag, cut);
+		}
+		checks++;
+		if (!err_rd && sz != old_size && sz != new_size) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: j.txt "
+					"is %llu bytes after replay — neither "
+					"the old nor the new size\n",
+				tag, cut, (unsigned long long)sz);
+		}
+		checks++;
+		if (!err_rd && al != old_alloc && al != new_alloc) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: j.txt "
+					"has %llu bytes allocated after replay "
+					"— neither the old %llu nor the new %llu\n",
+				tag, cut, (unsigned long long)al,
+				(unsigned long long)old_alloc,
+				(unsigned long long)new_alloc);
+		}
+		checks++;
+		if (!err_rd && !side_ok) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: j.txt "
+					"content is neither all-old nor all-new "
+					"after replay (size %llu, alloc %llu)\n",
+				tag, cut, (unsigned long long)sz,
+				(unsigned long long)al);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled %s cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+				tag, cut, err_rep2, an2.records_redone,
+				an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- -------------------------\n");
+	printf("  %d cut points: %d inconsistent before replay, %d still bad "
+	       "after it; j.txt all-old %d times, all-new %d times "
+	       "(old alloc %llu, new alloc %llu)\n",
+	       (int)((total + step - 1) / step), n_pre_bad, n_post_bad,
+	       n_old, n_new,
+	       (unsigned long long)old_alloc,
+	       (unsigned long long)new_alloc);
+
+	/*
+	 * The sweep has to bite before replay, or it proved nothing: if
+	 * every raw crash state was already clean, the write ordering alone
+	 * saved them all and the journal's undo/redo never ran. And after
+	 * replay nothing may remain bad — that is the per-cut verdict above,
+	 * counted here so the summary names it.
+	 */
+	checks++;
+	if (!n_pre_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: no cut point left the raw crash state "
+				"inconsistent before replay — the sweep did not "
+				"exercise the journal at all\n");
+	}
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+out_free:
+	free(old_buf);
+	free(new_buf);
+	free(got);
+	unlink(base);
+	unlink(work);
+	printf("test_journaled_%s_cut_points\n", tag);
+}
+
+static void test_journaled_cwrite_overwrite_cut_points(void)
+{
+	sweep_cwrite_cut_points(CWRITE_OVERWRITE);
+}
+
+static void test_journaled_cwrite_append_cut_points(void)
+{
+	sweep_cwrite_cut_points(CWRITE_APPEND);
+}
+
+static void test_journaled_cwrite_two_block_cut_points(void)
+{
+	sweep_cwrite_cut_points(CWRITE_TWO_BLOCK);
+}
+
 int main(void)
 {
 	tool_paths();
@@ -5662,6 +6247,9 @@ int main(void)
 	test_journaled_ea_remove_cut_points();
 	test_journaled_ea_create_root_cut_points();
 	test_journaled_ea_remove_root_cut_points();
+	test_journaled_cwrite_overwrite_cut_points();
+	test_journaled_cwrite_append_cut_points();
+	test_journaled_cwrite_two_block_cut_points();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }

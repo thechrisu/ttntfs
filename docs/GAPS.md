@@ -1223,7 +1223,21 @@ tests: overwrite one 64 KiB block — walk 39 records, replay redoes
 — walk 39, the old 8 KiB tail block frees 3 clusters, replay redoes
 7; conversion — walk 16, the create only, replay redoes 2; content
 reads back whole after replay + mount in all three; `ntfsck`
-clean). Crash tests follow in the next commit of this round.
+clean). Crash tests landed in the follow-up commit of this round
+(this commit): three cut-point sweeps in `core/tests/test_crash.c`
+— overwrite one 64 KiB block (49 cut points), append one block at
+EOF (50), overwrite two blocks crossing a boundary (50); per cut
+ntfsck + allocation coverage + replay + remount read-back + second
+replay no-op, with the size, the allocation and the content all
+required to agree on the same side. Evidence: `test_crash` 9869
+checks, 0 failures (was 8519): 149 cut points, 15 inconsistent
+before replay, 0 still bad after it; content all-old 53 times,
+all-new 96 times, never mixed; old alloc 208896 bytes in all three
+sweeps, new alloc 147456 (overwrite), 212992 (append), 151552
+(two-block). No bug found: the writer's allocate-new-before-punch
+order holds even for the two-block rewrite, whose mixed blocks go
+to new clusters. This closes the compressed-write class and §1.2
+Phase 3.
 Follow-ups, not this class: the truncate class shares the
 flags-source shape for handler-flagged sparse files (its mapped-`$SI`
 undo would clear SPARSE from the entry after a refresh); the mkdir
