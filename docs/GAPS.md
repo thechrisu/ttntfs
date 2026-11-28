@@ -1697,7 +1697,11 @@ first findings triaged.
 Done (round 4). Harness: `core/fuzz/fuzz_mount.c` (libFuzzer target +
 standalone runner; mounts the input as a temp-file image, RW with
 $LogFile replay, bounded walk), `tools/fuzz/mkseeds.c` (3 deterministic
-4 MiB seeds: basic / 512 B clusters / compressed), `tools/fuzz.sh`
+4 MiB seeds: basic / 512 B clusters / compressed) plus
+`tools/fuzz/mkdirtyseed.c` (stream E: a 4th seed, `seed-dirty-log.img`,
+built by this driver -- five journaled creates, snapshot while still
+mounted, so the $LogFile holds one checkpointed transaction and four
+uncheckpointed ones), `tools/fuzz.sh`
 (seeds / check / regression / build / run), CI workflow
 `.github/workflows/fuzz.yml` (weekly Sunday 03:00 UTC + dispatch,
 ubuntu-latest, own concurrency group `fuzz-${{ github.ref }}` so it can
@@ -1735,15 +1739,22 @@ and passes on the fixed code):
   Regression `ubsan-boot-cpr.img` (record-size byte set to -56).
 
 Evidence: plain ctest 15/15, UBSan ctest 15/15, fixture suite 265/0/0,
-`tools/fuzz.sh check` (3 seeds mount, 3 regressions fail as expected),
+`tools/fuzz.sh check` (4 seeds mount, 3 regressions fail as expected),
 `tools/fuzz.sh regression` (ASan+LSan, exit 0), 600 s fuzz run
 (9,498 exec, 43 exec/s, 352 new units, 1 UBSan finding -- the shift
 above) and a post-fix 300 s run (clean), ntfsck clean on all 3 seeds.
+Dirty-seed evidence (stream E): `seed-dirty-log.img` mounts via the
+standalone runner (replay path); its $LogFile holds 5 RCRD pages, one
+per journaled create, while the restart page from the last checkpoint
+(after the first create) records current_lsn 0x40a33 -- and the
+newest record ends at LSN 0x40c53, so four transactions lie beyond
+the checkpoint and replay must redo them. The clean seed's $LogFile
+holds 0 RCRD records (control).
 
-Follow-ups (not done): a dirty-$LogFile seed (replay only ever sees
-clean logs from the seeds) and a read-only-mount fuzz variant (the
-target mounts RW with replay, so `ntfs_fill_super()`'s own geometry
-parse is only reached after replay accepts the image).
+Follow-ups (not done): a read-only-mount fuzz variant (the target
+mounts RW with replay, so `ntfs_fill_super()`'s own geometry parse
+is only reached after replay accepts the image). The dirty-$LogFile
+seed landed with stream E (see above).
 
 ### 5.3 Upstream tracking has no automation — done 2026-11-25
 Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`

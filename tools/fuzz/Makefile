@@ -2,6 +2,7 @@
 #   make -C tools/fuzz            # builds ./mkseeds
 #   make -C tools/fuzz seeds      # generates tools/fuzz/corpus/*.img
 TOOLS   := $(abspath ..)
+ROOT    := $(abspath $(TOOLS)/..)
 LOCAL   := $(TOOLS)/.local
 CC      ?= cc
 ARCH    := $(shell uname -m)
@@ -26,11 +27,18 @@ mkseeds: mkseeds.c $(LOCAL)/lib/libntfs-3g.a
 $(LOCAL)/lib/libntfs-3g.a:
 	$(TOOLS)/build-ntfsprogs.sh
 
-seeds: mkseeds
+seeds: mkseeds dirty-seed
 	./mkseeds -o corpus --mkntfs $(LOCAL)/sbin/mkntfs --force
+
+# The dirty-log seed needs this driver, not libntfs-3g: build the
+# generator with CMake and run it (corpus/seed-dirty-log.img).
+dirty-seed:
+	cmake -S $(ROOT) -B $(ROOT)/build >/dev/null
+	cmake --build $(ROOT)/build --target mkdirtyseed
+	TMPDIR=$${TMPDIR:-/tmp} $(ROOT)/build/mkdirtyseed -o corpus/seed-dirty-log.img --mkntfs $(LOCAL)/sbin/mkntfs
 
 clean:
 	rm -f mkseeds
 	rm -rf mkseeds.dSYM
 
-.PHONY: all seeds clean
+.PHONY: all seeds dirty-seed clean

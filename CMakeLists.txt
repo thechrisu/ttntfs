@@ -332,6 +332,16 @@ if(NTFS_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
 
+  # Dirty-$LogFile seed generator (GAPS.md §5.2): mounts a fresh image
+  # with this driver, journals five creates, snapshots while mounted.
+  # It builds in the plain build dir (not the fuzz build): the seed it
+  # makes is an input to the fuzzer, not a fuzz target.
+  add_executable(mkdirtyseed tools/fuzz/mkdirtyseed.c)
+  target_link_libraries(mkdirtyseed ntfscore ntfsplatform)
+  target_include_directories(mkdirtyseed PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+
   # The libFuzzer binary itself (Clang only, -DNTFS_FUZZ=ON, own build
   # dir so the instrumentation does not leak into the library the app
   # links):
