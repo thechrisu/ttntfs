@@ -900,6 +900,7 @@ static void test_one_flush_per_sync(void)
 }
 
 static void test_quota_removal_remount_rw(void);
+static void test_sd_lookup(void);
 
 int main(void)
 {
@@ -913,6 +914,7 @@ int main(void)
 	test_boot_sector_spc_refused_early();
 	test_attrdef_too_small_refused();
 	test_quota_removal_remount_rw();
+	test_sd_lookup();
 	printf("%d checks, %d failures\n", checks, failures);
 	return failures ? 1 : 0;
 }
@@ -1033,5 +1035,104 @@ out_fc:
 		fc.ops->free(&fc);
 out_dev:
 	ntfs_bdev_close(dev);
+	unlink(scratch);
+}
+
+/* ---- $SDS lookup + cache (docs/ACL-DESIGN.md §2.3) ---------------------- */
+
+/*
+ * The volume handle behind ntfscore.h's ntfs_volume_t (core/vfs/glue.h):
+ * its first two fields are sb and the core struct ntfs_volume *.
+ * Declared here rather than including volume.h (see test_links.c for
+ * the same pattern). Only the layout of those two fields is relied on.
+ */
+struct ntfs_volume_handle_test {
+	struct super_block *sb;
+	struct ntfs_volume *vol;
+};
+
+struct ntfs_volume;
+int ntfs_sd_mode(struct ntfs_volume *vol, uint32_t security_id, bool is_dir,
+		 unsigned int *mode_out);
+void ntfs_sd_cache_stats(struct ntfs_volume *vol, unsigned long *hits,
+			 unsigned long *misses);
+
+/*
+ * $SDS lookup + per-volume cache, against a fresh mkntfs image. The
+ * image's $SDS holds two entries (confirmed 2026-11-28 by parsing
+ * tools/images/basic-4k.img directly): security_id 256, DACL SYSTEM +
+ * Administrators allow read-only (mask 0x00120089) -> 0440; 257, the
+ * same SIDs allow read+write (mask 0x0012019f) -> 0660. Owner and group
+ * are both Administrators in both SDs, so owner == group == r / rw and
+ * other == 0 (no Everyone ACE). The pinned modes below are those
+ * hand-derived values, not the parser's own output: the parser is
+ * pinned separately by test_sd's 58 checks, so this test pins the
+ * wiring (lookup finds the right entry, the cache returns it again,
+ * unknown ids fail).
+ *
+ * With the lookup stubbed to -ENODATA every ntfs_sd_mode() call here
+ * fails; with the cache keyed wrong (e.g. by security_id only and the
+ * is_dir bit dropped) the 257 directory call would return the file
+ * entry -- here the bits coincide, so that case is pinned by the
+ * stats: the second 256 lookup must be a hit, not a re-read.
+ */
+static void test_sd_lookup(void)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *handle;
+	struct ntfs_volume *vol;
+	struct ntfs_mount_options o = { .flags = NTFS_MOUNT_RDONLY,
+					 .uid = 0, .gid = 0,
+					 .fmask = 022, .dmask = 022 };
+	unsigned int mode;
+	unsigned long hits, misses;
+	int err;
+
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_sd_lookup: no fixture\n");
+		return;
+	}
+	dev = ntfs_bdev_open_path(scratch, true);
+	if (!dev) {
+		fprintf(stderr, "SKIP test_sd_lookup: bdev open failed\n");
+		goto out_unlink;
+	}
+	err = ntfs_mount(dev, &o, &handle);
+	if (err) {
+		fprintf(stderr, "SKIP test_sd_lookup: mount failed %d\n", err);
+		ntfs_bdev_close(dev);
+		goto out_unlink;
+	}
+	vol = ((struct ntfs_volume_handle_test *)handle)->vol;
+
+	/* 256: Administrators read-only -> 0440. */
+	mode = 0777;
+	CHECK(ntfs_sd_mode(vol, 256, false, &mode) == 0);
+	CHECK(mode == 0440);
+	/* A second lookup of the same id is a cache hit, same answer. */
+	ntfs_sd_cache_stats(vol, &hits, &misses);
+	CHECK(hits == 0 && misses == 1);
+	mode = 0777;
+	CHECK(ntfs_sd_mode(vol, 256, false, &mode) == 0);
+	CHECK(mode == 0440);
+	ntfs_sd_cache_stats(vol, &hits, &misses);
+	CHECK(hits == 1 && misses == 1);
+	/* 257: Administrators read+write -> 0660, for a file and for a
+	 * directory (no FILE_DELETE_CHILD here, so the same bits). */
+	mode = 0777;
+	CHECK(ntfs_sd_mode(vol, 257, false, &mode) == 0);
+	CHECK(mode == 0660);
+	mode = 0777;
+	CHECK(ntfs_sd_mode(vol, 257, true, &mode) == 0);
+	CHECK(mode == 0660);
+	/* Unknown id and id 0 are errors, never a mode. */
+	mode = 0777;
+	CHECK(ntfs_sd_mode(vol, 999999, false, &mode) != 0);
+	CHECK(mode == 0777);
+	CHECK(ntfs_sd_mode(vol, 0, false, &mode) != 0);
+
+	ntfs_unmount(handle);
+	ntfs_bdev_close(dev);
+out_unlink:
 	unlink(scratch);
 }

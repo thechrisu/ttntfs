@@ -116,7 +116,23 @@ struct ntfs_log_writer;
  * @log_txn_lock: Serializes whole transactions (begin to commit/abort).
  *   The writer's append path and tables are shared state with no
  *   internal lock; two concurrent commits would interleave appends.
+ * @sd_cache: $SDS lookup cache (docs/ACL-DESIGN.md §2.3): the computed
+ *   perm bits per (security_id, is_dir), 64 entries FIFO, guarded by
+ *   @sd_cache_lock. Only successful parses are cached; security_id 0
+ *   marks an empty slot (0 is never looked up). SDs never change
+ *   through this driver in v1, so no invalidation is needed; the write
+ *   path (design §3) must invalidate. @sd_cache_next is the next slot
+ *   to overwrite; @sd_cache_hits/@sd_cache_misses are lifetime
+ *   counters, for tests.
  */
+#define NTFS_SD_CACHE_SIZE	64
+
+struct ntfs_sd_cache_entry {
+	u32 security_id;
+	bool is_dir;
+	unsigned int perm;
+};
+
 struct ntfs_volume {
 	struct super_block *sb;
 	s64 nr_blocks;
@@ -186,6 +202,11 @@ struct ntfs_volume {
 	uint32_t log_lcn_bitmap_attr;
 	atomic_t log_txn_open;
 	struct mutex log_txn_lock;
+	struct ntfs_sd_cache_entry sd_cache[NTFS_SD_CACHE_SIZE];
+	unsigned int sd_cache_next;
+	struct mutex sd_cache_lock;
+	unsigned long sd_cache_hits;
+	unsigned long sd_cache_misses;
 };
 
 /*

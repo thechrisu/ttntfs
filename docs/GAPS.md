@@ -1522,6 +1522,21 @@ index updates, which belong to the journal line. Enabling
 `CONFIG_NTFS_FS_POSIX_ACL` is a separate WSL-interop decision, not
 part of SD mapping (FSKit never calls `get_acl`/`set_acl`).
 
+Wiring, commit 1 (2026-11-28, round 34): `$SDS` lookup + per-volume
+cache landed (`core/ntfs/security.c`: `ntfs_sd_mode()`; `struct
+sds_entry` in `core/ntfs/layout.h`, confirmed against an mkntfs image
+— two entries, ids 256/257, second copy byte-identical at +0x40000).
+The lookup reads entry by entry with `ntfs_inode_attr_pread()`
+because `ntfs_attr_readall()` caps at 64 KiB and a real `$SDS` is
+262 KiB on a fresh image; a corrupt first copy falls back to the
+second copy. The cache holds computed perm bits per
+(`security_id`, `is_dir`) — keyed by both, not by id alone, because
+`FILE_DELETE_CHILD` maps differently for directories. Pinned by
+`test_sd_lookup` in `core/tests/test_mount.c` (256 → 0440, 257 →
+0660, unknown/0 ids fail, second lookup is a cache hit). Still to
+land: the inode-load hook + `mode_of()` (commit 2), then the write
+path (v2, needs `$Secure` write machinery + new journal builders).
+
 ### 2.3 No TRIM for SSDs — open, re-examine (2026-11-26)
 Was blocked: no FSKit path to issue discards. Reopened by the
 owner's industry-leading bar — re-examine whether any FSKit path

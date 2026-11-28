@@ -9,10 +9,13 @@
  */
 
 #include <linux/fs.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 
 #include "layout.h"
 #include "security.h"
+#include "volume.h"
+#include "inode.h"
 
 /* ---- SIDs --------------------------------------------------------------- */
 
@@ -310,4 +313,188 @@ next:
 
 	*mode_out = (owner << 6) | (group << 3) | other;
 	return 0;
+}
+
+/* ---- $SDS lookup + per-volume cache (docs/ACL-DESIGN.md §2.3) ---------- */
+
+/*
+ * $SDS is the named $DATA stream of $Secure. Its name in the same idiom
+ * as I30 in dir.c. Note ntfs_attr_readall() cannot read it: its 64 KiB
+ * cap is below a real $SDS (262 KiB on a fresh mkntfs image, two copies
+ * of a handful of entries), so the lookup reads entry by entry with
+ * ntfs_inode_attr_pread() instead.
+ */
+__le16 sds_name[] = { cpu_to_le16('$'), cpu_to_le16('S'),
+		      cpu_to_le16('D'), cpu_to_le16('S'), 0 };
+
+/* The second copy of every SD lives 256 KiB into $SDS (docs/ACL-DESIGN.md
+ * §1, confirmed against an mkntfs image 2026-11-28: the first two
+ * entries reappear byte-identical at +0x40000). */
+#define NTFS_SDS_SECOND_COPY	0x40000
+
+/*
+ * Scan one copy of $SDS (at stream offset @base) for @security_id.
+ * @avi is the open $SDS attribute inode; @data_size its size.
+ *
+ * Returns 0 with a kvmalloc'd copy of the SD in *@sd_out (length
+ * *@sd_len_out), -ENODATA when the copy ends cleanly without the id
+ * (zeroed entry, or the stream ends), or -EINVAL when an entry fails
+ * validation (the caller then tries the other copy). A short pread is
+ * -EIO. The caller frees *@sd_out with kvfree().
+ *
+ * Entries are 16-byte aligned and sorted by security_id; the scan is
+ * linear (v1: typical volumes hold a handful of distinct SDs, and the
+ * result is cached per volume -- see ntfs_sd_mode()).
+ */
+static int ntfs_sds_scan_copy(struct inode *avi, s64 data_size, loff_t base,
+			      u32 security_id, u8 **sd_out, size_t *sd_len_out)
+{
+	loff_t pos = base;
+
+	while (pos + (loff_t)sizeof(struct sds_entry) <= data_size) {
+		struct sds_entry hdr;
+		u64 step;
+		u8 *sd;
+		s64 got;
+		u32 length;
+
+		got = ntfs_inode_attr_pread(avi, pos, sizeof(hdr), (u8 *)&hdr);
+		if (got != (s64)sizeof(hdr))
+			return got < 0 ? (int)got : -EIO;
+		/* A zeroed entry is the end of the entries in this copy. */
+		if (!hdr.hash && !hdr.security_id && !hdr.offset && !hdr.length)
+			return -ENODATA;
+		length = le32_to_cpu(hdr.length);
+		if (length < sizeof(hdr) ||
+		    pos + (loff_t)length > data_size ||
+		    le64_to_cpu(hdr.offset) != (u64)pos)
+			return -EINVAL;
+		if (le32_to_cpu(hdr.security_id) != security_id) {
+			/* 64-bit step: a u32 (length + 15) could wrap to 0
+			 * for a crafted length and spin this loop forever. */
+			step = ((u64)length + 15) & ~15ULL;
+			pos += (loff_t)step;
+			continue;
+		}
+		sd = kvmalloc(length - sizeof(hdr), GFP_NOFS);
+		if (!sd)
+			return -ENOMEM;
+		got = ntfs_inode_attr_pread(avi, pos + (loff_t)sizeof(hdr),
+					    length - sizeof(hdr), sd);
+		if (got != (s64)(length - sizeof(hdr))) {
+			kvfree(sd);
+			return got < 0 ? (int)got : -EIO;
+		}
+		*sd_out = sd;
+		*sd_len_out = length - sizeof(hdr);
+		return 0;
+	}
+	return -ENODATA;
+}
+
+/*
+ * Find the SD for @security_id in $Secure:$SDS. Tries the first copy,
+ * then the second copy at +256 KiB when the first is corrupt or does
+ * not hold the id (a torn first copy can zero the entry). Returns 0
+ * with a kvmalloc'd SD in *@sd_out, or a negative errno; the caller
+ * frees *@sd_out with kvfree().
+ */
+static int ntfs_sds_lookup(struct ntfs_volume *vol, u32 security_id,
+			   u8 **sd_out, size_t *sd_len_out)
+{
+	struct inode *avi;
+	s64 data_size;
+	int err;
+
+	if (!vol->secure_ino)
+		return -ENODEV;
+	avi = ntfs_attr_iget(vol->secure_ino, AT_DATA, sds_name, 4);
+	if (IS_ERR(avi))
+		return PTR_ERR(avi);
+	data_size = NTFS_I(avi)->data_size;
+	err = ntfs_sds_scan_copy(avi, data_size, 0, security_id,
+				 sd_out, sd_len_out);
+	if (err == -EINVAL || err == -ENODATA) {
+		if (data_size > NTFS_SDS_SECOND_COPY +
+		    (s64)sizeof(struct sds_entry)) {
+			int err2 = ntfs_sds_scan_copy(avi, data_size,
+						      NTFS_SDS_SECOND_COPY,
+						      security_id,
+						      sd_out, sd_len_out);
+			if (!err2)
+				err = 0;
+			else if (err == -ENODATA && err2 == -EINVAL)
+				err = err2;
+		}
+	}
+	iput(avi);
+	return err;
+}
+
+int ntfs_sd_mode(struct ntfs_volume *vol, u32 security_id, bool is_dir,
+		 unsigned int *mode_out)
+{
+	unsigned int mode;
+	u8 *sd;
+	size_t sd_len;
+	int err, i;
+
+	if (!vol || !mode_out)
+		return -EINVAL;
+	if (!security_id)
+		return -ENODATA;
+
+	mutex_lock(&vol->sd_cache_lock);
+	for (i = 0; i < NTFS_SD_CACHE_SIZE; i++) {
+		if (vol->sd_cache[i].security_id == security_id &&
+		    vol->sd_cache[i].is_dir == is_dir) {
+			*mode_out = vol->sd_cache[i].perm;
+			vol->sd_cache_hits++;
+			mutex_unlock(&vol->sd_cache_lock);
+			return 0;
+		}
+	}
+	vol->sd_cache_misses++;
+	mutex_unlock(&vol->sd_cache_lock);
+
+	err = ntfs_sds_lookup(vol, security_id, &sd, &sd_len);
+	if (err)
+		return err;
+	err = ntfs_sd_dacl_mode(sd, sd_len, is_dir, &mode);
+	kvfree(sd);
+	if (err)
+		return err;
+
+	mutex_lock(&vol->sd_cache_lock);
+	/* Another load may have inserted this id while the $SDS read was
+	 * in flight; re-check under the lock instead of duplicating it. */
+	for (i = 0; i < NTFS_SD_CACHE_SIZE; i++) {
+		if (vol->sd_cache[i].security_id == security_id &&
+		    vol->sd_cache[i].is_dir == is_dir) {
+			*mode_out = vol->sd_cache[i].perm;
+			mutex_unlock(&vol->sd_cache_lock);
+			return 0;
+		}
+	}
+	i = vol->sd_cache_next;
+	vol->sd_cache[i].security_id = security_id;
+	vol->sd_cache[i].is_dir = is_dir;
+	vol->sd_cache[i].perm = mode;
+	vol->sd_cache_next = (i + 1) % NTFS_SD_CACHE_SIZE;
+	mutex_unlock(&vol->sd_cache_lock);
+	*mode_out = mode;
+	return 0;
+}
+
+void ntfs_sd_cache_stats(struct ntfs_volume *vol, unsigned long *hits,
+			 unsigned long *misses)
+{
+	if (!vol)
+		return;
+	mutex_lock(&vol->sd_cache_lock);
+	if (hits)
+		*hits = vol->sd_cache_hits;
+	if (misses)
+		*misses = vol->sd_cache_misses;
+	mutex_unlock(&vol->sd_cache_lock);
 }

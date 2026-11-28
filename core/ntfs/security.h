@@ -34,4 +34,31 @@
 int ntfs_sd_dacl_mode(const void *sd, size_t len, bool is_dir,
 		      unsigned int *mode_out);
 
+/*
+ * ntfs_sd_mode - the SD for a security_id, mapped to Unix mode bits.
+ *
+ * Looks the descriptor up in $Secure:$SDS (linear scan; the stream is
+ * small and the result is cached per volume), parses it with
+ * ntfs_sd_dacl_mode(), and returns the perm bits (0000-0777, no type
+ * bits) in @mode_out. @is_dir selects the directory mapping
+ * (FILE_DELETE_CHILD grants write on directories only).
+ *
+ * Returns 0, or a negative errno, all of which mean "fall back to
+ * today's behaviour" for the caller, never "fail the inode load":
+ *   -ENODATA  no $Secure, no $SDS, or no entry for @security_id
+ *             (including @security_id 0: no SD assigned).
+ *   -EINVAL   the $SDS entry or the SD fails validation.
+ *   -EIO / -ENOMEM  the $SDS read itself failed.
+ * Only successful parses are cached, so a failure re-reads $SDS on
+ * the next load of the same id; that keeps a corrupt $SDS visible
+ * instead of cached as "no mode".
+ */
+struct ntfs_volume;
+int ntfs_sd_mode(struct ntfs_volume *vol, u32 security_id, bool is_dir,
+		 unsigned int *mode_out);
+
+/* Cache observability for tests: lifetime hits/misses of ntfs_sd_mode(). */
+void ntfs_sd_cache_stats(struct ntfs_volume *vol, unsigned long *hits,
+			 unsigned long *misses);
+
 #endif /* NTFS_SECURITY_H */

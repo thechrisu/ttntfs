@@ -2761,6 +2761,10 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	 * make_rw attaches one; the gate starts closed (0 open txns). */
 	mutex_init(&vol->log_txn_lock);
 	atomic_set(&vol->log_txn_open, 0);
+	/* $SDS lookup cache (docs/ACL-DESIGN.md §2.3): the array starts
+	 * zeroed (security_id 0 marks an empty slot); only the lock needs
+	 * initialising. */
+	mutex_init(&vol->sd_cache_lock);
 
 	fc->s_fs_info = vol;
 	fc->ops = &ntfs_context_ops;

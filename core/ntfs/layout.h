@@ -1755,6 +1755,29 @@ struct sdh_index_key {
 } __packed;
 
 /*
+ * struct sds_entry - One entry in the $Secure:$SDS data attribute.
+ *
+ * Each unique security descriptor is stored once in $SDS, in entries
+ * sorted by ascending security_id and padded to a 16-byte boundary.
+ * The whole stream is stored twice: the second copy starts 256 KiB in
+ * (+0x40000). Layout confirmed against an mkntfs image 2026-11-28
+ * (tools/images/basic-4k.img: entries 256/257, length 124 padded to
+ * 128, offset equal to the entry position, second copy byte-identical
+ * at +0x40000).
+ *
+ * @hash:        32-bit hash of the security descriptor.
+ * @security_id: 32-bit security identifier (the $SI security_id).
+ * @offset:      Offset of this entry within the $SDS stream.
+ * @length:      Length of this entry, including this header.
+ */
+struct sds_entry {
+	__le32 hash;
+	__le32 security_id;
+	__le64 offset;
+	__le32 length;
+} __packed;
+
+/*
  * enum - NTFS volume flags (16-bit)
  *
  * These flags are stored in $VolumeInformation attribute.
