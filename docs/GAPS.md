@@ -1596,6 +1596,16 @@ constraint: random-write work touches the write path, so §1.3 gates
 it and every change needs torn-write / power-loss evidence, not
 just a faster number.
 
+Baseline measured 2026-11-27 on the shared Linux VM (ranges across
+runs, contention-dominated; never macOS numbers) — see
+[PERF-BASELINE.md](../docs/PERF-BASELINE.md): sequential write
+62.5–111.3 MiB/s, sequential read 183–1152.6 MiB/s, random 4 KiB
+write 8959–20483 IOPS, warm random read 19k–258k IOPS. Headline: the
+flush dominates random-write cost — 2000 writes in 1.2 ms + fsync
+95.1 ms (99% of the pass). Harness: `tools/perf-bench.sh` (drives
+`ntfscli bench`); rerun before any §3.2 tuning and compare against
+this baseline.
+
 ## 4. macOS integration
 
 ### 4.1 Disk Utility shows volumes as "Unknown" — blocked (needs Apple)

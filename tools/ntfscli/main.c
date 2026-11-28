@@ -22,7 +22,8 @@
  *   sync                        ntfs_volume_sync()
  *   verify MANIFEST [--no-data] [--no-times]
  *                               compare the whole volume with a mkfixtures manifest
- *   bench [--size MiB] [--files N] [--dir PATH]
+ *   bench [--size MiB] [--files N] [--randops N] [--dir PATH]
+ *   randread PATH [--ops N] [--label TEXT]   (random 4 KiB reads, fresh process)
  *                               sequential write/read + create/stat/unlink
  *
  * Global options: --ro --case-sensitive --allow-illegal --show-system
@@ -147,7 +148,8 @@ static int usage(const char *why)
 		"          mv OLD NEW | ln [-s] EXISTING|TARGET NEW | truncate PATH SIZE |\n"
 		"          xattr list|get|set|rm PATH [NAME] [VALUE|@FILE] | sync |\n"
 		"          verify MANIFEST [--no-data] [--no-times] |\n"
-		"          bench [--size MiB] [--files N] [--dir PATH]\n"
+		"          bench [--size MiB] [--files N] [--randops N] [--dir PATH] |\n"
+		"          randread PATH [--ops N]\n"
 		"core: %s\n", NTFSCLI_CORE);
 	return 2;
 }
@@ -1071,14 +1073,76 @@ static double now_s(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+/* Deterministic 4 KiB random-access passes. The LCG state is reset per pass
+ * so the write and read passes visit the same offsets in the same order.
+ * Each prints its own result line; returns 0 or a negative errno. */
+static uint64_t rand_off(uint64_t *state, uint64_t nblocks)
+{
+	*state = *state * 6364136223846793005ull + 1442695040888963407ull;
+	return (*state >> 33) % nblocks * 4096;
+}
+
+static int randwrite_pass(ntfs_inode_t *ni, uint8_t *buf, uint64_t nblocks, int ops)
+{
+	uint64_t state = 0x9e3779b97f4a7c15ull;
+	int err = 0;
+	double t0 = now_s();
+	for (int i = 0; i < ops && !err; i++) {
+		uint64_t off = rand_off(&state, nblocks);
+		ssize_t w = ntfs_write(ni, buf, 4096, off);
+		if (w != 4096)
+			err = w < 0 ? (int)w : -EIO;
+	}
+	double t1 = now_s();
+	double wr_t = t1 - t0;
+	double fs_t = 0;
+	if (!err) {
+		t0 = now_s();
+		err = ntfs_fsync(ni, false);
+		t1 = now_s();
+		fs_t = t1 - t0;
+	}
+	if (err)
+		return fail(err, "random write");
+	printf("rand write 4 KiB x %d: %8.0f IOPS (writes %.1f ms, fsync %.1f ms)\n",
+	       ops, ops / wr_t, wr_t * 1e3, fs_t * 1e3);
+	return 0;
+}
+
+static int randread_pass(ntfs_inode_t *ni, uint8_t *buf, uint64_t nblocks, int ops,
+			 const char *label)
+{
+	uint64_t state = 0x9e3779b97f4a7c15ull;
+	uint64_t cksum = 0;
+	int err = 0;
+	double t0 = now_s();
+	for (int i = 0; i < ops && !err; i++) {
+		uint64_t off = rand_off(&state, nblocks);
+		ssize_t r = ntfs_read(ni, buf, 4096, off);
+		if (r != 4096)
+			err = r < 0 ? (int)r : -EIO;
+		else
+			for (int j = 0; j < 4096; j += 1024)
+				cksum += buf[j];
+	}
+	double t1 = now_s();
+	if (err)
+		return fail(err, "random read");
+	printf("rand read  4 KiB x %d (%s): %8.0f IOPS (cksum %" PRIu64 ")\n",
+	       ops, label, ops / (t1 - t0), cksum);
+	return 0;
+}
+
 static int cmd_bench(int argc, char **argv)
 {
 	uint64_t size_mib = 256;
 	int nfiles = 1000;
+	int randops = 2000;
 	const char *dirpath = "/";
 	for (int i = 0; i + 1 < argc; i++) {
 		if (!strcmp(argv[i], "--size")) size_mib = strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--files")) nfiles = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--randops")) randops = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--dir")) dirpath = argv[++i];
 	}
 	int rc = do_mount(false);
@@ -1112,14 +1176,21 @@ static int cmd_bench(int argc, char **argv)
 		if (w != (ssize_t)CHUNK)
 			err = w < 0 ? (int)w : -EIO;
 	}
-	if (!err)
-		err = ntfs_fsync(ni, false);
 	t1 = now_s();
+	double seqw_t = t1 - t0;
+	double seqfs_t = 0;
+	if (!err) {
+		t0 = now_s();
+		err = ntfs_fsync(ni, false);
+		t1 = now_s();
+		seqfs_t = t1 - t0;
+	}
 	if (err) {
 		rc = fail(err, "sequential write");
 		goto out_big;
 	}
-	printf("seq write %6" PRIu64 " MiB: %8.1f MiB/s\n", size_mib, (double)size_mib / (t1 - t0));
+	printf("seq write %6" PRIu64 " MiB: %8.1f MiB/s (writes %.2fs, fsync %.3fs)\n",
+	       size_mib, (double)size_mib / (seqw_t + seqfs_t), seqw_t, seqfs_t);
 
 	/* sequential read */
 	t0 = now_s();
@@ -1134,6 +1205,20 @@ static int cmd_bench(int argc, char **argv)
 		goto out_big;
 	}
 	printf("seq read  %6" PRIu64 " MiB: %8.1f MiB/s\n", size_mib, (double)size_mib / (t1 - t0));
+
+	/* random 4 KiB passes over the same file (warm: this process just read it) */
+	uint64_t nblocks = (size_mib << 20) / 4096;
+	err = randwrite_pass(ni, buf, nblocks, randops);
+	if (err) {
+		rc = err;
+		goto out_big;
+	}
+	err = randread_pass(ni, buf, nblocks, randops, "warm");
+	if (err) {
+		rc = err;
+		goto out_big;
+	}
+
 	ntfs_inode_put(ni);
 	ni = NULL;
 	err = ntfs_unlink(bd, "big.bin");
@@ -1229,6 +1314,64 @@ out:
 	}
 }
 
+/* randread: random 4 KiB reads over an existing file, in a fresh process.
+ * The harness drops the host page cache first, so this is the cold pass;
+ * run it twice in a row for a warm comparison. */
+static int cmd_randread(int argc, char **argv)
+{
+	int ops = 2000;
+	const char *path = NULL;
+	const char *label = "cold";
+	for (int i = 0; i < argc; i++) {
+		if (!strcmp(argv[i], "--ops") && i + 1 < argc) {
+			ops = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--label") && i + 1 < argc) {
+			label = argv[++i];
+		} else if (argv[i][0] != '-' && !path) {
+			path = argv[i];
+		}
+	}
+	if (!path)
+		return usage("randread needs PATH");
+	int rc = do_mount(true);
+	if (rc)
+		return rc;
+	ntfs_inode_t *ni = NULL;
+	int err = resolve(path, &ni);
+	if (err) {
+		rc = fail(err, "lookup %s", path);
+		goto out;
+	}
+	struct ntfs_attr a;
+	err = ntfs_getattr(ni, &a);
+	if (err) {
+		rc = fail(err, "stat %s", path);
+		goto out_ni;
+	}
+	uint8_t *buf = malloc(4096);
+	if (!buf) {
+		rc = fail(ENOMEM, "alloc");
+		goto out_ni;
+	}
+	uint64_t nblocks = a.size / 4096;
+	if (nblocks == 0) {
+		rc = fail(EINVAL, "file smaller than 4 KiB");
+		goto out_buf;
+	}
+	err = randread_pass(ni, buf, nblocks, ops, label);
+	if (err)
+		rc = err;
+out_buf:
+	free(buf);
+out_ni:
+	ntfs_inode_put(ni);
+out:
+	{
+		int urc = do_unmount();
+		return rc ? rc : urc;
+	}
+}
+
 /* ------------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
@@ -1261,7 +1404,7 @@ int main(int argc, char **argv)
 		{ "cat", cmd_cat }, { "cp-out", cmd_cp_out }, { "cp-in", cmd_cp_in },
 		{ "mkdir", cmd_simple }, { "rm", cmd_simple }, { "rmdir", cmd_simple }, { "mv", cmd_simple },
 		{ "ln", cmd_simple }, { "truncate", cmd_simple }, { "xattr", cmd_xattr }, { "sync", cmd_sync },
-		{ "verify", cmd_verify }, { "bench", cmd_bench },
+		{ "verify", cmd_verify }, { "bench", cmd_bench }, { "randread", cmd_randread },
 	};
 	for (size_t k = 0; k < sizeof(cmds) / sizeof(*cmds); k++)
 		if (!strcmp(cmds[k].name, g.cmd))
