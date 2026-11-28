@@ -3164,6 +3164,22 @@ Porting progress (one commit per item, in the order above):
   (201 s).
   0 port items remain — the port queue is done.
 
+- 2026-11-28: upstream 0.5.0 triaged (stream F, docs/UPSTREAM-TRIAGE-0.5.0.md).
+  Upstream `dr-kbadawi/ttntfs` main `92cc6267` (release 0.5.0) is 38
+  commits ahead of the merge base `f61228f` (upstream 0.4.2); the fork
+  is ahead 120 / behind 38. Verdicts over 38: **port 12,
+  companion 10, already-covered 3, needs-work 6, not-applicable 7**.
+  The 12 port items are the maintainer's own findings on top of
+  0.4.2 — full-volume handling (findings 26/27/28), allocator fixes
+  (U13/U14; U15/U16/U17 already ported 2026-11-26), hole zeroing
+  (finding 29) + allocation rollback (U20), compressed-block fixes
+  (U18/U21/U22), and mount/unmount (findings 33/34). Needs-work: the
+  Mount-Read-Write-Anyway override (a safety-policy decision — the
+  parent's call, it interacts with journal replay on dirty volumes)
+  and 5 macOS 27 enabling items (deferred to §4.3). This does not
+  move the Linux pin — the pin tracks torvalds/linux `fs/ntfs`, and
+  this delta is maintainer work, not Linux drift.
+
 - 2026-11-26: §1.3 replay atomicity proven at the engine level.
   New test `test_replay_cut_points` (core/logfile/tests/
   test_logfile.c) + a write-budget fault hook on the fake volume's
