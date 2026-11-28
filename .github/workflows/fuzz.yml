@@ -26,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: "Mutation run length in seconds (default 300)"
+        description: "Mutation run length in seconds per variant (default 600)"
         required: false
-        default: "300"
+        default: "600"
 
 concurrency:
   group: fuzz-${{ github.ref }}
@@ -62,7 +62,7 @@ jobs:
     needs: budget-guard
     if: needs.budget-guard.outputs.allow == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -101,10 +101,10 @@ jobs:
       # $LogFile replay running first. Both fail on any crash,
       # timeout, OOM, or leak.
       - name: Fuzz the parser
-        run: tools/fuzz.sh run ${{ inputs.seconds || '300' }}
+        run: tools/fuzz.sh run ${{ inputs.seconds || '600' }}
 
       - name: Fuzz the parser (read-only mount)
-        run: tools/fuzz.sh run-ro ${{ inputs.seconds || '300' }}
+        run: tools/fuzz.sh run-ro ${{ inputs.seconds || '600' }}
 
       - name: Crash artifacts
         if: failure()

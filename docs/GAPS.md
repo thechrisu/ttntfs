@@ -1761,9 +1761,26 @@ regression per-image expectations hold (leak-logfile-runs mounts
 read-only, the other two fail); `tools/fuzz.sh regression` clean for
 both binaries (2 binaries x 3 images); a 120 s read-only mutation
 run: 591 exec, 4 exec/s, 67 new units, 0 crashes / timeouts / OOMs.
+Longer runs (stream E): local defaults 300 -> 600 s (both variants),
+weekly workflow 300 -> 600 s per variant with the job timeout 45 ->
+60 min (budget guard and concurrency group unchanged). Local 1800 s
+runs, 28 Nov: RW 7,569 exec, 9 exec/s, 274 new units, peak RSS 665
+MB; RO 20,325 exec, 11 exec/s, 569 new units, peak RSS 707 MB,
+corpus 56 -> 584 files. No bug found. Two load artifacts triaged,
+both not driver bugs: the RW run tripped one timeout (alarm fired on
+a single fsync inside replay's flush_overlay, overlayfs+btrfs under
+4-coordinator load; the input executes in 519-748 ms alone,
+SHA-256 912fd9967a22f7d53da949c90822ea176d1101863ee28bb9c71d3f972928b3ad,
+artifact deleted after triage) and the RO run wrote four slow-unit
+artifacts (11/13/25/35 s during the run; each executes in 167-1679
+ms alone -- load, not the input; deleted after triage). The
+per-input timeout went 10 -> 30 s in tools/fuzz.sh for the same
+reason: a genuine hang still trips 30 s, the extra headroom only
+absorbs the loaded box's fsync stalls.
 
-Follow-ups (not done): longer runs (see below). The read-only-mount
-variant landed with stream E (see above).
+Follow-ups (not done): none recorded. The dirty-$LogFile seed, the
+read-only-mount variant and longer runs all landed with stream E
+(see above and below).
 
 ### 5.3 Upstream tracking has no automation — done 2026-11-25
 Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`
