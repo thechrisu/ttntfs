@@ -1309,13 +1309,42 @@ already shortens by zeroed clusters). Driver hook
 `ntfs_journal_notify_flushed()` from `ntfs_write_mft_block` (per
 written record, only when no record overlapping its clusters is
 still dirty), `write_mft_record_nolock` (the inode path), and
-`ntfs_write_folio` for `AT_BITMAP` / `AT_INDEX_ALLOCATION` folios;
-file data never notifies, compressed-data flush is a follow-up, and
-entries for attributes that no longer exist linger (slow leak, a
+`ntfs_write_folio` for `AT_BITMAP` / `AT_INDEX_ALLOCATION` folios
+(`$Bitmap:$DATA` arrives as `AT_DATA` with `mft_no == FILE_Bitmap`
+and is caught by that check, not by `AT_BITMAP`); file data never
+notifies, compressed-data flush is a follow-up, and entries for
+attributes that no longer exist linger (slow leak, a
 checkpoint-time reaper is the follow-up). In this port `submit_bio`
 performs the I/O immediately, so the bytes are durable when the
 writeback function returns; on a real async kernel the notify must
-move to bio completion.
+move to bio completion. Implementation landed 2026-11-28 (round 31,
+commits this round: writer half, then driver hook + tests): the
+emitter in `core/logfile/logfile_write.c` with the upkeep skip in
+`core/logfile/logfile_replay.c` and the recursive writer mutex; the
+hook in `core/vfs/journal.c` with call sites in `core/ntfs/mft.c`
+and `core/vfs/aops.c`. Evidence: logfile suite 13531 checks, 0
+failures (new `test_writer_delete_dirty_clusters`, 71 checks —
+with the upkeep skip removed the emitter case reports a phantom
+ACTIVE transaction at tid 0x18, so the test fails without the
+fix); journal suite 2074 checks, 0 failures (new
+`test_flush_notify_retires_dirty_pages` and
+`test_flush_notify_no_sync_no_retire` — the walk holds only the
+second create's 16 records plus 3 `DeleteDirtyClusters`, and
+`oldest_lsn` advances past the first create; the no-sync control
+still holds the first create and `oldest_lsn` stays at its first
+data record — plus the walk-count rewrite that zeroed all 90
+non-zero replay assertions, since after a sync replay is a no-op);
+crash sweep `test_journaled_flush_notify_cut_points`: 24 cut
+points step 1 across the sync tail (writes 38–61), 10 inconsistent
+before replay, 0 still bad after it, zero ACTIVE transactions at
+every cut, j.txt present 24 times; full crash suite 10560 checks,
+0 failures (was 9869 — the notify's extra log writes lengthen
+every sweep's sync tail). Finding, not this step: aborted
+transactions leak dirty-page entries (`ntfs_log_txn_abort` frees
+only the transaction-table entry; the stale entries carry
+`oldest_lsn == 0` and do not pin `first_lsn`, but are dumped at
+every checkpoint until a flush notifies them away) — belongs with
+the checkpoint-time reaper follow-up, not this commit.
 Next: Phase 4 step 3 (flip the default to 128 + driver walk-count
 updates + write-amplification and latency measurement).
 

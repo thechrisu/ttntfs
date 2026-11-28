@@ -1283,6 +1283,40 @@ static int make_base_with_dir(const char *path)
 	return err;
 }
 
+/* Create "d/j.txt" and return the number of device writes the mount
+ * and create attempted, WITHOUT syncing: the write index at which the
+ * sync — and therefore the flush notification — starts. Used as the
+ * landmark for the notify sweep below. */
+static long crash_run_create_nosync(const char *path)
+{
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	long after_create;
+
+	dev = crash_bdev_open(path, LONG_MAX);
+	if (!dev)
+		return -1;
+	if (ntfs_mount(dev, &mopts, &vol) != 0) {
+		ntfs_bdev_close(dev);
+		return -1;
+	}
+	write_count = 0;
+	write_limit = LONG_MAX;
+	if (ntfs_volume_root(vol, &root) == 0) {
+		if (ntfs_lookup(root, "d", &d) == 0) {
+			if (ntfs_create(d, "j.txt", 0100644, &f) == 0)
+				ntfs_inode_put(f);
+			ntfs_inode_put(d);
+		}
+		ntfs_inode_put(root);
+	}
+	after_create = write_count;
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	return after_create;
+}
+
 /* Create "d/j.txt" with the device dying after @limit writes, counting
  * only from the moment the volume is mounted. Returns the number of
  * writes the operation, sync and unmount attempted. */
@@ -1622,6 +1656,211 @@ static void test_journaled_create_cut_points(void)
 	unlink(base);
 	unlink(work);
 	printf("test_journaled_create_cut_points\n");
+}
+
+/* The flush-notification sweep (Phase 4 step 2). Same create+sync as
+ * the create sweep, but cut densely — step 1 — across the sync tail
+ * only, from the first write after the create returns to the last
+ * write of the run. That tail is where the flush notification lives:
+ * the $MFT folio flushes, the bitmap folio flush, the three
+ * DeleteDirtyClusters appends, the commit checkpoint that retires the
+ * create's dirty-page entries, and the unmount. A crash between any
+ * two of those writes — a torn notify append, a notify written but
+ * the checkpoint not, a checkpoint written but the folio flush not —
+ * must still replay clean, and must not leave a phantom ACTIVE
+ * transaction: the notify record carries tid 0x18 with no
+ * transaction-table entry, so the analysis pass must skip its
+ * upkeep (the logfile unit test proves the discrimination; this
+ * sweep proves it end to end at every cut). j.txt present/absent is
+ * counted, never asserted — either outcome is correct, depending on
+ * where the crash landed. The raw crash state is NOT required to be
+ * inconsistent before replay: most tail cuts land after the data is
+ * already flushed, so the interesting property is the post-replay
+ * verdict, not the pre-replay one. */
+static void test_journaled_flush_notify_cut_points(void)
+{
+	char base[1024], work[1024], work2[1024];
+	struct geometry g;
+	long total, pre, cut, n_cuts = 0;
+	int n_pre_bad = 0, n_post_bad = 0, n_present = 0, n_absent = 0;
+
+	scratch_path(base, sizeof(base), "jn-base");
+	scratch_path(work, sizeof(work), "jn-work");
+	scratch_path(work2, sizeof(work2), "jn-work2");
+	if (make_base_with_dir(base) != 0) {
+		fprintf(stderr, "SKIP test_journaled_flush_notify_cut_points: "
+				"mkntfs unavailable\n");
+		return;
+	}
+	if (run_ntfsck(base, NULL, 0) == V_SKIPPED) {
+		fprintf(stderr, "SKIP test_journaled_flush_notify_cut_points: "
+				"ntfsck unavailable at '%s'\n", ntfsck_path);
+		unlink(base);
+		return;
+	}
+	checks++;
+	if (run_ntfsck(base, NULL, 0) != V_CLEAN) {
+		failures++;
+		fprintf(stderr, "FAIL: the driver's own clean unmount of the "
+				"journaled base does not pass ntfsck; the cut-point "
+				"table below is not meaningful\n");
+	}
+	if (copy_file(base, work) != 0) { FAILF("copy failed\n"); unlink(base); return; }
+	total = crash_run_journaled(work, LONG_MAX);
+	/* The landmark runs on a FRESH copy: the full run above already
+	 * created j.txt in work, so a second create there would fail
+	 * with EEXIST and report a pre of 0. */
+	if (copy_file(base, work2) != 0) { FAILF("copy failed\n"); unlink(base); unlink(work); return; }
+	pre = crash_run_create_nosync(work2);
+	if (total <= 0 || pre < 0 || pre >= total) {
+		FAILF("notify sweep landmarks invalid (pre %ld, total %ld)\n",
+		      pre, total);
+		unlink(base);
+		unlink(work);
+		unlink(work2);
+		return;
+	}
+
+	printf("\n  cut  pre-replay          replay (redo/undo/active)  "
+	       "post-replay   mounts  j.txt\n");
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- ------\n");
+
+	for (cut = pre + 1; cut <= total; cut++) {
+		char msg_pre[256] = "", msg_post[256] = "";
+		enum verdict v_pre, v_post;
+		struct ntfs_logfile_analysis an, an2;
+		struct aftermath a;
+		u64 bad_lcn = 0, bad_ino = 0;
+		int cov_pre = 0, cov_post = 0, err_rep, err_rep2;
+		bool pre_bad, post_bad;
+
+		if (copy_file(base, work) != 0) { FAILF("copy failed\n"); break; }
+		crash_run_journaled(work, cut);
+		n_cuts++;
+
+		v_pre = run_ntfsck(work, msg_pre, sizeof(msg_pre));
+		if (geometry_open(&g, work) == 0) {
+			cov_pre = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		pre_bad = (v_pre != V_CLEAN) || (cov_pre == 1);
+		if (pre_bad)
+			n_pre_bad++;
+
+		err_rep = replay_image(work, &an);
+
+		v_post = run_ntfsck(work, msg_post, sizeof(msg_post));
+		if (geometry_open(&g, work) == 0) {
+			cov_post = allocation_covered(&g, &bad_ino, &bad_lcn);
+			geometry_close(&g);
+		}
+		post_bad = (err_rep != 0) || an.needs_chkdsk ||
+			   (v_post != V_CLEAN) || (cov_post == 1) ||
+			   (an.transactions_active != 0);
+		if (post_bad)
+			n_post_bad++;
+
+		err_rep2 = replay_image(work, &an2);
+
+		a = remount(work, "d", "j.txt");
+		if (a.file_present)
+			n_present++;
+		else
+			n_absent++;
+
+		printf("  %4ld %-19s redo %u undo %u active %u   %-14s %-8s %s\n",
+		       cut, verdict_name[v_pre],
+		       an.records_redone, an.records_undone,
+		       an.transactions_active,
+		       verdict_name[v_post], a.mounts ? "yes" : "NO",
+		       a.file_present ? "present" : "absent");
+
+		checks++;
+		if (err_rep != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: replay "
+					"refused the volume (%d: %s)\n",
+				cut, err_rep, an.message);
+		}
+		checks++;
+		if (!err_rep && an.needs_chkdsk) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: replay "
+					"succeeded but needs chkdsk (%s)\n",
+				cut, an.message);
+		}
+		checks++;
+		if (an.transactions_active != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: replay "
+					"leaves %u ACTIVE transactions — the "
+					"DeleteDirtyClusters record created a "
+					"phantom transaction-table entry\n",
+				cut, an.transactions_active);
+		}
+		checks++;
+		if (v_post != V_CLEAN) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: ntfsck "
+					"after replay is %s: %s\n",
+				cut, verdict_name[v_post], msg_post);
+		}
+		checks++;
+		if (cov_post == 1) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: inode "
+					"%llu references cluster %llu, which "
+					"$Bitmap marks free, after replay\n",
+				cut, (unsigned long long)bad_ino,
+				(unsigned long long)bad_lcn);
+		}
+		checks++;
+		if (!a.mounts) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: the "
+					"volume no longer mounts after replay\n",
+				cut);
+		}
+		checks++;
+		if (a.file_present && a.size > a.alloc) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: j.txt "
+					"has size %llu but only %llu bytes "
+					"allocated after replay\n",
+				cut, (unsigned long long)a.size,
+				(unsigned long long)a.alloc);
+		}
+		checks++;
+		if (err_rep2 != 0 || an2.records_redone != 0 ||
+		    an2.records_undone != 0) {
+			failures++;
+			fprintf(stderr, "FAIL journaled notify cut %ld: second "
+					"replay is not a no-op (err %d, redo %u, "
+					"undo %u)\n",
+				cut, err_rep2, an2.records_redone,
+				an2.records_undone);
+		}
+	}
+	printf("  ---- ------------------- -------------------------- "
+	       "-------------- -------- ------\n");
+	printf("  %ld cut points (sync tail, writes %ld-%ld): %d inconsistent "
+	       "before replay, %d still bad after it; j.txt present %d times, "
+	       "absent %d times\n",
+	       n_cuts, pre + 1, total, n_pre_bad, n_post_bad,
+	       n_present, n_absent);
+
+	checks++;
+	if (n_post_bad) {
+		failures++;
+		fprintf(stderr, "FAIL: %d notify cut points are still bad after replay\n",
+			n_post_bad);
+	}
+
+	unlink(base);
+	unlink(work);
+	unlink(work2);
+	printf("test_journaled_flush_notify_cut_points\n");
 }
 
 /* The unlink sweep. Same shape as the create sweep, but the operation
@@ -6224,6 +6463,7 @@ int main(void)
 	test_data_before_metadata();
 	test_cut_points();
 	test_journaled_create_cut_points();
+	test_journaled_flush_notify_cut_points();
 	test_journaled_unlink_cut_points();
 	test_journaled_unlink_reparse_cut_points();
 	test_journaled_mknod_cut_points();

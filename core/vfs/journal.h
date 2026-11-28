@@ -790,4 +790,24 @@ int ntfs_journal_cwrite_finish(struct ntfs_journal_cwrite *t,
 			       struct ntfs_inode *ni,
 			       const struct mft_record *mrec);
 
+/* ---- Flush notification (Phase 4 step 2) ------------------------------ */
+
+/* Retire the dirty pages whose clusters in [@byte_off, @byte_off + @len)
+ * in @attr_ni just reached the volume: appends a DeleteDirtyClusters
+ * record for those clusters and zeroes their slots in the writer's
+ * dirty-page table. The caller has just written those bytes
+ * synchronously and still holds the folio lock. Best-effort and
+ * silent: nothing when journaling is inactive, when a cluster has no
+ * LCN (a hole past the attribute's allocation), or when the emitter
+ * refuses the append; a notification for ranges matching no entry
+ * appends nothing. Takes only the writer lock, never log_txn_lock.
+ * Callers: ntfs_write_mft_block (per written MFT record, only when
+ * no record overlapping its clusters is still dirty),
+ * write_mft_record_nolock (the inode path, at done:), ntfs_write_folio
+ * (non-resident AT_BITMAP / AT_INDEX_ALLOCATION folios, and
+ * $Bitmap:$DATA). File data folios never notify. */
+void ntfs_journal_notify_flushed(struct ntfs_volume *vol,
+				 struct ntfs_inode *attr_ni,
+				 u64 byte_off, u64 len);
+
 #endif /* NTFS_JOURNAL_H */

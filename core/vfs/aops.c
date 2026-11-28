@@ -36,6 +36,7 @@
 #include "ntfs.h"
 #include "debug.h"
 #include "vfs.h"
+#include "journal.h"	/* PORT: Phase 4 step 2 flush notification */
 
 /* ---- run list mapping ------------------------------------------------- */
 
@@ -425,6 +426,7 @@ static int ntfs_write_folio(struct address_space *mapping, struct folio *folio)
 {
 	struct inode *vi = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(vi);
+	int err;
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
@@ -462,7 +464,31 @@ static int ntfs_write_folio(struct address_space *mapping, struct folio *folio)
 			return 0;
 		return ntfs_write_folio_resident(vi, folio);
 	}
-	return ntfs_write_folio_non_resident(vi, folio);
+	err = ntfs_write_folio_non_resident(vi, folio);
+	if (err)
+		return err;
+	/*
+	 * Phase 4 step 2: the flush notification. The folio just
+	 * reached the volume (ntfs_vfs_walk_runs writes synchronously
+	 * in this port; on a real async kernel this must move to bio
+	 * completion). Only journaled metadata notifies: $MFT:$BITMAP
+	 * and $Bitmap:$DATA (AT_BITMAP covers the first; the second is
+	 * the $Bitmap base inode, type AT_DATA, so it needs the
+	 * mft_no check) and $INDEX_ALLOCATION folios. File data folios
+	 * never notify (data is not journaled); resident-attribute
+	 * folios only copy bytes into the in-memory MFT record, which
+	 * is gated at its $MFT folio. The whole folio is the written
+	 * range: the writer covers everything the allocation spans,
+	 * and the hook skips any vcn with no LCN (a hole past the
+	 * allocation, e.g. a folio tail). Runs while the folio is
+	 * still locked. No-op when journaling is inactive or nothing
+	 * matches; errors are dropped — retirement is best-effort.
+	 */
+	if (ni->type == AT_BITMAP || ni->type == AT_INDEX_ALLOCATION ||
+	    (ni->mft_no == FILE_Bitmap && ni->type == AT_DATA))
+		ntfs_journal_notify_flushed(ni->vol, ni, folio_pos(folio),
+					    PAGE_SIZE);
+	return 0;
 }
 
 /*

@@ -16,6 +16,7 @@
 #include "lcnalloc.h"
 #include "mft.h"
 #include "ntfs.h"
+#include "../vfs/journal.h"	/* PORT: Phase 4 step 2 flush notification */
 
 /*
  * ntfs_mft_record_check - Check the consistency of an MFT record
@@ -546,6 +547,61 @@ err_out:
 	return err;
 }
 
+/* Forward declaration: defined below write_mft_record_nolock. */
+static int ntfs_test_inode_wb(struct inode *vi, u64 ino, void *data);
+
+/*
+ * mft_cluster_other_dirty - is any MFT record in the clusters @mft_no
+ * spans, other than @mft_no itself, still dirty in memory (Phase 4
+ * step 2)? A record is dirty only when its inode is in icache and
+ * NInoDirty: an inode not in icache was written back on eviction (or
+ * never dirtied), so its record is already on the volume. An inode
+ * being created or deleted is in flux and counts as dirty. The lookup
+ * grabs a reference; the inode has an icache reference too, so the
+ * iput below can never drop it to zero and never evicts — safe under
+ * the folio lock (the deferred-iput rule in ntfs_may_write_mft_record
+ * is for an inode that may hold the last reference).
+ */
+static bool mft_cluster_other_dirty(struct ntfs_volume *vol, u64 mft_no)
+{
+	u64 rec_bytes = (u64)mft_no * vol->mft_record_size;
+	u64 first_vcn = rec_bytes >> vol->cluster_size_bits;
+	u64 last_vcn = (rec_bytes + vol->mft_record_size - 1) >>
+		vol->cluster_size_bits;
+	u64 v;
+
+	for (v = first_vcn; v <= last_vcn; v++) {
+		u64 clu_start = v << vol->cluster_size_bits;
+		u64 first = clu_start / vol->mft_record_size;
+		u64 last = (clu_start + vol->cluster_size) /
+			vol->mft_record_size;
+		u64 r;
+
+		for (r = first; r < last; r++) {
+			struct ntfs_attr na = { 0 };
+			struct inode *vi;
+
+			if (r == mft_no)
+				continue;
+			na.mft_no = r;
+			na.type = AT_UNUSED;
+			vi = find_inode_nowait(vol->sb, r,
+					       ntfs_test_inode_wb, &na);
+			if (na.state == NI_BeingDeleted ||
+			    na.state == NI_BeingCreated)
+				return true;
+			if (vi) {
+				bool dirty = NInoDirty(NTFS_I(vi));
+
+				iput(vi);
+				if (dirty)
+					return true;
+			}
+		}
+	}
+	return false;
+}
+
 /*
  * write_mft_record_nolock - write out a mapped (extent) mft record
  * @ni:		ntfs inode describing the mapped (extent) mft record
@@ -654,6 +710,21 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 			ni->mft_no);
 		goto err_out;
 	}
+	/*
+	 * Phase 4 step 2: the flush notification. The record just
+	 * reached the volume (sync waits, async submit_bio performs
+	 * the I/O immediately in this port; on a real async kernel
+	 * this must move to bio completion). Retire its clusters only
+	 * when no other record in them is still dirty in memory —
+	 * otherwise that record's changes, still only in the folio,
+	 * would lose their log entries. Runs while the folio is
+	 * locked (WARN_ON above). Reached only when this call wrote
+	 * the record; the already-clean path jumps straight to done:.
+	 */
+	if (!mft_cluster_other_dirty(vol, ni->mft_no))
+		ntfs_journal_notify_flushed(vol, NTFS_I(vol->mft_ino),
+			(u64)ni->mft_no * vol->mft_record_size,
+			vol->mft_record_size);
 done:
 	ntfs_debug("Done.");
 	return 0;
@@ -2764,6 +2835,43 @@ static s64 lcn_from_index(struct ntfs_volume *vol, struct ntfs_inode *ni,
 }
 
 /*
+ * mft_block_mark - record whether an MFT record's clusters were written
+ * or skipped, for the Phase 4 step 2 flush notification
+ * (docs/JOURNAL-DESIGN.md §4.3). A cluster is notifiable only when
+ * every record overlapping it was written here; a record skipped by
+ * ntfs_may_write_mft_record (its inode is dirty) or by the extent
+ * carve-out blocks its clusters. @written/@blocked are indexed by the
+ * cluster's offset in the folio (folio_first_vcn .. +nvcns); a record
+ * spanning clusters outside the folio is clamped. No-op when the folio
+ * spans more than 8 clusters (cluster_size < 512 cannot happen, and a
+ * cluster larger than the folio is never fully covered here, so
+ * nothing is notified for it either).
+ */
+static void mft_block_mark(struct ntfs_volume *vol, u64 folio_first_vcn,
+			   uint32_t nvcns, bool *written, bool *blocked,
+			   u64 mft_no, bool was_written)
+{
+	u64 start, end, v;
+
+	if (nvcns > 8)
+		return;
+	start = (mft_no * vol->mft_record_size) >> vol->cluster_size_bits;
+	end = ((mft_no + 1) * vol->mft_record_size + vol->cluster_size - 1) >>
+		vol->cluster_size_bits;
+	for (v = start; v < end; v++) {
+		uint32_t idx;
+
+		if (v < folio_first_vcn || v >= folio_first_vcn + nvcns)
+			continue;
+		idx = (uint32_t)(v - folio_first_vcn);
+		if (was_written)
+			written[idx] = true;
+		else
+			blocked[idx] = true;
+	}
+}
+
+/*
  * ntfs_write_mft_block - Write back a folio containing MFT records
  * @folio:	The folio to write back (contains one or more MFT records)
  * @wbc:	Writeback control structure
@@ -2797,6 +2905,19 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 	s64 end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
 	unsigned int folio_sz;
 	loff_t i_size = i_size_read(vi);
+	/* Phase 4 step 2: per-cluster write tracking for the flush
+	 * notification. The folio spans nvcns clusters of $MFT:$DATA,
+	 * starting at folio_first_vcn; a cluster is notifiable only
+	 * when every record overlapping it was written here (see
+	 * mft_block_mark). nvcns is 0 when a cluster is larger than
+	 * the folio — no cluster is fully covered then, so nothing is
+	 * notified. The arrays cover at most 8 clusters (folio 4096 /
+	 * cluster 512); more, and mft_block_mark no-ops. */
+	u64 folio_first_vcn = ((u64)folio->index * folio_size(folio)) >>
+		vol->cluster_size_bits;
+	uint32_t nvcns = folio_size(folio) >> vol->cluster_size_bits;
+	bool vcn_written[8] = { false };
+	bool vcn_blocked[8] = { false };
 
 	ntfs_debug("Entering for inode 0x%llx, attribute type 0x%x, folio index 0x%lx.",
 			ni->mft_no, ni->type, folio->index);
@@ -2867,9 +2988,21 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 				tni->ext.base_ntfs_ino == NTFS_I(vol->mft_ino)) {
 				mutex_unlock(&tni->mrec_lock);
 				atomic_dec(&tni->count);
+				/* Not written here: the extent record blocks
+				 * its clusters (Phase 4 step 2). */
+				mft_block_mark(vol, folio_first_vcn, nvcns,
+					       vcn_written, vcn_blocked,
+					       mft_no, false);
 				iput(vol->mft_ino);
 				continue;
 			}
+
+			/* The record is written below: its clusters are
+			 * candidates for the flush notification, unless
+			 * another record in them was skipped (Phase 4
+			 * step 2). */
+			mft_block_mark(vol, folio_first_vcn, nvcns,
+				       vcn_written, vcn_blocked, mft_no, true);
 
 			/*
 			 * The record should be written.  If a locked ntfs
@@ -2958,8 +3091,15 @@ flush_bio:
 				if (unlikely(sub_err) && !err)
 					err = sub_err;
 			}
-		} else if (ref_inos[nr_ref_inos])
-			nr_ref_inos++;
+		} else {
+			/* Not written here: the record's inode is dirty
+			 * (or its lock is held), so it blocks its clusters
+			 * for the flush notification (Phase 4 step 2). */
+			mft_block_mark(vol, folio_first_vcn, nvcns,
+				       vcn_written, vcn_blocked, mft_no, false);
+			if (ref_inos[nr_ref_inos])
+				nr_ref_inos++;
+		}
 	}
 
 	if (bio) {
@@ -2967,6 +3107,46 @@ flush_bio:
 		submit_bio(bio);
 	}
 unm_done:
+	/*
+	 * Phase 4 step 2: the flush notification. The bios above are
+	 * submitted — in this port submit_bio performs the I/O
+	 * immediately, so the bytes are durable on return; on a real
+	 * async kernel this must move to bio completion. Retire the
+	 * clusters every record in them was written for, as contiguous
+	 * runs; a cluster with a skipped (still dirty) record is not
+	 * notified, so its log entries stay pinned until that record
+	 * is written too. Runs while the folio is still locked, before
+	 * folio_unlock below. No-op when journaling is inactive or
+	 * nothing matches (nvcns is 0 when a cluster is larger than
+	 * the folio); errors are dropped — retirement is best-effort.
+	 */
+	if (!err && nvcns >= 1 && nvcns <= 8) {
+		uint32_t i;
+		u64 run_start = 0;
+		bool in_run = false;
+
+		for (i = 0; i < nvcns; i++) {
+			bool ok = vcn_written[i] && !vcn_blocked[i];
+
+			if (ok && !in_run) {
+				run_start = folio_first_vcn + i;
+				in_run = true;
+			} else if (!ok && in_run) {
+				ntfs_journal_notify_flushed(vol,
+					NTFS_I(vol->mft_ino),
+					run_start << vol->cluster_size_bits,
+					((folio_first_vcn + i) - run_start) <<
+						vol->cluster_size_bits);
+				in_run = false;
+			}
+		}
+		if (in_run)
+			ntfs_journal_notify_flushed(vol,
+				NTFS_I(vol->mft_ino),
+				run_start << vol->cluster_size_bits,
+				((folio_first_vcn + nvcns) - run_start) <<
+					vol->cluster_size_bits);
+	}
 	folio_mark_uptodate(folio);
 	kunmap_local(kaddr);
 

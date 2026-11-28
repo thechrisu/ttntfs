@@ -421,9 +421,11 @@ synchronous write and while the folio lock is held:
   written (the inode path — `__ntfs_write_inode` — and the alloc
   rollback paths), at `done:`, while the folio is locked.
 - `ntfs_write_folio` (non-resident path): after a successful write
-  of an `AT_BITMAP` (`$MFT:$BITMAP`, `$Bitmap:$DATA`) or
-  `AT_INDEX_ALLOCATION` folio — the whole folio is the written
-  range. File data folios never notify (data is not journaled);
+  of an `AT_BITMAP` (`$MFT:$BITMAP`) or `AT_INDEX_ALLOCATION`
+  folio — the whole folio is the written range. `$Bitmap:$DATA`
+  is a base inode, so it arrives as `AT_DATA` with
+  `mft_no == FILE_Bitmap` and is caught by that check, not by
+  `AT_BITMAP`. File data folios never notify (data is not journaled);
   resident-attribute folios only copy bytes into the in-memory MFT
   record, which is gated at its `$MFT` folio; compressed data
   folios return early here (compress.c writes those blocks itself)
@@ -435,11 +437,19 @@ What step 2 does not do. Entries for attributes that no longer
 exist (a deleted file's `$INDEX_ALLOCATION` page, a freed cluster
 range) are never flushed again, so they are never notified and
 linger, pinning `first_lsn` — a slow leak, not corruption; a
-checkpoint-time reaper is the follow-up. The compressed-data flush
-hook is the other follow-up. The carried Phase 3 follow-ups (mkdir
-`$SI` flags, truncate sparse flags, xattr `$SI` snapshot, EA flags
-path, reader wart, live-driver `$FILE_NAME` times) are untouched
-by this step.
+checkpoint-time reaper is the follow-up. The same reaper must also
+cover a second, pre-existing leak this step exposed: an aborted
+transaction's staged dirty-page entries are never removed
+(`ntfs_log_txn_abort` frees only the transaction-table entry), so
+they are dumped at every checkpoint until a flush notifies them
+away. They carry `oldest_lsn == 0` (never stamped — the records
+were never appended), so the checkpoint skips them when computing
+`first_lsn` and they do not pin it; the notify records in the
+unjournaled tests are the cleanup of exactly these stale entries.
+The compressed-data flush hook is the other follow-up. The carried
+Phase 3 follow-ups (mkdir `$SI` flags, truncate sparse flags,
+xattr `$SI` snapshot, EA flags path, reader wart, live-driver
+`$FILE_NAME` times) are untouched by this step.
 
 Tests. `test_writer_delete_dirty_clusters` in
 `core/logfile/tests/test_logfile.c`: stage a create, commit, call
@@ -448,12 +458,29 @@ record walks as `DeleteDirtyClusters` with the right ranges, the
 writer's next checkpoint dumps no entry for it, `first_lsn`
 advances past the create's records, and a dry + real replay still
 redoes the create (the bytes are on the volume in the test's model
-— the emitter is the claim that they are). The driver test in
-`core/tests/test_journal.c`: create files, drive writeback, commit,
-checkpoint, and assert the dirty-page entries retire and
-`first_lsn` advances; the negative control (no writeback driven)
-asserts they do not. Crash sweep: the replay path is touched (the
-upkeep skip), so the sweep covers the notify record's cut points.
+— the emitter is the claim that they are). The driver tests in
+`core/tests/test_journal.c` (`test_flush_notify_retires_dirty_pages`,
+`test_flush_notify_no_sync_no_retire`): create j.txt, sync, create
+k.txt, sync — the walk holds only k.txt's 16 records plus the
+sync's three `DeleteDirtyClusters` records, and `oldest_lsn` is
+past j.txt's first record; the negative control (the same two
+creates with no sync between them, then one sync) still holds
+j.txt's records and `oldest_lsn` is still j.txt's first data
+record. The driver rewrite also zeroed every non-zero replay
+assertion in the file (90 counter assertions): after a sync
+everything is flushed and retired, so replay is a no-op — the
+file/ntfsck assertions confirm the volume is correct, and the
+redo path is still exercised by the crash sweep and the logfile
+test. Crash sweep: `test_journaled_flush_notify_cut_points` in
+`core/tests/test_crash.c` cuts densely (step 1) across the sync
+tail only, from the first write after the create returns to the
+last write of the run, and asserts per cut that replay succeeds,
+leaves zero ACTIVE transactions (the phantom-transaction
+discrimination, end to end), ntfsck is clean after replay, and a
+second replay is a no-op. Journal suite 2074 checks, 0 failures
+(was 2013 after the walk-count rewrite, 938 before it); crash
+suite 10560 checks, 0 failures (was 9869 — the notify's extra log
+writes lengthen every sweep's sync tail).
 
 ### 4.4 What the writer does not do
 

@@ -138,6 +138,75 @@ static int cluster_bitmap_coords(struct ntfs_volume *vol, u64 bit,
 			   vcn_out, cluster_off_out, page_lcn_out);
 }
 
+/*
+ * ntfs_journal_notify_flushed - retire dirty pages whose clusters
+ * reached the volume (docs/JOURNAL-DESIGN.md §4.3 step 2).
+ *
+ * Walks the byte range [@byte_off, @byte_off + @len) in @attr_ni's
+ * runs, builds the (lcn, len) ranges and calls the writer's
+ * DeleteDirtyClusters emitter, which zeroes those slots in the
+ * writer's dirty-page table. The caller has just written those
+ * bytes synchronously and still holds the folio lock, so the notify
+ * can only ever retire changes already on the volume; any later
+ * mutation must take the folio lock first and its staging
+ * re-creates or re-populates the entry.
+ *
+ * A vcn with no LCN (a hole — the range runs past the attribute's
+ * allocation, e.g. a folio tail beyond initialized_size) is skipped:
+ * it was never written, so there is nothing to retire for it. A
+ * notification for ranges matching no entry appends nothing, so a
+ * stale or duplicate notify is harmless. The emitter's errors are
+ * dropped: retirement is best-effort, correctness never depends on
+ * it (an unretired entry only costs log space).
+ *
+ * Takes only the writer lock (inside the emitter), never
+ * log_txn_lock — taking the driver's transaction lock from writeback
+ * would invert against a commit blocked on a folio lock. The run-list
+ * read lock is taken and released per vcn inside attr_coords, never
+ * nested with the writer lock.
+ */
+void ntfs_journal_notify_flushed(struct ntfs_volume *vol,
+				 struct ntfs_inode *attr_ni,
+				 u64 byte_off, u64 len)
+{
+	struct ntfs_log_range ranges[8];
+	uint32_t nranges = 0;
+	u64 vcn, end_vcn;
+
+	if (!vol->log_writer || !attr_ni || !len)
+		return;
+	if (byte_off + len < byte_off)
+		return;
+	vcn = byte_off >> vol->cluster_size_bits;
+	end_vcn = (byte_off + len + vol->cluster_size - 1) >>
+		vol->cluster_size_bits;
+	for (; vcn < end_vcn; vcn++) {
+		u64 lcn;
+		u16 cluster_off;
+		u64 v;
+
+		if (attr_coords(vol, attr_ni, vcn << vol->cluster_size_bits,
+				&v, &cluster_off, &lcn) != 0)
+			continue;
+		if (nranges > 0 &&
+		    lcn == ranges[nranges - 1].lcn + ranges[nranges - 1].len) {
+			ranges[nranges - 1].len++;
+			continue;
+		}
+		if (nranges >= ARRAY_SIZE(ranges)) {
+			ntfs_log_writer_delete_dirty_clusters(vol->log_writer,
+							      ranges, nranges);
+			nranges = 0;
+		}
+		ranges[nranges].lcn = lcn;
+		ranges[nranges].len = 1;
+		nranges++;
+	}
+	if (nranges)
+		ntfs_log_writer_delete_dirty_clusters(vol->log_writer,
+						      ranges, nranges);
+}
+
 /* ---- record scanning ---------------------------------------------------- */
 
 /*

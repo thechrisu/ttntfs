@@ -14,16 +14,31 @@
  *                        $FILE_NAME create carries the name, the SetBits
  *                        names the new record number, and both touched
  *                        MFT records carry an MR_LSN at or past the
- *                        record that touched them. Replaying the dirty
- *                        snapshot redoes only the SetBits — the MFT
- *                        records were already flushed and their MR_LSN
- *                        stamps skip the rest — and the file is present
- *                        and ntfsck -n is clean afterwards. A second
+ *                        record that touched them. The sync's flush
+ *                        notification (Phase 4 step 2) appends three
+ *                        DeleteDirtyClusters records, and replaying the
+ *                        dirty snapshot redoes nothing — the MFT
+ *                        records and the bitmap were already flushed
+ *                        and retired — and the file is present and
+ *                        ntfsck -n is clean afterwards. A second
  *                        replay of the same dirty snapshot redoes the
- *                        same single record: replay is idempotent.
- *   mkdir_unjournaled  a mkdir writes no client records at all, and the
+ *                        same zero records: replay is idempotent.
+ *   flush_notify_retires_dirty_pages
+ *                        a sync flushes the $MFT folios and the bitmap
+ *                        folio, the flush notification retires the
+ *                        create's dirty pages, and the next commit's
+ *                        checkpoint advances oldest_lsn past the
+ *                        retired transaction's records — the walk
+ *                        holds only the second create's records.
+ *   flush_notify_no_sync_no_retire
+ *                        the negative control: the same two creates
+ *                        with no sync between them leave the first
+ *                        create's records in the walk, and oldest_lsn
+ *                        stays at its first data record.
+ *   mkdir_unjournaled  a mkdir writes no transaction records at all,
+ *                        and the
  *                        directory is still there after a remount.
- *   create_in_root     a create in the volume root writes no client
+ *   create_in_root     a create in the volume root writes no transaction
  *                        records either — its entry lands in the root's
  *                        $INDEX_ALLOCATION block, which Phase 2 cannot
  *                        describe — and the create still succeeds and
@@ -49,7 +64,7 @@
  *                        effect (the record is already free) — the
  *                        file is gone and ntfsck -n is clean.
  *   unlink_in_root_unjournaled
- *                        an unlink in the root writes no client records
+ *                        an unlink in the root writes no transaction records
  *                        (its entry lives in the root's
  *                        $INDEX_ALLOCATION block) and still succeeds.
  *   rmdir_journaled    an rmdir of an empty driver-made directory
@@ -69,7 +84,7 @@
  *                        stamps — and the file is under its new name
  *                        and ntfsck -n is clean.
  *   rename_in_root_unjournaled
- *                        a rename in the root writes no client records
+ *                        a rename in the root writes no transaction records
  *                        (both entries live in the root's
  *                        $INDEX_ALLOCATION block) and still succeeds.
  *   rename_over_journaled
@@ -844,6 +859,48 @@ out_dev:
 	return err;
 }
 
+/* The log's oldest LSN (the restart area's client oldest) for the
+ * image at @path — the LSN a replay walks from. A test uses it to
+ * prove a checkpoint advanced past a retired transaction. */
+static int log_oldest_lsn(const char *path, uint64_t *lsn_out)
+{
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+	struct ntfs_image img;
+	struct ntfs_image_io io;
+	struct ntfs_log_io log_io;
+	struct ntfs_log_geometry geom;
+	ntfs_logfile_t *log = NULL;
+	int err;
+
+	if (!dev)
+		return -EIO;
+	io.ctx = dev;
+	io.pread = img_pread;
+	io.pwrite = NULL;
+	io.sync = NULL;
+	memset(&img, 0, sizeof(img));
+	err = ntfs_image_open_io(&img, &io, dev->size_bytes, false);
+	if (err)
+		goto out_dev;
+	ntfs_image_log_io(&img, &log_io);
+	ntfs_image_geometry(&img, &geom);
+	err = ntfs_logfile_open(&log_io, &geom, &log);
+	if (err)
+		goto out_img;
+	{
+		struct ntfs_logfile_info info;
+
+		ntfs_logfile_get_info(log, &info);
+		*lsn_out = info.oldest_lsn;
+	}
+	ntfs_logfile_close(log);
+out_img:
+	ntfs_image_close(&img);
+out_dev:
+	ntfs_bdev_close(dev);
+	return err;
+}
+
 /* Read the MR_LSN (offset 8) of MFT record @mft_no from the image at @path. */
 static int read_mft_lsn(const char *path, uint64_t mft_no, uint64_t *lsn_out)
 {
@@ -1487,10 +1544,14 @@ out:
 	 * 3 dumps + Forget, in the order the create staged them. The
 	 * ninth data record is the $MFT $DATA size extension, staged
 	 * first so the redo extends $MFT before it initialises the new
-	 * record. */
+	 * record. The sync then flushes the $MFT folios and the bitmap
+	 * folio, and the flush notification (Phase 4 step 2) appends
+	 * three DeleteDirtyClusters records after the Forget — one per
+	 * flushed cluster (record 0's cluster, the new record + parent
+	 * cluster, the $MFT:$BITMAP cluster). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 16);
-	if (s.n == 16) {
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
 		static const uint16_t want_op[9] = {
 			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
@@ -1515,6 +1576,14 @@ out:
 		CHECK_EQ(s.redo_op[13], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[14], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+		/* The sync's flush notification: three
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0 (the record names no
+		 * transaction). */
+		for (i = 16; i < 19; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
 		/* The $FILE_NAME create is the last CreateAttribute, the
 		 * record right before the index entry. */
 		lsn_fn = s.lsn[8];
@@ -1560,16 +1629,18 @@ out:
 	CHECK(mrlsn_dir != 0);
 	CHECK(mrlsn_dir >= lsn_index);
 
-	/* Replay copy 1: the MFT records were already flushed, so only
-	 * the two records that carry no LSN to skip on redo — the $MFT
-	 * $DATA size extension and the SetBits — and the extension
-	 * writes MFT record 0. */
+	/* Replay copy 1: the sync flushed the $MFT folios and the
+	 * bitmap folio, so the flush notification retired every dirty
+	 * page — the $MFT $DATA size extension, the MFT records and
+	 * the SetBits are all skipped (zeroed clusters / MR_LSN) and
+	 * the replay redoes nothing. The file is already on the
+	 * volume; replay is a no-op. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -1578,13 +1649,13 @@ out:
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * two records. Replay is idempotent. */
+	 * zero records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
@@ -1592,7 +1663,219 @@ out:
 	unlink(snap2);
 }
 
-/* ---- 2. a mkdir writes no client records ------------------------------ */
+/* ---- 1b. the flush notification retires dirty pages ----------------------
+ *
+ * Phase 4 step 2: a sync flushes the $MFT folios and the bitmap folio,
+ * and the flush notification appends DeleteDirtyClusters records that
+ * retire the dirty-page entries the flushed pages carried. The next
+ * commit's checkpoint then advances oldest_lsn past the retired
+ * transaction's records, so the log can wrap in-session instead of
+ * filling until journaling degrades to unjournaled.
+ *
+ * Positive case: create j.txt, sync (flush + notify), create k.txt,
+ * sync. The walk holds only k.txt's 16 records plus the sync's three
+ * DeleteDirtyClusters records — j.txt's records are gone, and
+ * oldest_lsn is past j.txt's first record.
+ *
+ * Negative control: create j.txt and k.txt with no sync between
+ * them, then sync once. The walk still holds j.txt's records (its
+ * pages were dirty at k.txt's commit checkpoint, so nothing retired
+ * them yet), and oldest_lsn is still j.txt's first data record. */
+static void test_flush_notify_retires_dirty_pages(void)
+{
+	char orig[1024], snap[1024], snap0[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s, s0;
+	uint64_t first_lsn_j = 0, oldest = 0;
+	int err, i;
+
+	printf("test_flush_notify_retires_dirty_pages\n");
+	scratch_path(orig, sizeof(orig), "fnorig");
+	scratch_path(snap, sizeof(snap), "fnsnap");
+	scratch_path(snap0, sizeof(snap0), "fnsnap0");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_flush_notify_retires_dirty_pages: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	/* j.txt's first record LSN, from a snapshot taken after the
+	 * sync that flushed and notified it. */
+	CHECK_EQ(copy_file(orig, snap0), 0);
+	CHECK_EQ(walk_log(snap0, &s0), 0);
+	CHECK(s0.n >= 1);
+	if (s0.n >= 1)
+		first_lsn_j = s0.lsn[0];
+	CHECK(first_lsn_j != 0);
+
+	/* A second create, then a sync: its commit checkpoints, and
+	 * j.txt's entries are already retired, so oldest_lsn must
+	 * advance past j.txt's first record. */
+	err = ntfs_create(d, "k.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); unlink(snap0); return; }
+
+	/* The walk holds only k.txt's 16 records plus the sync's
+	 * three DeleteDirtyClusters records. */
+	set_fn_name("k.txt");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[2], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[8], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+		for (i = 16; i < 19; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
+	}
+	/* k.txt's $FILE_NAME is the only one in the walk; j.txt's
+	 * records are gone. */
+	CHECK_EQ(s.fn_name_hits, 1);
+	CHECK_EQ(s.fn_lsn, s.lsn[8]);
+	/* oldest_lsn advanced past j.txt's first record. */
+	CHECK_EQ(log_oldest_lsn(snap, &oldest), 0);
+	CHECK(oldest > first_lsn_j);
+	CHECK_EQ(oldest, s.lsn[0]);
+
+	/* Both files are present and the volume is clean. */
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "k.txt"), 0);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+	unlink(snap0);
+}
+
+/* ---- 1c. without a sync, dirty pages do not retire -----------------------
+ *
+ * Negative control for 1b: the same two creates with no sync
+ * between them, then one sync. The walk still holds j.txt's
+ * records — its pages were dirty at k.txt's commit checkpoint,
+ * so nothing retired them yet — and oldest_lsn is still j.txt's
+ * first data record. */
+static void test_flush_notify_no_sync_no_retire(void)
+{
+	char orig[1024], snap[1024];
+	struct ntfs_bdev *dev;
+	ntfs_volume_t *vol = NULL;
+	ntfs_inode_t *root = NULL, *d = NULL, *f = NULL;
+	struct rec_seen s;
+	uint64_t oldest = 0;
+	int err, i;
+
+	printf("test_flush_notify_no_sync_no_retire\n");
+	scratch_path(orig, sizeof(orig), "nnorig");
+	scratch_path(snap, sizeof(snap), "nnsnap");
+	if (make_image(orig) != 0) {
+		fprintf(stderr, "SKIP test_flush_notify_no_sync_no_retire: mkntfs unavailable\n");
+		return;
+	}
+
+	dev = ntfs_bdev_open_path(orig, false);
+	CHECK(dev != NULL);
+	if (!dev) { unlink(orig); return; }
+	err = ntfs_mount(dev, &mopts, &vol);
+	CHECK_EQ(err, 0);
+	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
+	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
+
+	err = ntfs_mkdir(root, "sub", 0100755, &d);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	err = ntfs_create(d, "j.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	/* No sync here: j.txt's pages stay dirty. */
+	err = ntfs_create(d, "k.txt", 0100644, &f);
+	CHECK_EQ(err, 0);
+	if (err) { goto out; }
+	ntfs_inode_put(f);
+	f = NULL;
+	CHECK_EQ(ntfs_volume_sync(vol), 0);
+	CHECK_EQ(copy_file(orig, snap), 0);
+
+out:
+	if (f) { ntfs_inode_put(f); f = NULL; }
+	if (d) { ntfs_inode_put(d); d = NULL; }
+	if (root) { ntfs_inode_put(root); root = NULL; }
+	ntfs_unmount(vol);
+	ntfs_bdev_close(dev);
+	if (err) { unlink(orig); unlink(snap); return; }
+
+	/* The walk holds j.txt's 14 still-live records (its opens
+	 * precede oldest_lsn — oldest sits at its first data record,
+	 * the SetNewAttributeSizes), then k.txt's full 16, then the
+	 * sync's DeleteDirtyClusters records. */
+	set_fn_name("j.txt");
+	CHECK_EQ(walk_log(snap, &s), 0);
+	CHECK(s.n >= 30);
+	if (s.n >= 30) {
+		CHECK_EQ(s.redo_op[0], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[29], LOP_ForgetTransaction);
+		for (i = 30; i < s.n; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
+	}
+	/* j.txt's $FILE_NAME is still in the walk. Its records start
+	 * at the first data record (the opens precede oldest_lsn),
+	 * so the $FILE_NAME is at index 6, not 8. */
+	CHECK_EQ(s.fn_name_hits, 1);
+	CHECK_EQ(s.fn_lsn, s.lsn[6]);
+	/* oldest_lsn is still j.txt's first data record — it did
+	 * not advance past the unretired transaction. */
+	CHECK_EQ(log_oldest_lsn(snap, &oldest), 0);
+	CHECK_EQ(oldest, s.lsn[0]);
+
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "j.txt"), 0);
+	CHECK_EQ(lookup_nested_after_mount(snap, "sub", "k.txt"), 0);
+	CHECK_EQ(run_ntfsck_clean(snap), 0);
+
+	unlink(orig);
+	unlink(snap);
+}
+
+/* ---- 2. a mkdir writes no transaction records ------------------------ */
 
 static void test_mkdir_unjournaled(void)
 {
@@ -1633,9 +1916,22 @@ static void test_mkdir_unjournaled(void)
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* Phase 2 journals regular-file creates only: the log holds no
-	 * client records at all after a mkdir. */
+	 * transaction records at all after a mkdir. The flush
+	 * notification (Phase 4 step 2) still appends two
+	 * DeleteDirtyClusters records: the aborted mkdir staged
+	 * dirty-page entries for the $MFT folio and the bitmap folio
+	 * before it aborted, and the sync's writeback notifies them
+	 * away (the abort-leak note in JOURNAL-DESIGN.md §4.3). The
+	 * records are log-client bookkeeping, not transaction
+	 * records, and the reader skips them. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	/* The directory itself is still there after a remount, and the
 	 * volume is clean: unjournaled does not mean lost. */
@@ -1720,12 +2016,15 @@ out:
 	 * 3 dumps + Forget, in the order the create staged them. The
 	 * five CreateAttributes are $SECURITY_DESCRIPTOR, $INDEX_ROOT,
 	 * $EA_INFORMATION, $EA and $FILE_NAME — the $INDEX_ROOT in the
-	 * slot the file's $DATA occupies. */
+	 * slot the file's $DATA occupies. The sync then flushes the
+	 * $MFT folios and the bitmap folio, and the flush notification
+	 * (Phase 4 step 2) appends three DeleteDirtyClusters records
+	 * after the Forget. */
 	/* The $FILE_NAME scan looks for the created name. */
 	set_fn_name("jdir");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 16);
-	if (s.n == 16) {
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
 		static const uint16_t want_op[9] = {
 			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
@@ -1746,6 +2045,13 @@ out:
 		CHECK_EQ(s.redo_op[13], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[14], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+		/* The sync's flush notification: three
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		for (i = 16; i < 19; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
 		/* The $FILE_NAME create is the last CreateAttribute, the
 		 * record right before the index entry. */
 		lsn_fn = s.lsn[8];
@@ -1789,16 +2095,16 @@ out:
 	CHECK(mrlsn_dir != 0);
 	CHECK(mrlsn_dir >= lsn_index);
 
-	/* Replay copy 1: the MFT records were already flushed, so only
-	 * the two records that carry no LSN to skip on redo — the $MFT
-	 * $DATA size extension and the SetBits — and the extension
-	 * writes MFT record 0. */
+	/* Replay copy 1: the sync flushed the $MFT folios and the
+	 * bitmap folio, so the flush notification retired every dirty
+	 * page and the replay redoes nothing. The directory is already
+	 * on the volume; replay is a no-op. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -1844,19 +2150,21 @@ out:
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * two records. Replay is idempotent. */
+	 * zero records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
 	unlink(snap1);
 	unlink(snap2);
 }
+
+/* ---- 3. a create in the volume root writes no transaction records -- */
 
 /* ---- 4. a create in the root falls back to unjournaled -------------- */
 
@@ -1902,8 +2210,19 @@ static void test_create_in_root_unjournaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
+	/* The create proceeds unjournaled, so the log holds no
+	 * transaction records — but the flush notification (Phase 4
+	 * step 2) appends two DeleteDirtyClusters records for the
+	 * stale dirty-page entries the aborted transaction staged
+	 * (the abort-leak note in JOURNAL-DESIGN.md §4.3). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	CHECK_EQ(lookup_after_mount(snap, "r.txt"), 0);
 	CHECK_EQ(run_ntfsck_clean(snap), 0);
@@ -1976,59 +2295,65 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk from the oldest LSN holds 25 records: the create's
-	 * 14 that are still live (its 2 open records are already
-	 * dispensable — oldest sits at its first data record — so 9
-	 * data + Commit + 3 dumps + Forget) plus the unlink's 11.
-	 * The unlink transaction is 2 open + 4 data + Commit + 3
-	 * dumps + Forget: it touches two attributes, so it opens
+	/* The walk from the oldest LSN holds 13 records: the unlink's
+	 * 11, plus the sync's two DeleteDirtyClusters records. The
+	 * create's records are gone: the sync after the create
+	 * flushed the $MFT folios and the bitmap folio, the flush
+	 * notification (Phase 4 step 2) retired the create's dirty
+	 * pages, and the unlink's commit checkpoint advanced
+	 * oldest_lsn past them. That is the point of the
+	 * notification — a crash after the sync needs none of the
+	 * create's redo records, because the pages are already on
+	 * disk. The unlink transaction is 2 open + 4 data + Commit +
+	 * 3 dumps + Forget: it touches two attributes, so it opens
 	 * both ($MFT:$DATA for the index, the $FILE_NAME and the
 	 * Deallocate; $MFT:$BITMAP for the ClearBits), and its data
 	 * records are DeleteIndexEntryRoot, DeleteAttribute,
 	 * DeallocateFileRecordSegment and ClearBitsInNonresidentBitMap
 	 * — the free is part of the unlink transaction, not a
-	 * separate evict one. The create's records stay live because
-	 * the MFT pages they dirtied were never flushed to disk — no
-	 * checkpoint is emitted after a sync, so the dirty-page table
-	 * still names the create's LSNs as the oldest for those
-	 * pages. That is correct NTFS behaviour: a crash before those
-	 * pages flush needs the create's redo records. The unlink's
-	 * records follow at positions 14..24. */
+	 * separate evict one. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 25);
-	if (s.n == 25) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x40u);
-		CHECK_EQ(s.redo_op[16], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[17], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[18], LOP_DeallocateFileRecordSegment);
-		CHECK_EQ(s.redo_op[19], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
+	CHECK_EQ(s.n, 13);
+	if (s.n == 13) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[11], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[11], 0u);
+		CHECK_EQ(s.redo_op[12], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[12], 0u);
 		/* The index, $FILE_NAME and Deallocate records target
 		 * $MFT:$DATA (0x18): the index entry lives in the
 		 * parent's record, the $FILE_NAME and the free in the
 		 * file's own. The ClearBits targets $MFT:$BITMAP
 		 * (0x40). */
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.target_attr[18], 0x18u);
-		CHECK_EQ(s.target_attr[19], 0x40u);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.target_attr[4], 0x18u);
+		CHECK_EQ(s.target_attr[5], 0x40u);
 		/* The file's record is at vcn ino/4 (1024-byte records
 		 * in 4096-byte clusters), the parent's at sub_ino/4;
 		 * the bitmap bit for the file's record is in cluster
 		 * (ino/8)/4096 of $MFT:$BITMAP. */
-		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[17], ino / 4);
-		CHECK_EQ(s.target_vcn[18], ino / 4);
-		CHECK_EQ(s.target_vcn[19], (ino / 8) / 4096);
-		lsn_del_idx = s.lsn[16];
-		lsn_del_attr = s.lsn[17];
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], ino / 4);
+		CHECK_EQ(s.target_vcn[4], ino / 4);
+		CHECK_EQ(s.target_vcn[5], (ino / 8) / 4096);
+		lsn_del_idx = s.lsn[2];
+		lsn_del_attr = s.lsn[3];
 	}
 
 	/* Both touched records carry an MR_LSN at or past the record
@@ -2041,27 +2366,21 @@ out:
 	CHECK(mrlsn_dir != 0);
 	CHECK(mrlsn_dir >= lsn_del_idx);
 
-	/* Replay copy 1: the unlink's DeleteIndexEntryRoot and
-	 * DeleteAttribute are skipped on their MR_LSN stamps and
-	 * its Deallocate is skipped on its effect (the record is
-	 * already free on disk — the effect-based skip), but the
-	 * create's records are still live (see above) so the replay
-	 * redoes exactly its two idempotent ones —
-	 * SetNewAttributeSizes (MFT record 0) and
-	 * SetBitsInNonresidentBitMap (the $MFT bitmap cluster) —
-	 * plus the unlink's ClearBits, which clears the same
-	 * cluster's bit again (idempotent: the clean unmount
-	 * already cleared it, so the cluster count stays 1).
-	 * The replayed image is ntfsck-clean: the free is in the
-	 * unlink transaction, so the SetBits redo no longer
-	 * resurrects the freed record's bit.
+	/* Replay copy 1: the sync flushed the $MFT folios and the
+	 * bitmap folio, so the flush notification retired the
+	 * create's and the unlink's dirty pages alike — the replay
+	 * redoes nothing. The file is already gone on the volume
+	 * (the unlink's delete landed on disk), and the replayed
+	 * image is ntfsck-clean: the free is in the unlink
+	 * transaction, so no SetBits redo resurrects the freed
+	 * record's bit.
 	 */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
@@ -2129,8 +2448,20 @@ out:
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
+	/* The create and the unlink both proceed unjournaled, so the
+	 * log holds no transaction records — but the flush
+	 * notification (Phase 4 step 2) appends two
+	 * DeleteDirtyClusters records for the stale dirty-page
+	 * entries the aborted transactions staged (the abort-leak
+	 * note in JOURNAL-DESIGN.md §4.3). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	CHECK_EQ(lookup_after_mount(snap, "r.txt"), -ENOENT);
 	CHECK_EQ(run_ntfsck_clean(snap), 0);
@@ -2198,45 +2529,51 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk holds the mkdir's 14 still-live records first (its
-	 * two opens precede oldest_lsn and are dispensable), then the
-	 * rmdir's full 11 — the rmdir's opens follow oldest_lsn, so
-	 * they are held. Before the mkdir class the setup mkdir was
-	 * unjournaled and the walk held only the rmdir's 11. */
+	/* The walk holds only the rmdir's 11 records, plus the sync's
+	 * two DeleteDirtyClusters records. The setup mkdir's records
+	 * are gone: the sync after the mkdir flushed the $MFT folios
+	 * and the bitmap folio, the flush notification (Phase 4
+	 * step 2) retired the mkdir's dirty pages, and the rmdir's
+	 * commit checkpoint advanced oldest_lsn past them. Before
+	 * the mkdir class the setup mkdir was unjournaled and the
+	 * walk held only the rmdir's 11. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 25);
-	if (s.n == 25) {
-		/* The mkdir's first and last live records. */
-		CHECK_EQ(s.redo_op[0], LOP_SetNewAttributeSizes);
-		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x40u);
-		CHECK_EQ(s.redo_op[16], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[17], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[18], LOP_DeallocateFileRecordSegment);
-		CHECK_EQ(s.redo_op[19], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[20], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[21], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[24], LOP_ForgetTransaction);
-		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[17], sub2_ino / 4);
-		CHECK_EQ(s.target_vcn[18], sub2_ino / 4);
-		CHECK_EQ(s.target_vcn[19], (sub2_ino / 8) / 4096);
+	CHECK_EQ(s.n, 13);
+	if (s.n == 13) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[11], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[11], 0u);
+		CHECK_EQ(s.redo_op[12], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[12], 0u);
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[4], sub2_ino / 4);
+		CHECK_EQ(s.target_vcn[5], (sub2_ino / 8) / 4096);
 	}
 
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	/* Three records redo: the mkdir's $MFT $DATA size extension
-	 * and SetBits (both idempotent) plus the rmdir's ClearBits
-	 * (idempotent clear of an already-clear bit); the Deallocate
-	 * is skipped on its effect — the record is already free on
-	 * disk. */
-	CHECK_EQ(an.records_redone, 3u);
+	/* No records redo: the sync flushed the $MFT folios and the
+	 * bitmap folio, so the flush notification retired the mkdir's
+	 * and the rmdir's dirty pages alike. The directory is already
+	 * gone on the volume. */
+	CHECK_EQ(an.records_redone, 0u);
 	CHECK(!an.needs_chkdsk);
 
 	CHECK_EQ(lookup_nested_after_mount(snap1, "sub", "sub2"), -ENOENT);
@@ -2307,43 +2644,52 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk holds 24 records: the create's 14 still-live ones
-	 * (see test_unlink_journaled) plus the rename's 10 — 1 open
-	 * ($MFT:$DATA: the rename allocates and frees nothing, so no
-	 * $MFT:$BITMAP open record) + 4 data + Commit + 3 dumps +
-	 * Forget. The rename's data records are the link half first
-	 * (CreateAttribute for the new $FILE_NAME, AddIndexEntryRoot
-	 * for the new entry) then the old name's removal
-	 * (DeleteIndexEntryRoot, DeleteAttribute), in live order. */
+	/* The walk holds 11 records: the rename's 10, plus the sync's
+	 * one DeleteDirtyClusters record. The create's records are
+	 * gone: the sync after the create flushed the $MFT folios
+	 * and the bitmap folio, the flush notification (Phase 4
+	 * step 2) retired the create's dirty pages, and the rename's
+	 * commit checkpoint advanced oldest_lsn past them. The
+	 * rename is 1 open ($MFT:$DATA: the rename allocates and
+	 * frees nothing, so no $MFT:$BITMAP open record) + 4 data +
+	 * Commit + 3 dumps + Forget. The rename's data records are
+	 * the link half first (CreateAttribute for the new
+	 * $FILE_NAME, AddIndexEntryRoot for the new entry) then the
+	 * old name's removal (DeleteIndexEntryRoot,
+	 * DeleteAttribute), in live order. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 24);
-	if (s.n == 24) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_CreateAttribute);
-		CHECK_EQ(s.redo_op[16], LOP_AddIndexEntryRoot);
-		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.target_attr[18], 0x18u);
+	CHECK_EQ(s.n, 11);
+	if (s.n == 11) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[2], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[4], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[5], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[6], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[10], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[10], 0u);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.target_attr[4], 0x18u);
 		/* The new $FILE_NAME and the old one's removal target
 		 * the file's record; both index records target the
 		 * parent's. */
-		CHECK_EQ(s.target_vcn[15], ino / 4);
-		CHECK_EQ(s.target_vcn[16], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[17], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[18], ino / 4);
-		lsn_create_attr = s.lsn[15];
-		lsn_add_idx = s.lsn[16];
-		lsn_del_idx = s.lsn[17];
-		lsn_del_attr = s.lsn[18];
+		CHECK_EQ(s.target_vcn[1], ino / 4);
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[4], ino / 4);
+		lsn_create_attr = s.lsn[1];
+		lsn_add_idx = s.lsn[2];
+		lsn_del_idx = s.lsn[3];
+		lsn_del_attr = s.lsn[4];
 	}
 
 	/* Both touched records carry an MR_LSN at or past the record
@@ -2359,18 +2705,16 @@ out:
 	CHECK(mrlsn_dir >= lsn_add_idx);
 	CHECK(mrlsn_dir >= lsn_del_idx);
 
-	/* Replay: only the create's two idempotent records redo
-	 * (SetNewAttributeSizes on record 0 and SetBits on the $MFT
-	 * bitmap cluster) — the rename's four data records are all
-	 * skipped on their MR_LSN stamps, because the file and the
-	 * directory were flushed after the commit. The file is under
-	 * its new name and ntfsck is clean. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the rename's dirty pages alike. The file
+	 * is under its new name and ntfsck is clean. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
@@ -2438,8 +2782,22 @@ out:
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
+	/* The create and the rename both proceed unjournaled, so the
+	 * log holds no transaction records — but the flush
+	 * notification (Phase 4 step 2) appends three
+	 * DeleteDirtyClusters records for the stale dirty-page
+	 * entries the aborted transactions staged (the abort-leak
+	 * note in JOURNAL-DESIGN.md §4.3). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 3);
+	if (s.n == 3) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[2], 0u);
+	}
 
 	CHECK_EQ(lookup_after_mount(snap, "s.txt"), 0);
 	CHECK_EQ(lookup_after_mount(snap, "r.txt"), -ENOENT);
@@ -2525,65 +2883,68 @@ out:
 	 * ClearBitsInNonresidentBitMap), then the link half
 	 * (CreateAttribute, AddIndexEntryRoot), then the old name's
 	 * removal (DeleteIndexEntryRoot, DeleteAttribute). */
-	/* The walk holds 45 records: the first create's 14 still-live
-	 * ones (its 2 open records precede oldest — oldest sits at
-	 * its first data record, the Initialize — so they are already
-	 * dispensable), the second create's full 16 (its opens follow
-	 * oldest, so they are still live; it stages a sizes record
-	 * too, because allocating its record grows $MFT $DATA's
-	 * data_size by one record), plus the rename's 15 — 2 open
-	 * ($MFT:$DATA and $MFT:$BITMAP: the target's free touches
-	 * the bitmap) + 8 data + Commit + 3 dumps + Forget. The
-	 * rename's data records are the target's removal first
-	 * (DeleteIndexEntryRoot, DeleteAttribute,
+	/* The walk holds 17 records: the rename's 15, plus the sync's
+	 * two DeleteDirtyClusters records. Both creates' records are
+	 * gone: the sync after the creates flushed the $MFT folios
+	 * and the bitmap folio, the flush notification (Phase 4
+	 * step 2) retired the creates' dirty pages, and the rename's
+	 * commit checkpoint advanced oldest_lsn past them. The
+	 * rename is 2 open ($MFT:$DATA and $MFT:$BITMAP: the
+	 * target's free touches the bitmap) + 8 data + Commit + 3
+	 * dumps + Forget. The rename's data records are the target's
+	 * removal first (DeleteIndexEntryRoot, DeleteAttribute,
 	 * DeallocateFileRecordSegment,
 	 * ClearBitsInNonresidentBitMap), then the link half
 	 * (CreateAttribute, AddIndexEntryRoot), then the old name's
 	 * removal (DeleteIndexEntryRoot, DeleteAttribute). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 45);
-	if (s.n == 45) {
-		CHECK_EQ(s.redo_op[30], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[30], 0x18u);
-		CHECK_EQ(s.redo_op[31], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[31], 0x40u);
-		CHECK_EQ(s.redo_op[32], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[33], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[34], LOP_DeallocateFileRecordSegment);
-		CHECK_EQ(s.redo_op[35], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[36], LOP_CreateAttribute);
-		CHECK_EQ(s.redo_op[37], LOP_AddIndexEntryRoot);
-		CHECK_EQ(s.redo_op[38], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[39], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[40], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[41], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[42], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[43], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[44], LOP_ForgetTransaction);
-		CHECK_EQ(s.target_vcn[32], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[33], k_ino / 4);
-		CHECK_EQ(s.target_vcn[34], k_ino / 4);
-		CHECK_EQ(s.target_vcn[35], (k_ino / 8) / 4096);
-		CHECK_EQ(s.target_vcn[36], j_ino / 4);
-		CHECK_EQ(s.target_vcn[37], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[38], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[39], j_ino / 4);
+	CHECK_EQ(s.n, 17);
+	if (s.n == 17) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[6], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[7], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[8], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[9], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[10], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[11], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[15], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[15], 0u);
+		CHECK_EQ(s.redo_op[16], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[16], 0u);
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], k_ino / 4);
+		CHECK_EQ(s.target_vcn[4], k_ino / 4);
+		CHECK_EQ(s.target_vcn[5], (k_ino / 8) / 4096);
+		CHECK_EQ(s.target_vcn[6], j_ino / 4);
+		CHECK_EQ(s.target_vcn[7], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[8], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[9], j_ino / 4);
 	}
 
-	/* Replay: the two creates' idempotent records redo (each
-	 * create's sizes + SetBits — every record allocation grows
-	 * $MFT $DATA's data_size by one record, so both creates
-	 * staged a sizes record) plus the rename's ClearBits for
-	 * the target's freed record — the rest of the rename's
-	 * records are skipped on their MR_LSN stamps (or, for the
-	 * Deallocate, on its effect). The file is under the target
-	 * name with the source's inode, and ntfsck is clean. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the creates' and the rename's dirty pages alike. The file
+	 * is under the target name with the source's inode, and
+	 * ntfsck is clean. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
@@ -2666,32 +3027,41 @@ out:
 
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk holds 24 records: the create's 14 still-live ones
-	 * plus the rename's 10 — the same four data records as a
+	/* The walk holds 11 records: the rename's 10, plus the sync's
+	 * one DeleteDirtyClusters record. The create's records are
+	 * gone: the sync after the create flushed the $MFT folios
+	 * and the bitmap folio, the flush notification (Phase 4
+	 * step 2) retired the create's dirty pages, and the rename's
+	 * commit checkpoint advanced oldest_lsn past them. The
+	 * rename's 10 are the same four data records as a
 	 * same-directory rename, split across the two parents: the
 	 * link half targets d2, the old name's removal targets d1. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 24);
-	if (s.n == 24) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_CreateAttribute);
-		CHECK_EQ(s.redo_op[16], LOP_AddIndexEntryRoot);
-		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
-		CHECK_EQ(s.target_vcn[15], ino / 4);
-		CHECK_EQ(s.target_vcn[16], d2_ino / 4);
-		CHECK_EQ(s.target_vcn[17], d1_ino / 4);
-		CHECK_EQ(s.target_vcn[18], ino / 4);
-		lsn_create_attr = s.lsn[15];
-		lsn_add_idx = s.lsn[16];
-		lsn_del_idx = s.lsn[17];
-		lsn_del_attr = s.lsn[18];
+	CHECK_EQ(s.n, 11);
+	if (s.n == 11) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_CreateAttribute);
+		CHECK_EQ(s.redo_op[2], LOP_AddIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[4], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[5], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[6], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[10], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[10], 0u);
+		CHECK_EQ(s.target_vcn[1], ino / 4);
+		CHECK_EQ(s.target_vcn[2], d2_ino / 4);
+		CHECK_EQ(s.target_vcn[3], d1_ino / 4);
+		CHECK_EQ(s.target_vcn[4], ino / 4);
+		lsn_create_attr = s.lsn[1];
+		lsn_add_idx = s.lsn[2];
+		lsn_del_idx = s.lsn[3];
+		lsn_del_attr = s.lsn[4];
 	}
 
 	/* All three touched records carry an MR_LSN at or past the
@@ -2707,13 +3077,15 @@ out:
 	CHECK(mrlsn_d1 != 0);
 	CHECK(mrlsn_d1 >= lsn_del_idx);
 
-	/* Replay: only the create's two idempotent records redo. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the rename's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
@@ -2835,31 +3207,35 @@ static void test_truncate_shrink_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14 still-live records, then the
-	 * setattr transaction's 13. ntfs_truncate routes through
-	 * ntfs_setattr, so the resize joins the setattr transaction:
-	 * the truncate's 6 (2 open + 4 data) plus the setattr's 2
-	 * (the $SI 36 bytes, then a second UpdateFileNameRoot with
-	 * the same dup — the setattr stages its own $FILE_NAME
-	 * record from its begin snapshot, it does not dedupe
-	 * against the truncate's), plus Commit + 3 dumps + Forget.
-	 * The four truncate data records are the $Bitmap ClearBits
-	 * for the freed run, the UpdateMappingPairs for the shorter
-	 * run list, the SetNewAttributeSizes for the new sizes, and
-	 * the UpdateFileNameRoot for the parent's $FILE_NAME — in
-	 * that order: clusters first, then the pairs that name
-	 * them, then the sizes, then the parent's duplicated
-	 * sizes. */
+	/* The walk: the shrink transaction's 13 records, plus the
+	 * sync's two DeleteDirtyClusters records. The create's
+	 * records are gone: the sync after the create flushed the
+	 * $MFT folios and the bitmap folio, the flush notification
+	 * (Phase 4 step 2) retired the create's dirty pages, and
+	 * the shrink's commit checkpoint advanced oldest_lsn past
+	 * them. ntfs_truncate routes through ntfs_setattr, so the
+	 * resize joins the setattr transaction: the truncate's 6
+	 * (2 open + 4 data) plus the setattr's 2 (the $SI 36 bytes,
+	 * then a second UpdateFileNameRoot with the same dup — the
+	 * setattr stages its own $FILE_NAME record from its begin
+	 * snapshot, it does not dedupe against the truncate's),
+	 * plus Commit + 3 dumps + Forget. The four truncate data
+	 * records are the $Bitmap ClearBits for the freed run, the
+	 * UpdateMappingPairs for the shorter run list, the
+	 * SetNewAttributeSizes for the new sizes, and the
+	 * UpdateFileNameRoot for the parent's $FILE_NAME — in that
+	 * order: clusters first, then the pairs that name them,
+	 * then the sizes, then the parent's duplicated sizes. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 27);
-	if (s.n != 27) {
+	CHECK_EQ(s.n, 15);
+	if (s.n != 15) {
 		int k;
 		for (k = 0; k < s.n; k++)
 			fprintf(stderr, "DBG ow op[%d]=%u attr=0x%x lsn=%llu\n",
 				k, s.redo_op[k], s.target_attr[k],
 				(unsigned long long)s.lsn[k]);
 	}
-	if (s.n == 27) {
+	if (s.n == 15) {
 		/* The opens come in first-use order: the truncate
 		 * stages the $Bitmap record first, so the volume
 		 * $Bitmap ($Bitmap:$DATA) opens before $MFT:$DATA —
@@ -2867,35 +3243,42 @@ static void test_truncate_shrink_journaled(void)
 		 * the attribute the truncate opened first, and that
 		 * attribute is NOT the one the create's SetBits used
 		 * ($MFT:$BITMAP, MFT-record bits). */
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], s.clear_bits_target_attr);
-		CHECK(s.target_attr[14] != s.bits_target_attr);
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.target_attr[16], s.clear_bits_target_attr);
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], s.clear_bits_target_attr);
+		CHECK(s.target_attr[0] != s.bits_target_attr);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[2], s.clear_bits_target_attr);
 		CHECK(s.clear_bits_target_attr != s.bits_target_attr);
-		CHECK_EQ(s.redo_op[17], LOP_UpdateMappingPairs);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
-		CHECK_EQ(s.target_attr[18], 0x18u);
-		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[4], 0x18u);
+		CHECK_EQ(s.redo_op[5], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[5], 0x18u);
 		/* The setattr's two records, staged at finish after
 		 * the truncate's: the $SI 36 bytes (mtime/ctime moved
 		 * by the resize) and a second UpdateFileNameRoot —
-		 * same dup as [19], staged from the setattr's begin
+		 * same dup as [5], staged from the setattr's begin
 		 * snapshot. Both address the file's record through
 		 * $MFT:$DATA (0x18). */
-		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[20], 0x18u);
-		CHECK_EQ(s.redo_op[21], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[21], 0x18u);
-		CHECK_EQ(s.redo_op[22], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[23], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[24], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[25], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[26], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[6], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[6], 0x18u);
+		CHECK_EQ(s.redo_op[7], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[7], 0x18u);
+		CHECK_EQ(s.redo_op[8], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[9], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[11], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[13], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[13], 0u);
+		CHECK_EQ(s.redo_op[14], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[14], 0u);
 		/* The $FILE_NAME record names the new sizes (64 KiB)
 		 * and undoes to the old ones (256 KiB); the parent's
 		 * record is addressed through $MFT:$DATA, like the
@@ -2905,14 +3288,14 @@ static void test_truncate_shrink_journaled(void)
 		CHECK_EQ(s.fn_redo_alloc, 64u * 1024u);
 		CHECK_EQ(s.fn_undo_alloc, 256u * 1024u);
 		/* The collector keeps the LAST $FILE_NAME record: the
-		 * setattr's dup at [21], identical to the truncate's
-		 * at [19]. */
-		CHECK_EQ(s.fnupd_lsn, s.lsn[21]);
+		 * setattr's dup at [7], identical to the truncate's
+		 * at [5]. */
+		CHECK_EQ(s.fnupd_lsn, s.lsn[7]);
 		/* The ClearBits frees 48 clusters, one run. (The
 		 * SetBits fields still hold the create's 1-bit record;
 		 * the clear has its own capture.) */
 		CHECK_EQ(s.clear_bits_count, 48u);
-		CHECK_EQ(s.clear_bits_lsn, s.lsn[16]);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[2]);
 		/* The ClearBits targets the VOLUME $Bitmap
 		 * ($Bitmap:$DATA, record 6) — not $MFT:$BITMAP
 		 * (record 0, type 0xB0), which holds MFT-record
@@ -2930,38 +3313,23 @@ static void test_truncate_shrink_journaled(void)
 		/* The sizes record names the new data size. */
 		CHECK_EQ(s.sizes_redo_data, 64u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 256u * 1024u);
-		CHECK_EQ(s.sizes_lsn, s.lsn[18]);
+		CHECK_EQ(s.sizes_lsn, s.lsn[4]);
 		/* The pairs record is the $DATA attribute, at the
 		 * same record offset as the sizes record. */
-		CHECK_EQ(s.record_off[17], s.record_off[18]);
+		CHECK_EQ(s.record_off[3], s.record_off[4]);
 	}
 	(void)i;
 
-	/* Replay copy 1: five records redo — the create's sizes
-	 * and SetBits, the truncate's ClearBits, and the two
-	 * $FILE_NAME records (the truncate's and the setattr's
-	 * identical second dup). The truncate's sizes record is skipped
-	 * by the file record's MR_LSN stamp (the commit stamped it
-	 * and the sync flushed it), as is the pairs record and the
-	 * setattr's $SI record — but
-	 * the $FILE_NAME records are NOT skipped: the commit stamps
-	 * MR_LSN only into the file's record, not the parent's, so
-	 * the parent's record carries no stamp to skip on (the same
-	 * as record 0, whose stamp the replay applies itself).
-	 * The redo is idempotent — it writes the same duplicated
-	 * sizes the sync already flushed — and it writes the
-	 * parent's record, so two MFT records are written, not
-	 * one. Two clusters are written, not one: the create's
-	 * SetBits lands on the $MFT:$BITMAP cluster and the
-	 * truncate's ClearBits on the volume $Bitmap's own cluster
-	 * — before the bitmap fix both landed on the same (wrong)
-	 * cluster and the count was 1. */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios and the bitmap folios, so the flush notification
+	 * retired the create's and the shrink's dirty pages alike.
+	 * The file is already 64 KiB on the volume. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -2975,9 +3343,9 @@ static void test_truncate_shrink_journaled(void)
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
@@ -3053,43 +3421,56 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 39);
-	if (s.n == 39) {
-		/* The shrink's records sit at [14..26] (its
-		 * $FILE_NAME at [19], its setattr's $SI at [20] and
-		 * second $FILE_NAME at [21], as in the shrink test).
-		 * The extend's records sit at [27..38]: one open
-		 * ($DATA — no $Bitmap record, so $BITMAP never
-		 * opens), then pairs, sizes, the $SI flags, the
-		 * parent's $FILE_NAME, then the setattr's $SI and
-		 * second $FILE_NAME, Commit, dumps, Forget. */
-		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[19], 0x18u);
-		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[20], 0x18u);
-		CHECK_EQ(s.redo_op[21], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[21], 0x18u);
-		CHECK_EQ(s.redo_op[27], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[27], 0x18u);
-		CHECK_EQ(s.redo_op[28], LOP_UpdateMappingPairs);
-		CHECK_EQ(s.target_attr[28], 0x18u);
-		CHECK_EQ(s.redo_op[29], LOP_SetNewAttributeSizes);
-		CHECK_EQ(s.target_attr[29], 0x18u);
-		CHECK_EQ(s.redo_op[30], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[30], 0x18u);
-		CHECK_EQ(s.redo_op[31], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[31], 0x18u);
-		CHECK_EQ(s.redo_op[32], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[32], 0x18u);
-		CHECK_EQ(s.redo_op[33], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[33], 0x18u);
-		CHECK_EQ(s.redo_op[34], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[35], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
+	CHECK_EQ(s.n, 25);
+	if (s.n == 25) {
+		/* The shrink's records sit at [0..10] — its two opens
+		 * precede oldest_lsn and are dispensable, so the walk
+		 * starts at its ClearBits (its $FILE_NAME at [3], its
+		 * setattr's $SI at [4] and second $FILE_NAME at [5],
+		 * as in the shrink test). The extend's records sit at
+		 * [11..22]: one open ($DATA — no $Bitmap record, so
+		 * $BITMAP never opens), then pairs, sizes, the $SI
+		 * flags, the parent's $FILE_NAME, then the setattr's
+		 * $SI and second $FILE_NAME, Commit, dumps, Forget.
+		 * The create's records are gone: the sync after the
+		 * create flushed the $MFT folios and the bitmap folio,
+		 * the flush notification (Phase 4 step 2) retired the
+		 * create's dirty pages, and the shrink's commit
+		 * checkpoint advanced oldest_lsn past them. */
+		CHECK_EQ(s.redo_op[3], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[4], 0x18u);
+		CHECK_EQ(s.redo_op[5], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[5], 0x18u);
+		CHECK_EQ(s.redo_op[11], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[11], 0x18u);
+		CHECK_EQ(s.redo_op[12], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[12], 0x18u);
+		CHECK_EQ(s.redo_op[13], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[13], 0x18u);
+		CHECK_EQ(s.redo_op[14], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[14], 0x18u);
+		CHECK_EQ(s.redo_op[15], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[15], 0x18u);
+		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[16], 0x18u);
+		CHECK_EQ(s.redo_op[17], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[17], 0x18u);
+		CHECK_EQ(s.redo_op[18], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[19], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[20], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[21], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[22], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[23], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[23], 0u);
+		CHECK_EQ(s.redo_op[24], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[24], 0u);
 		/* The extend's $FILE_NAME record (the last one the
-		 * collector saw — the setattr's second dup at [33])
+		 * collector saw — the setattr's second dup at [17])
 		 * names the new sizes (256 KiB) and undoes to the old
 		 * ones (64 KiB); the sparse flag flips with it (0x200
 		 * set, 0x0 undone). */
@@ -3103,46 +3484,39 @@ out:
 		 * carry only the sparse bit. */
 		CHECK_EQ(s.fn_redo_flags, 0x200u);
 		CHECK_EQ(s.fn_undo_flags, 0u);
-		CHECK_EQ(s.fnupd_lsn, s.lsn[33]);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[17]);
 		/* The $SI record sets the sparse bit (0x200) and
 		 * undoes to clear (0x0) — the $DATA flag flips in
 		 * step, so the two agree after replay either way. The
 		 * 4-byte capture ignores the setattr's 36-byte $SI
-		 * record at [32], so this is still the truncate's
-		 * flags record at [30]. */
+		 * record at [16], so this is still the truncate's
+		 * flags record at [14]. */
 		CHECK_EQ(s.res_redo, 0x200u);
 		CHECK_EQ(s.res_undo, 0u);
-		CHECK_EQ(s.res_lsn, s.lsn[30]);
+		CHECK_EQ(s.res_lsn, s.lsn[14]);
 		/* No bitmap record in the extend: the ClearBits
 		 * fields still hold the shrink's 48-cluster free. */
 		CHECK_EQ(s.clear_bits_count, 48u);
-		CHECK_EQ(s.clear_bits_lsn, s.lsn[16]);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[0]);
 		/* The sizes record names the new data size. */
 		CHECK_EQ(s.sizes_redo_data, 256u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 64u * 1024u);
-		CHECK_EQ(s.sizes_lsn, s.lsn[29]);
+		CHECK_EQ(s.sizes_lsn, s.lsn[13]);
 		/* The pairs record is the $DATA attribute, at the
 		 * same record offset as the sizes record. */
-		CHECK_EQ(s.record_off[28], s.record_off[29]);
+		CHECK_EQ(s.record_off[12], s.record_off[13]);
 	}
 
-	/* Replay: seven records redo — the create's sizes and SetBits,
-	 * the shrink's ClearBits, and the four $FILE_NAME records
-	 * (shrink's truncate + setattr dups, extend's truncate +
-	 * setattr dups). The extend adds no pairs, sizes or
-	 * $SI redo: those are skipped by the file record's MR_LSN
-	 * stamp (the commit stamped it and the sync flushed it), and
-	 * it has no $Bitmap record to redo. The $FILE_NAME records
-	 * redo because the commit stamps MR_LSN only into the file's
-	 * record, not the parent's (see the shrink test) — the redo
-	 * is idempotent and writes the parent's record, so two MFT
-	 * records are written, not one. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folios, so the flush notification retired
+	 * the create's, the shrink's and the extend's dirty pages
+	 * alike. The file is already 256 KiB on the volume. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 7u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -3155,7 +3529,7 @@ out:
 	unlink(snap1);
 }
 
-/* ---- 14. a truncate of a resident file writes no client records -------- */
+/* ---- 14. a truncate of a resident file writes no transaction records -- */
 
 static void test_truncate_resident_unjournaled(void)
 {
@@ -3185,8 +3559,10 @@ static void test_truncate_resident_unjournaled(void)
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
 	/* A small file, never written: its $DATA is resident. The
-	 * create journals (14 live records); the truncate must add
-	 * none — walk before and after and compare. */
+	 * create journals (16 records); the truncate must add
+	 * none — walk before and after and compare. The sync's
+	 * flush notification (Phase 4 step 2) appends three
+	 * DeleteDirtyClusters records after the create's Forget. */
 	err = ntfs_mkdir(root, "sub", 0100755, &d);
 	CHECK_EQ(err, 0);
 	if (err)
@@ -3205,7 +3581,15 @@ static void test_truncate_resident_unjournaled(void)
 	 * still mounted. */
 	CHECK_EQ(copy_file(orig, snap0), 0);
 	CHECK_EQ(walk_log(snap0, &s), 0);
-	CHECK_EQ(s.n, 16);
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
+		CHECK_EQ(s.redo_op[16], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[16], 0u);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[18], 0u);
+	}
 
 	/* Truncate the resident file to 2 bytes. */
 	err = ntfs_truncate(f, 2);
@@ -3223,9 +3607,18 @@ static void test_truncate_resident_unjournaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* Still 16: the truncate added no client records. */
+	/* Still 19: the truncate added no transaction records — the
+	 * three DeleteDirtyClusters records are the create's. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 16);
+	CHECK_EQ(s.n, 19);
+	if (s.n == 19) {
+		CHECK_EQ(s.redo_op[16], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[16], 0u);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[18], 0u);
+	}
 
 	{
 		uint64_t size = 0;
@@ -3310,30 +3703,40 @@ static void test_setattr_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, then the setattr transaction's 9
-	 * (one open + $SI + $EA + $FILE_NAME + Commit + 3 dumps +
-	 * Forget). No $EA_INFORMATION record: the $LXMOD value changes
+	/* The walk: the setattr transaction's 9 records, plus the
+	 * sync's one DeleteDirtyClusters record. The create's
+	 * records are gone: the sync after the create (in
+	 * truncate_setup) flushed the $MFT folios and the bitmap
+	 * folio, the flush notification (Phase 4 step 2) retired
+	 * the create's dirty pages, and the setattr's commit
+	 * checkpoint advanced oldest_lsn past them. The setattr is
+	 * one open + $SI + $EA + $FILE_NAME + Commit + 3 dumps +
+	 * Forget. No $EA_INFORMATION record: the $LXMOD value changes
 	 * but the entry count does not, so its 8 bytes are unchanged.
 	 * No $Bitmap record and no second open: everything the
 	 * setattr stages lives in the file's own record, addressed
 	 * through $MFT:$DATA. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 23);
-	if (s.n == 23) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.redo_op[17], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.redo_op[18], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[19], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[20], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_ForgetTransaction);
-		/* The $SI record (the 36-byte one, at [15]) names the
+	CHECK_EQ(s.n, 10);
+	if (s.n == 10) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[5], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[9], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[9], 0u);
+		/* The $SI record (the 36-byte one, at [1]) names the
 		 * new mtime/atime and the READONLY flag, and undoes to
 		 * the create's times and flags. crtime and ctime are
 		 * untouched by this call, so redo and undo agree. */
@@ -3347,37 +3750,32 @@ static void test_setattr_journaled(void)
 		CHECK_EQ(s.si_undo_ctime, ntfs_time(old.ctime.sec, old.ctime.nsec));
 		CHECK_EQ(s.si_redo_flags, old.file_attributes | 0x1u);
 		CHECK_EQ(s.si_undo_flags, old.file_attributes);
-		CHECK_EQ(s.si_lsn, s.lsn[15]);
-		/* The $EA record (at [16]) carries the new $LXMOD. */
+		CHECK_EQ(s.si_lsn, s.lsn[1]);
+		/* The $EA record (at [2]) carries the new $LXMOD. */
 		CHECK_EQ(s.ea_lxmod_redo, 0100444u);
 		CHECK_EQ(s.ea_lxmod_undo, 0100644u);
-		CHECK_EQ(s.ea_lsn, s.lsn[16]);
-		/* The $FILE_NAME record (at [17]) carries the READONLY
+		CHECK_EQ(s.ea_lsn, s.lsn[2]);
+		/* The $FILE_NAME record (at [3]) carries the READONLY
 		 * flag and undoes to the create's flags; the sizes do
 		 * not move. */
 		CHECK_EQ(s.fn_redo_flags, old.file_attributes | 0x1u);
 		CHECK_EQ(s.fn_undo_flags, old.file_attributes);
 		CHECK_EQ(s.fn_redo_data, 256u * 1024u);
 		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
-		CHECK_EQ(s.fnupd_lsn, s.lsn[17]);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[3]);
 	}
 	(void)i;
 
-	/* Replay copy 1: three records redo — the create's sizes and
-	 * SetBits, and the setattr's $FILE_NAME record. The $SI and
-	 * $EA records are skipped by the file record's MR_LSN stamp
-	 * (the commit stamped it and the sync flushed it); the
-	 * $FILE_NAME record is NOT skipped, the commit stamps MR_LSN
-	 * only into the file's record, not the parent's. The redo is
-	 * idempotent. One cluster is written: the create's SetBits
-	 * lands on the $MFT:$BITMAP cluster; the $FILE_NAME redo
-	 * writes the parent's MFT record, not a data cluster. */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios and the bitmap folio, so the flush notification
+	 * retired the create's and the setattr's dirty pages alike.
+	 * The attributes are already the new ones on the volume. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -3392,13 +3790,13 @@ static void test_setattr_journaled(void)
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
 	/* Replay copy 2: the same dirty snapshot replays to the same
-	 * three records. Replay is idempotent. */
+	 * zero records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
@@ -3458,74 +3856,87 @@ static void test_setattr_size_joins(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, then one 14-record transaction:
-	 * the truncate's 6 (2 open + ClearBits + pairs + sizes +
-	 * $FILE_NAME), the setattr's 3 ($SI + $EA + a second
-	 * $FILE_NAME with the same dup), and one Commit + 3 dumps +
-	 * Forget — not two transactions. The $SI here carries the
-	 * resize's mtime/ctime (current_time) as well as the
-	 * READONLY flag. */
+	/* The walk: one 14-record transaction, plus the sync's two
+	 * DeleteDirtyClusters records. The create's records are
+	 * gone: the sync after the create (in truncate_setup)
+	 * flushed the $MFT folios and the bitmap folio, the flush
+	 * notification (Phase 4 step 2) retired the create's dirty
+	 * pages, and this transaction's commit checkpoint advanced
+	 * oldest_lsn past them. The transaction is the truncate's
+	 * 6 (2 open + ClearBits + pairs + sizes + $FILE_NAME), the
+	 * setattr's 3 ($SI + $EA + a second $FILE_NAME with the
+	 * same dup), and one Commit + 3 dumps + Forget — not two
+	 * transactions. The $SI here carries the resize's
+	 * mtime/ctime (current_time) as well as the READONLY flag. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 28);
-	if (s.n == 28) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[17], LOP_UpdateMappingPairs);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.redo_op[18], LOP_SetNewAttributeSizes);
-		CHECK_EQ(s.target_attr[18], 0x18u);
-		CHECK_EQ(s.redo_op[19], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[19], 0x18u);
-		CHECK_EQ(s.redo_op[20], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[20], 0x18u);
-		CHECK_EQ(s.redo_op[21], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[21], 0x18u);
-		CHECK_EQ(s.redo_op[22], LOP_UpdateFileNameRoot);
-		CHECK_EQ(s.target_attr[22], 0x18u);
-		CHECK_EQ(s.redo_op[23], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[24], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[25], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[26], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[27], LOP_ForgetTransaction);
-		/* Exactly two commits in the whole log: the create's
-		 * and this one. A second transaction for the resize
-		 * would make three. */
+	CHECK_EQ(s.n, 16);
+	if (s.n == 16) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[4], 0x18u);
+		CHECK_EQ(s.redo_op[5], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[5], 0x18u);
+		CHECK_EQ(s.redo_op[6], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[6], 0x18u);
+		CHECK_EQ(s.redo_op[7], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[7], 0x18u);
+		CHECK_EQ(s.redo_op[8], LOP_UpdateFileNameRoot);
+		CHECK_EQ(s.target_attr[8], 0x18u);
+		CHECK_EQ(s.redo_op[9], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[10], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[11], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[14], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[14], 0u);
+		CHECK_EQ(s.redo_op[15], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[15], 0u);
+		/* Exactly one commit in the walk: this transaction's.
+		 * The create's commit retired with its records, so a
+		 * second transaction for the resize would show up as
+		 * a second commit here — the resize and the setattr
+		 * joined one transaction. */
 		for (i = 0; i < s.n; i++)
 			if (s.redo_op[i] == LOP_CommitTransaction)
 				commits++;
-		CHECK_EQ(commits, 2);
-		/* The setattr's $SI (at [20], the last 36-byte one)
+		CHECK_EQ(commits, 1);
+		/* The setattr's $SI (at [6], the last 36-byte one)
 		 * carries the READONLY flag; the resize moved the
 		 * times, so redo and undo differ there too. */
 		CHECK_EQ(s.si_redo_flags, old.file_attributes | 0x1u);
 		CHECK_EQ(s.si_undo_flags, old.file_attributes);
 		CHECK(s.si_redo_mtime != s.si_undo_mtime);
-		CHECK_EQ(s.si_lsn, s.lsn[20]);
-		/* The $EA record (at [21]) carries the new $LXMOD. */
+		CHECK_EQ(s.si_lsn, s.lsn[6]);
+		/* The $EA record (at [7]) carries the new $LXMOD. */
 		CHECK_EQ(s.ea_lxmod_redo, 0100444u);
 		CHECK_EQ(s.ea_lxmod_undo, 0100644u);
-		CHECK_EQ(s.ea_lsn, s.lsn[21]);
+		CHECK_EQ(s.ea_lsn, s.lsn[7]);
 		/* The last $FILE_NAME record (the setattr's dup at
-		 * [22]) names the new sizes. */
+		 * [8]) names the new sizes. */
 		CHECK_EQ(s.fn_redo_data, 64u * 1024u);
 		CHECK_EQ(s.fn_undo_data, 256u * 1024u);
-		CHECK_EQ(s.fnupd_lsn, s.lsn[22]);
+		CHECK_EQ(s.fnupd_lsn, s.lsn[8]);
 	}
 	(void)i;
 
-	/* Replay: five records redo — the create's sizes and SetBits,
-	 * the truncate's ClearBits, and the two $FILE_NAME records
-	 * (the truncate's and the setattr's identical second dup).
-	 * The pairs, sizes, $SI and $EA records are skipped by the
-	 * file record's MR_LSN stamp. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folios, so the flush notification retired
+	 * the create's and the joined transaction's dirty pages
+	 * alike. The file is already 64 KiB with the new mode. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -3571,7 +3982,8 @@ static void test_setattr_in_root_unjournaled(void)
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
 	/* The create in root is itself unjournaled (the root's index
-	 * lives in $INDEX_ALLOCATION), so the walk is empty before the
+	 * lives in $INDEX_ALLOCATION), so the walk holds only the
+	 * create's two DeleteDirtyClusters records before the
 	 * setattr — the same baseline the root-create test pins. */
 	err = ntfs_create(root, "r.txt", 0100644, &f);
 	CHECK_EQ(err, 0);
@@ -3580,7 +3992,13 @@ static void test_setattr_in_root_unjournaled(void)
 	CHECK_EQ(ntfs_volume_sync(vol), 0);
 	CHECK_EQ(copy_file(orig, snap), 0);
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	/* chmod + utimens on the root file: the $FILE_NAME stage cannot
 	 * find the entry in the root's $INDEX_ROOT (it is in
@@ -3603,9 +4021,19 @@ static void test_setattr_in_root_unjournaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* Still empty: the setattr added no client records. */
+	/* Still no transaction records: the setattr added one more
+	 * DeleteDirtyClusters record (three total) for the stale
+	 * dirty-page entry its aborted transaction staged. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 3);
+	if (s.n == 3) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[2], 0u);
+	}
 
 	/* The op still landed: mode and mtime are the new ones after a
 	 * remount, and the volume is clean. */
@@ -3673,49 +4101,60 @@ static void test_xattr_create_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, then the xattr transaction's 8
-	 * (one open — $MFT:$DATA — the $SI ctime record, the ADS
-	 * CreateAttribute, Commit, three table dumps, Forget). No
+	/* The walk: the xattr transaction's 8 records, plus the
+	 * sync's one DeleteDirtyClusters record. The create's
+	 * records are gone: the sync after the create (in
+	 * truncate_setup) flushed the $MFT folios and the bitmap
+	 * folio, the flush notification (Phase 4 step 2) retired
+	 * the create's dirty pages, and the xattr's commit
+	 * checkpoint advanced oldest_lsn past them. The xattr is
+	 * one open — $MFT:$DATA — the $SI ctime record, the ADS
+	 * CreateAttribute, Commit, three table dumps, Forget. No
 	 * $Bitmap record and no second open: a resident create
 	 * allocates no clusters. No $FILE_NAME record: ADS sizes are
 	 * not in the parent's dup. */
 	set_ads_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 22);
-	if (s.n == 22) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_CreateAttribute);
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.redo_op[17], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[18], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[19], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[20], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_ForgetTransaction);
-		/* The $SI record (at [15]) names a later ctime than
+	CHECK_EQ(s.n, 9);
+	if (s.n == 9) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_CreateAttribute);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[4], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[8], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[8], 0u);
+		/* The $SI record (at [1]) names a later ctime than
 		 * the create's — the setxattr success path only bumps
 		 * ctime — and undoes to the create's ctime. */
 		CHECK(s.si_redo_ctime > s.si_undo_ctime);
-		CHECK_EQ(s.si_lsn, s.lsn[15]);
+		CHECK_EQ(s.si_lsn, s.lsn[1]);
 		/* The ADS create is the only CreateAttribute carrying
-		 * "user.a"; the $FILE_NAME create is the only one
-		 * carrying "j.txt". */
+		 * "user.a". The create's $FILE_NAME record retired with
+		 * its transaction, so no CreateAttribute here carries
+		 * "j.txt". */
 		CHECK_EQ(s.ads_create_hits, 1);
-		CHECK_EQ(s.ads_create_lsn, s.lsn[16]);
-		CHECK_EQ(s.fn_name_hits, 1);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[2]);
+		CHECK_EQ(s.fn_name_hits, 0);
 	}
 
-	/* Replay copy 1: only the create's two idempotent records
-	 * redo — the xattr's records are skipped on the file
-	 * record's MR_LSN stamp. */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios and the bitmap folio, so the flush notification
+	 * retired the create's and the xattr's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -3726,14 +4165,14 @@ static void test_xattr_create_journaled(void)
 	CHECK_EQ(memcmp(buf, "abc", 3), 0);
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
-	/* Replay copy 2: the same dirty snapshot redoes the same two
+	/* Replay copy 2: the same dirty snapshot redoes the same zero
 	 * records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
@@ -3789,44 +4228,59 @@ static void test_xattr_replace_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, the create-xattr transaction's
-	 * 8, then the replace transaction's 8 (one open, the $SI
-	 * record, the value record, Commit, three dumps, Forget). */
+	/* The walk: the create-xattr transaction's 7 still-live
+	 * records (its open precedes oldest_lsn and is
+	 * dispensable), then the replace transaction's 8 (one open,
+	 * the $SI record, the value record, Commit, three dumps,
+	 * Forget), plus the sync's one DeleteDirtyClusters record.
+	 * The create's records are gone: the sync after the create
+	 * (in truncate_setup) flushed the $MFT folios and the
+	 * bitmap folio, the flush notification (Phase 4 step 2)
+	 * retired the create's dirty pages, and the create-xattr's
+	 * commit checkpoint advanced oldest_lsn past them. No sync
+	 * runs between the two setxattr calls, so the create-xattr's
+	 * records stay live. */
 	set_ads_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 30);
-	if (s.n == 30) {
-		CHECK_EQ(s.redo_op[22], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[22], 0x18u);
-		CHECK_EQ(s.redo_op[23], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[23], 0x18u);
-		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[24], 0x18u);
-		CHECK_EQ(s.redo_op[25], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[26], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[27], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[28], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[29], LOP_ForgetTransaction);
-		/* The value record (at [24]) carries the new value
+	CHECK_EQ(s.n, 16);
+	if (s.n == 16) {
+		CHECK_EQ(s.redo_op[7], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[7], 0x18u);
+		CHECK_EQ(s.redo_op[8], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[8], 0x18u);
+		CHECK_EQ(s.redo_op[9], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[9], 0x18u);
+		CHECK_EQ(s.redo_op[10], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[11], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[12], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[13], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[15], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[15], 0u);
+		/* The value record (at [9]) carries the new value
 		 * whole and undoes to the old value whole. */
 		CHECK_EQ(s.ads_value_redo_len, 6u);
 		CHECK_EQ(memcmp(s.ads_value_redo, "abcdef", 6), 0);
 		CHECK_EQ(s.ads_value_undo_len, 3u);
 		CHECK_EQ(memcmp(s.ads_value_undo, "abc", 3), 0);
-		CHECK_EQ(s.ads_value_lsn, s.lsn[24]);
+		CHECK_EQ(s.ads_value_lsn, s.lsn[9]);
 		/* The ADS was created once, in the first xattr
 		 * transaction. */
 		CHECK_EQ(s.ads_create_hits, 1);
-		CHECK_EQ(s.ads_create_lsn, s.lsn[16]);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[1]);
 	}
 
-	/* Replay: only the create's two idempotent records redo. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the op's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	/* The new value reads back after a remount. */
 	CHECK_EQ(xattr_after_mount(snap1, "sub", "j.txt", "user.a",
@@ -3885,48 +4339,61 @@ static void test_xattr_big_create_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, then the xattr transaction's 10
-	 * (two opens — $MFT:$DATA then $MFT:$BITMAP, in first-use
+	/* The walk: the xattr transaction's 10 records, plus the
+	 * sync's two DeleteDirtyClusters records. The create's
+	 * records are gone: the sync after the create (in
+	 * truncate_setup) flushed the $MFT folios and the bitmap
+	 * folio, the flush notification (Phase 4 step 2) retired
+	 * the create's dirty pages, and the xattr's commit
+	 * checkpoint advanced oldest_lsn past them. The xattr is
+	 * two opens — $MFT:$DATA then $MFT:$BITMAP, in first-use
 	 * order — the $SI record, the ADS CreateAttribute, the
 	 * SetBits for its two clusters, Commit, three dumps,
-	 * Forget). */
+	 * Forget. */
 	set_ads_name("user.big");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 24);
-	if (s.n == 24) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x68u);
-		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.redo_op[17], LOP_CreateAttribute);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.redo_op[18], LOP_SetBitsInNonresidentBitMap);
-		CHECK_EQ(s.target_attr[18], 0x68u);
-		CHECK_EQ(s.redo_op[19], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[20], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[23], LOP_ForgetTransaction);
+	CHECK_EQ(s.n, 12);
+	if (s.n == 12) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x68u);
+		CHECK_EQ(s.redo_op[2], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_CreateAttribute);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_SetBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[4], 0x68u);
+		CHECK_EQ(s.redo_op[5], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[6], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[10], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[10], 0u);
+		CHECK_EQ(s.redo_op[11], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[11], 0u);
 		/* The SetBits names two clusters: 8 KiB at 4 KiB per
 		 * cluster. */
 		CHECK_EQ(s.bits_target_attr, 0x68u);
 		CHECK_EQ(s.bits_count, 2u);
-		CHECK_EQ(s.bits_lsn, s.lsn[18]);
+		CHECK_EQ(s.bits_lsn, s.lsn[4]);
 		CHECK_EQ(s.ads_create_hits, 1);
-		CHECK_EQ(s.ads_create_lsn, s.lsn[17]);
+		CHECK_EQ(s.ads_create_lsn, s.lsn[3]);
 	}
 
-	/* Replay: the create's two records plus the xattr's SetBits
-	 * (the $Bitmap is never MR_LSN-stamped). The CreateAttribute
-	 * and $SI are skipped on the file record's stamp. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folios, so the flush notification retired
+	 * the create's and the xattr's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -3995,71 +4462,85 @@ static void test_xattr_big_replace_remove_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, the create-xattr transaction's
-	 * 10, the replace transaction's 11 (two opens, the $SI
-	 * record, sizes, pairs, SetBits, Commit, three dumps,
+	/* The walk: the create-xattr transaction's 7 still-live
+	 * records (its two opens precede oldest_lsn and are
+	 * dispensable), the replace transaction's 11 (two opens, the
+	 * $SI record, sizes, pairs, SetBits, Commit, three dumps,
 	 * Forget), then the remove transaction's 10 (two opens, the
 	 * $SI record, DeleteAttribute, ClearBits, Commit, three
-	 * dumps, Forget). */
+	 * dumps, Forget), plus the sync's two DeleteDirtyClusters
+	 * records. The create's records are gone: the sync after
+	 * the create (in truncate_setup) flushed the $MFT folios
+	 * and the bitmap folio, the flush notification (Phase 4
+	 * step 2) retired the create's dirty pages, and the
+	 * create-xattr's commit checkpoint advanced oldest_lsn past
+	 * them. No sync runs between the three xattr calls, so the
+	 * create-xattr's and the replace's records stay live. */
 	set_ads_name("user.big");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 45);
-	if (s.n == 45) {
+	CHECK_EQ(s.n, 31);
+	if (s.n == 31) {
 		/* Replace transaction: opens, $SI, sizes, pairs. */
-		CHECK_EQ(s.redo_op[24], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[24], 0x18u);
-		CHECK_EQ(s.redo_op[25], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[25], 0x68u);
-		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[26], 0x18u);
+		CHECK_EQ(s.redo_op[8], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[8], 0x18u);
+		CHECK_EQ(s.redo_op[9], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[9], 0x68u);
+		CHECK_EQ(s.redo_op[10], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[10], 0x18u);
 		/* The mapping pairs come before the sizes that name them
 		 * (the truncate class stages the same way). */
-		CHECK_EQ(s.redo_op[27], LOP_UpdateMappingPairs);
-		CHECK_EQ(s.target_attr[27], 0x18u);
-		CHECK_EQ(s.redo_op[28], LOP_SetNewAttributeSizes);
-		CHECK_EQ(s.target_attr[28], 0x18u);
-		CHECK_EQ(s.redo_op[29], LOP_SetBitsInNonresidentBitMap);
-		CHECK_EQ(s.target_attr[29], 0x68u);
-		CHECK_EQ(s.redo_op[30], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[11], LOP_UpdateMappingPairs);
+		CHECK_EQ(s.target_attr[11], 0x18u);
+		CHECK_EQ(s.redo_op[12], LOP_SetNewAttributeSizes);
+		CHECK_EQ(s.target_attr[12], 0x18u);
+		CHECK_EQ(s.redo_op[13], LOP_SetBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[13], 0x68u);
+		CHECK_EQ(s.redo_op[14], LOP_CommitTransaction);
 		/* The sizes record names the 8 KiB -> 16 KiB growth. */
-		/* Two sizes records: the create (0 -> 256 KiB) and the
-		 * replace (8 KiB -> 16 KiB). */
-		CHECK_EQ(s.sizes_count, 2);
+		/* One sizes record in the walk: the replace's (8 KiB
+		 * -> 16 KiB). The create's sizes record retired with
+		 * its transaction. */
+		CHECK_EQ(s.sizes_count, 1);
 		CHECK_EQ(s.sizes_redo_data, 16u * 1024u);
 		CHECK_EQ(s.sizes_undo_data, 8u * 1024u);
 		/* Remove transaction: opens, $SI, DeleteAttribute,
 		 * ClearBits. */
-		CHECK_EQ(s.redo_op[35], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[35], 0x18u);
-		CHECK_EQ(s.redo_op[36], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[36], 0x68u);
-		CHECK_EQ(s.redo_op[37], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[37], 0x18u);
-		CHECK_EQ(s.redo_op[38], LOP_DeleteAttribute);
-		CHECK_EQ(s.target_attr[38], 0x18u);
-		CHECK_EQ(s.redo_op[39], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.target_attr[39], 0x68u);
-		CHECK_EQ(s.redo_op[40], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[44], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[19], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[19], 0x18u);
+		CHECK_EQ(s.redo_op[20], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[20], 0x68u);
+		CHECK_EQ(s.redo_op[21], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[21], 0x18u);
+		CHECK_EQ(s.redo_op[22], LOP_DeleteAttribute);
+		CHECK_EQ(s.target_attr[22], 0x18u);
+		CHECK_EQ(s.redo_op[23], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.target_attr[23], 0x68u);
+		CHECK_EQ(s.redo_op[24], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[28], LOP_ForgetTransaction);
+		/* The sync's flush notification: two
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[29], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[29], 0u);
+		CHECK_EQ(s.redo_op[30], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[30], 0u);
 		/* The ClearBits frees the four 16 KiB clusters. */
 		CHECK_EQ(s.clear_bits_target_attr, 0x68u);
 		CHECK_EQ(s.clear_bits_count, 4u);
-		CHECK_EQ(s.clear_bits_lsn, s.lsn[39]);
+		CHECK_EQ(s.clear_bits_lsn, s.lsn[23]);
 	}
 
-	/* Replay: the create's two records, the big-create SetBits,
-	 * the replace SetBits and the remove ClearBits — the
-	 * $Bitmap records are never MR_LSN-stamped. The sizes,
-	 * pairs, CreateAttribute, DeleteAttribute and $SI records
-	 * are skipped on the file record's stamp. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folios, so the flush notification retired
+	 * the create's and the xattr transactions' dirty pages
+	 * alike. The ADS is already gone on the volume. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 5u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	/* Two distinct dirty overlay clusters are written back:
-	 * the MFT record cluster and the $Bitmap cluster. */
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	/* No clusters are written back: the replay redoes nothing. */
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -4106,8 +4587,9 @@ static void test_xattr_in_root_journaled(void)
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
 	/* The create in root is itself unjournaled (the root's index
-	 * lives in $INDEX_ALLOCATION), so the walk is empty before
-	 * the xattr — the same baseline the root-create test pins. */
+	 * lives in $INDEX_ALLOCATION), so the walk holds only the
+	 * create's two DeleteDirtyClusters records before the xattr
+	 * — the same baseline the root-create test pins. */
 	err = ntfs_create(root, "r.txt", 0100644, &f);
 	CHECK_EQ(err, 0);
 	if (err)
@@ -4115,7 +4597,13 @@ static void test_xattr_in_root_journaled(void)
 	CHECK_EQ(ntfs_volume_sync(vol), 0);
 	CHECK_EQ(copy_file(orig, snap), 0);
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	/* An xattr on the root file journals: only its own record
 	 * and $Bitmap are touched, no parent $FILE_NAME. */
@@ -4132,11 +4620,15 @@ static void test_xattr_in_root_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk holds just the xattr transaction's 8 records. */
+	/* The walk holds the xattr transaction's 8 records, plus the
+	 * sync's one DeleteDirtyClusters record. The create's two
+	 * notifies are gone: the xattr's commit checkpoint advanced
+	 * oldest_lsn past them, since the notifies had already
+	 * retired the entries they named. */
 	set_ads_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 8);
-	if (s.n == 8) {
+	CHECK_EQ(s.n, 9);
+	if (s.n == 9) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[0], 0x18u);
 		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
@@ -4148,6 +4640,10 @@ static void test_xattr_in_root_journaled(void)
 		CHECK_EQ(s.redo_op[5], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[6], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record after the Forget. */
+		CHECK_EQ(s.redo_op[8], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[8], 0u);
 		CHECK_EQ(s.ads_create_hits, 1);
 		CHECK_EQ(s.ads_create_lsn, s.lsn[2]);
 	}
@@ -4422,11 +4918,13 @@ out_dev:
 }
 
 /* The walk of one journaled symlink create in a driver-made
- * directory: 2 opens + 10 data + Commit + 3 dumps + Forget. The data
- * records are the $MFT $DATA size extension, the record init, the
- * $SD / $DATA-or-$INDEX_ROOT / $REPARSE_POINT / $FILE_NAME creates,
- * the $R index entry, the $SI flags, the parent index entry and the
- * SetBits — in that order. */
+ * directory: 2 opens + 10 data + Commit + 3 dumps + Forget, plus
+ * the sync's four DeleteDirtyClusters records (the flush
+ * notification, Phase 4 step 2). The data records are the $MFT
+ * $DATA size extension, the record init, the $SD /
+ * $DATA-or-$INDEX_ROOT / $REPARSE_POINT / $FILE_NAME creates,
+ * the $R index entry, the $SI flags, the parent index entry and
+ * the SetBits — in that order. */
 /* The walk checker for a journaled symlink create, shared by the
  * plain, WSL-tag and dir-link cases. @si_redo is the $SI flags value
  * the create stages: FILE_ATTR_REPARSE_POINT (0x400) for a plain or
@@ -4442,8 +4940,8 @@ static void check_symlink_walk(struct rec_seen *s, const char *snap,
 		 lsn_fn = 0, lsn_index = 0, lsn_r = 0;
 	int i;
 
-	CHECK_EQ(s->n, 17);
-	if (s->n != 17)
+	CHECK_EQ(s->n, 21);
+	if (s->n != 21)
 		return;
 	{
 		static const uint16_t want_op[10] = {
@@ -4470,6 +4968,14 @@ static void check_symlink_walk(struct rec_seen *s, const char *snap,
 	CHECK_EQ(s->redo_op[14], LOP_DirtyPageTableDump);
 	CHECK_EQ(s->redo_op[15], LOP_OpenAttributeTableDump);
 	CHECK_EQ(s->redo_op[16], LOP_ForgetTransaction);
+	/* The sync's flush notification (Phase 4 step 2): four
+	 * DeleteDirtyClusters records after the Forget — the $MFT
+	 * folio for record 0's cluster, the folio for the new record
+	 * + parent, the $MFT:$BITMAP folio, and the $Reparse folio. */
+	for (i = 17; i < 21; i++) {
+		CHECK_EQ(s->redo_op[i], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s->target_attr[i], 0u);
+	}
 	/* The $FILE_NAME create is the last CreateAttribute, the
 	 * record right before the $SI flags update; the $R entry sits
 	 * between the $REPARSE_POINT create and the $FILE_NAME one,
@@ -4627,9 +5133,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -4650,9 +5156,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(reparse_index_count_entries(snap2, rp_ino, tag, ino), 1);
 
 	unlink(orig);
@@ -4667,10 +5173,15 @@ out:
  * ($LXUID/$LXGID/$LXMOD, 60-byte stream), so setting a user EA on
  * it is a replace: the $EA_INFORMATION and $EA values are staged
  * whole, the $EA value growing (the xattr-proven length-change
- * path). The walk: the create's 14, then the EA transaction's 9
- * (one open — $MFT:$DATA — the $SI ctime record, the
- * $EA_INFORMATION record, the $EA record, Commit, three table
- * dumps, Forget). No $Bitmap record: a resident $EA allocates no
+ * path). The walk: the EA transaction's 9 records (one open —
+ * $MFT:$DATA — the $SI ctime record, the $EA_INFORMATION record,
+ * the $EA record, Commit, three table dumps, Forget), plus the
+ * sync's one DeleteDirtyClusters record. The create's records
+ * are gone: the sync after the create (in truncate_setup)
+ * flushed the $MFT folios and the bitmap folio, the flush
+ * notification (Phase 4 step 2) retired the create's dirty
+ * pages, and the EA's commit checkpoint advanced oldest_lsn
+ * past them. No $Bitmap record: a resident $EA allocates no
  * clusters. No $FILE_NAME record: EA sizes are not in the parent's
  * dup. */
 
@@ -4720,34 +5231,38 @@ static void test_ea_replace_journaled(void)
 
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 23);
-	if (s.n == 23) {
-		CHECK_EQ(s.redo_op[14], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[14], 0x18u);
-		CHECK_EQ(s.redo_op[15], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[16], 0x18u);
-		CHECK_EQ(s.redo_op[17], LOP_UpdateResidentValue);
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.redo_op[18], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[19], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[20], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[21], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[22], LOP_ForgetTransaction);
-		/* The $SI record (at [15]) names a later ctime than
+	CHECK_EQ(s.n, 10);
+	if (s.n == 10) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[5], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[9], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[9], 0u);
+		/* The $SI record (at [1]) names a later ctime than
 		 * the create's — the handler's success path only bumps
 		 * ctime — and undoes to the create's ctime. */
 		CHECK(s.si_redo_ctime > s.si_undo_ctime);
-		CHECK_EQ(s.si_lsn, s.lsn[15]);
-		/* The $EA_INFORMATION record (at [16]) carries the
+		CHECK_EQ(s.si_lsn, s.lsn[1]);
+		/* The $EA_INFORMATION record (at [2]) carries the
 		 * new stream length as its ea_query_length and undoes
 		 * to the $LX*-only length; both agree with the $EA
-		 * value record's lengths (at [17]). */
-		CHECK_EQ(s.ea_info_lsn, s.lsn[16]);
+		 * value record's lengths (at [3]). */
+		CHECK_EQ(s.ea_info_lsn, s.lsn[2]);
 		CHECK_EQ(s.ea_info_redo_query, 80u);
 		CHECK_EQ(s.ea_info_undo_query, 60u);
-		CHECK_EQ(s.ea_value_lsn, s.lsn[17]);
+		CHECK_EQ(s.ea_value_lsn, s.lsn[3]);
 		CHECK_EQ(s.ea_value_redo_len, 80u);
 		CHECK_EQ(s.ea_value_undo_len, 60u);
 		CHECK_EQ(s.ea_info_redo_query, (uint32_t)s.ea_value_redo_len);
@@ -4774,15 +5289,16 @@ static void test_ea_replace_journaled(void)
 		}
 	}
 
-	/* Replay copy 1: only the create's two idempotent records
-	 * redo — the EA transaction's records are skipped on the file
-	 * record's MR_LSN stamp. */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios and the bitmap folio, so the flush notification
+	 * retired the create's and the EA transaction's dirty pages
+	 * alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -4793,14 +5309,14 @@ static void test_ea_replace_journaled(void)
 	CHECK_EQ(memcmp(buf, "abc", 3), 0);
 	CHECK_EQ(run_ntfsck_clean(snap1), 0);
 
-	/* Replay copy 2: the same dirty snapshot redoes the same two
+	/* Replay copy 2: the same dirty snapshot redoes the same zero
 	 * records. Replay is idempotent. */
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	unlink(orig);
 	unlink(snap);
@@ -4857,25 +5373,37 @@ static void test_ea_replace_grow_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, the set transaction's 9, then
-	 * the replace transaction's 9. */
+	/* The walk: the set transaction's 7 still-live records (its
+	 * open precedes oldest_lsn and is dispensable), then the
+	 * replace transaction's 9, plus the sync's one
+	 * DeleteDirtyClusters record. The create's records are gone:
+	 * the sync after the create (in truncate_setup) flushed the
+	 * $MFT folios and the bitmap folio, the flush notification
+	 * (Phase 4 step 2) retired the create's dirty pages, and
+	 * the set's commit checkpoint advanced oldest_lsn past
+	 * them. No sync runs between the two ea_set calls, so the
+	 * set's records stay live. */
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 32);
-	if (s.n == 32) {
-		CHECK_EQ(s.redo_op[23], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[25], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
-		/* The value record (at [26]) carries the new stream
+	CHECK_EQ(s.n, 18);
+	if (s.n == 18) {
+		CHECK_EQ(s.redo_op[8], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[10], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[11], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[12], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[13], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[15], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[16], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
+		/* The value record (at [11]) carries the new stream
 		 * whole ("abcdef") and undoes to the old stream whole
 		 * ("abc"); the lengths differ, the length-change path. */
-		CHECK_EQ(s.ea_value_lsn, s.lsn[26]);
+		CHECK_EQ(s.ea_value_lsn, s.lsn[11]);
 		CHECK_EQ(s.ea_value_redo_len, 84u);
 		CHECK_EQ(s.ea_value_undo_len, 80u);
 		{
@@ -4902,18 +5430,20 @@ static void test_ea_replace_grow_journaled(void)
 			CHECK(!undo_has_new);
 			CHECK(undo_has_old);
 		}
-		CHECK_EQ(s.ea_info_lsn, s.lsn[25]);
+		CHECK_EQ(s.ea_info_lsn, s.lsn[10]);
 		CHECK_EQ(s.ea_info_redo_query, 84u);
 		CHECK_EQ(s.ea_info_undo_query, 80u);
 	}
 
-	/* Replay: only the create's two idempotent records redo. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the op's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	/* The new value reads back after a remount. */
 	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
@@ -4974,26 +5504,38 @@ static void test_ea_remove_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14, the set transaction's 9, then
-	 * the remove transaction's 9. */
+	/* The walk: the set transaction's 7 still-live records (its
+	 * open precedes oldest_lsn and is dispensable), then the
+	 * remove transaction's 9, plus the sync's one
+	 * DeleteDirtyClusters record. The create's records are gone:
+	 * the sync after the create (in truncate_setup) flushed the
+	 * $MFT folios and the bitmap folio, the flush notification
+	 * (Phase 4 step 2) retired the create's dirty pages, and
+	 * the set's commit checkpoint advanced oldest_lsn past
+	 * them. No sync runs between the two EA calls, so the set's
+	 * records stay live. */
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 32);
-	if (s.n == 32) {
-		CHECK_EQ(s.redo_op[23], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.redo_op[24], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[25], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[26], LOP_UpdateResidentValue);
-		CHECK_EQ(s.redo_op[27], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[28], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[29], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[30], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[31], LOP_ForgetTransaction);
-		/* The value record (at [26]) carries the $LX*-only
+	CHECK_EQ(s.n, 18);
+	if (s.n == 18) {
+		CHECK_EQ(s.redo_op[8], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.redo_op[9], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[10], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[11], LOP_UpdateResidentValue);
+		CHECK_EQ(s.redo_op[12], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[13], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[14], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[15], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[16], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
+		/* The value record (at [11]) carries the $LX*-only
 		 * stream (no "user.a") and undoes to the stream with
 		 * "user.a"; the remove's record matches because its
 		 * undo carries the name. */
-		CHECK_EQ(s.ea_value_lsn, s.lsn[26]);
+		CHECK_EQ(s.ea_value_lsn, s.lsn[11]);
 		CHECK_EQ(s.ea_value_redo_len, 60u);
 		CHECK_EQ(s.ea_value_undo_len, 80u);
 		{
@@ -5011,18 +5553,20 @@ static void test_ea_remove_journaled(void)
 			CHECK(!redo_has);
 			CHECK(undo_has);
 		}
-		CHECK_EQ(s.ea_info_lsn, s.lsn[25]);
+		CHECK_EQ(s.ea_info_lsn, s.lsn[10]);
 		CHECK_EQ(s.ea_info_redo_query, 60u);
 		CHECK_EQ(s.ea_info_undo_query, 80u);
 	}
 
-	/* Replay: only the create's two idempotent records redo. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the op's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	/* The EA is gone after a remount. */
 	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
@@ -5086,8 +5630,8 @@ static void test_ea_create_journaled(void)
 
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 9);
-	if (s.n == 9) {
+	CHECK_EQ(s.n, 10);
+	if (s.n == 10) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
 		CHECK_EQ(s.redo_op[2], LOP_CreateAttribute);
@@ -5097,6 +5641,10 @@ static void test_ea_create_journaled(void)
 		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[9], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[9], 0u);
 		/* The two CreateAttributes are the pair, $EA_INFORMATION
 		 * first: the redo's first 4 bytes are the type. */
 		CHECK_EQ(s.ea_info_create_hits, 1);
@@ -5108,7 +5656,8 @@ static void test_ea_create_journaled(void)
 	}
 
 	/* Replay: nothing redoes — every record targets the root's
-	 * own record and is skipped on its MR_LSN stamp. */
+	 * own record and is skipped on its MR_LSN stamp, and the
+	 * flush notification retired the dirty pages besides. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
@@ -5179,7 +5728,7 @@ static void test_ea_remove_last_journaled(void)
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* The walk: the create transaction's 9, then the remove
-	 * transaction's 9 — but the walk sees 17, not 18. The
+	 * transaction's 9 — but the walk sees 18, not 19. The
 	 * create's Open record precedes the restart area's oldest
 	 * LSN (the remove's checkpoint pins oldest at the create's
 	 * $SI record, the dirty-page table's oldest for the root's
@@ -5187,11 +5736,13 @@ static void test_ea_remove_last_journaled(void)
 	 * is after oldest and is visible. The Open is in the log —
 	 * the single-transaction create test shows it — and replay
 	 * does not need it here: the checkpoint's open-attribute
-	 * dump registers $MFT:$DATA. */
+	 * dump registers $MFT:$DATA. The sync's flush notification
+	 * (Phase 4 step 2) appends one DeleteDirtyClusters record
+	 * after the remove's Forget. */
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 17);
-	if (s.n == 17) {
+	CHECK_EQ(s.n, 18);
+	if (s.n == 18) {
 		/* The create transaction, minus its Open: $SI, the
 		 * two CreateAttributes, Commit, three dumps, Forget. */
 		CHECK_EQ(s.redo_op[0], LOP_UpdateResidentValue);
@@ -5213,6 +5764,10 @@ static void test_ea_remove_last_journaled(void)
 		CHECK_EQ(s.redo_op[14], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[15], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[16], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
 		/* The two DeleteAttributes are the pair, $EA first:
 		 * the undo's first 4 bytes are the type. */
 		CHECK_EQ(s.ea_delete_hits, 1);
@@ -5277,8 +5832,9 @@ static void test_ea_in_root_journaled(void)
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
 	/* The create in root is itself unjournaled (the root's index
-	 * lives in $INDEX_ALLOCATION), so the walk is empty before
-	 * the EA set — the same baseline the root-xattr test pins. */
+	 * lives in $INDEX_ALLOCATION), so the walk holds only the
+	 * create's two DeleteDirtyClusters records before the EA set
+	 * — the same baseline the root-xattr test pins. */
 	err = ntfs_create(root, "r.txt", 0100644, &f);
 	CHECK_EQ(err, 0);
 	if (err)
@@ -5286,7 +5842,13 @@ static void test_ea_in_root_journaled(void)
 	CHECK_EQ(ntfs_volume_sync(vol), 0);
 	CHECK_EQ(copy_file(orig, snap), 0);
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 2);
+	if (s.n == 2) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+	}
 
 	/* An EA on the root file journals: only its own record is
 	 * touched, no parent $FILE_NAME. */
@@ -5303,11 +5865,15 @@ static void test_ea_in_root_journaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
-	/* The walk holds just the EA transaction's 9 records. */
+	/* The walk holds the EA transaction's 9 records, plus the
+	 * sync's one DeleteDirtyClusters record. The create's two
+	 * notifies are gone: the EA's commit checkpoint advanced
+	 * oldest_lsn past them, since the notifies had already
+	 * retired the entries they named. */
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 9);
-	if (s.n == 9) {
+	CHECK_EQ(s.n, 10);
+	if (s.n == 10) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[0], 0x18u);
 		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
@@ -5321,6 +5887,10 @@ static void test_ea_in_root_journaled(void)
 		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record after the Forget. */
+		CHECK_EQ(s.redo_op[9], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[9], 0u);
 		CHECK_EQ(s.ea_value_redo_len, 80u);
 		CHECK_EQ(s.ea_value_undo_len, 60u);
 		CHECK_EQ(s.ea_info_redo_query, 80u);
@@ -5405,19 +5975,46 @@ static void test_ea_failed_set_unjournaled(void)
 	ntfs_bdev_close(dev);
 	if (err != -EEXIST) { unlink(orig); unlink(snap); return; }
 
-	/* The walk: the create's 14 plus the one successful set's 9
-	 * — the failed set added nothing. */
+	/* The walk: the one successful set's 9 records, plus the
+	 * sync's one DeleteDirtyClusters record. The create's
+	 * records are gone: the sync after the create (in
+	 * truncate_setup) flushed the $MFT folios and the bitmap
+	 * folio, the flush notification (Phase 4 step 2) retired
+	 * the create's dirty pages, and the set's commit checkpoint
+	 * advanced oldest_lsn past them. The failed set added
+	 * nothing. */
 	set_ea_name("user.a");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 23);
+	CHECK_EQ(s.n, 10);
+	if (s.n == 10) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[1], 0x18u);
+		CHECK_EQ(s.redo_op[2], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.redo_op[3], LOP_UpdateResidentValue);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.redo_op[4], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[5], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[6], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[7], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[8], LOP_ForgetTransaction);
+		/* The sync's flush notification: one
+		 * DeleteDirtyClusters record, with target attribute 0. */
+		CHECK_EQ(s.redo_op[9], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[9], 0u);
+	}
 
-	/* Replay: only the create's two idempotent records redo. */
+	/* Replay: nothing redoes — the sync flushed the $MFT folios
+	 * and the bitmap folio, so the flush notification retired
+	 * the create's and the op's dirty pages alike. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	/* The old value is untouched after a remount. */
 	CHECK_EQ(ea_after_mount(snap1, "sub", "j.txt", "user.a",
@@ -5533,9 +6130,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 
 	CHECK_EQ(readlink_after_mount(snap1, "sub", "dlink",
 				      buf, sizeof(buf), &len), 0);
@@ -5605,8 +6202,21 @@ static void test_symlink_in_root_unjournaled(void)
 	ntfs_bdev_close(dev);
 	if (err) { unlink(orig); unlink(snap); return; }
 
+	/* The create proceeds unjournaled, so the log holds no
+	 * transaction records — but the flush notification (Phase 4
+	 * step 2) appends three DeleteDirtyClusters records for the
+	 * stale dirty-page entries the aborted transaction staged
+	 * (the abort-leak note in JOURNAL-DESIGN.md §4.3). */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 0);
+	CHECK_EQ(s.n, 3);
+	if (s.n == 3) {
+		CHECK_EQ(s.redo_op[0], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[0], 0u);
+		CHECK_EQ(s.redo_op[1], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[1], 0u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[2], 0u);
+	}
 
 	CHECK_EQ(readlink_after_mount(snap, NULL, "rl.txt",
 				      buf, sizeof(buf), &len), 0);
@@ -5713,47 +6323,58 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 27);
-	if (s.n != 27) {
+	CHECK_EQ(s.n, 15);
+	if (s.n != 15) {
 		int k;
 		for (k = 0; k < s.n; k++)
 			fprintf(stderr, "DBG ow op[%d]=%u attr=0x%x lsn=%llu\n",
 				k, s.redo_op[k], s.target_attr[k],
 				(unsigned long long)s.lsn[k]);
 	}
-	if (s.n == 27) {
-		CHECK_EQ(s.redo_op[15], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[15], 0x18u);
-		CHECK_EQ(s.redo_op[16], LOP_OpenNonresidentAttribute);
-		CHECK_EQ(s.target_attr[16], 0x40u);
-		CHECK_EQ(s.redo_op[17], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[18], LOP_DeleteAttribute);
-		CHECK_EQ(s.redo_op[19], LOP_DeleteIndexEntryRoot);
-		CHECK_EQ(s.redo_op[20], LOP_DeallocateFileRecordSegment);
-		CHECK_EQ(s.redo_op[21], LOP_ClearBitsInNonresidentBitMap);
-		CHECK_EQ(s.redo_op[22], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[23], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[24], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[25], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[26], LOP_ForgetTransaction);
+	if (s.n == 15) {
+		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[0], 0x18u);
+		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
+		CHECK_EQ(s.target_attr[1], 0x40u);
+		CHECK_EQ(s.redo_op[2], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[3], LOP_DeleteAttribute);
+		CHECK_EQ(s.redo_op[4], LOP_DeleteIndexEntryRoot);
+		CHECK_EQ(s.redo_op[5], LOP_DeallocateFileRecordSegment);
+		CHECK_EQ(s.redo_op[6], LOP_ClearBitsInNonresidentBitMap);
+		CHECK_EQ(s.redo_op[7], LOP_CommitTransaction);
+		CHECK_EQ(s.redo_op[8], LOP_TransactionTableDump);
+		CHECK_EQ(s.redo_op[9], LOP_DirtyPageTableDump);
+		CHECK_EQ(s.redo_op[10], LOP_OpenAttributeTableDump);
+		CHECK_EQ(s.redo_op[11], LOP_ForgetTransaction);
+		/* The sync's flush notification: three
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0 — the $MFT folio for the
+		 * link's record, the $Reparse folio, and the bitmap
+		 * folio. */
+		CHECK_EQ(s.redo_op[12], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[12], 0u);
+		CHECK_EQ(s.redo_op[13], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[13], 0u);
+		CHECK_EQ(s.redo_op[14], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[14], 0u);
 		/* Every record targets $MFT:$DATA (0x18) except the
 		 * ClearBits, which targets $MFT:$BITMAP (0x40). */
-		CHECK_EQ(s.target_attr[17], 0x18u);
-		CHECK_EQ(s.target_attr[18], 0x18u);
-		CHECK_EQ(s.target_attr[19], 0x18u);
-		CHECK_EQ(s.target_attr[20], 0x18u);
-		CHECK_EQ(s.target_attr[21], 0x40u);
+		CHECK_EQ(s.target_attr[2], 0x18u);
+		CHECK_EQ(s.target_attr[3], 0x18u);
+		CHECK_EQ(s.target_attr[4], 0x18u);
+		CHECK_EQ(s.target_attr[5], 0x18u);
+		CHECK_EQ(s.target_attr[6], 0x40u);
 		/* The $I30 entry lives in the parent's record, the
 		 * $FILE_NAME and the free in the file's own, the $R
 		 * entry in $Reparse's record (vcn = record/4). */
-		CHECK_EQ(s.target_vcn[17], sub_ino / 4);
-		CHECK_EQ(s.target_vcn[18], ino / 4);
-		CHECK_EQ(s.target_vcn[19], rp_ino / 4);
-		CHECK_EQ(s.target_vcn[20], ino / 4);
-		CHECK_EQ(s.target_vcn[21], (ino / 8) / 4096);
-		lsn_del_idx = s.lsn[17];
-		lsn_del_attr = s.lsn[18];
-		lsn_del_r = s.lsn[19];
+		CHECK_EQ(s.target_vcn[2], sub_ino / 4);
+		CHECK_EQ(s.target_vcn[3], ino / 4);
+		CHECK_EQ(s.target_vcn[4], rp_ino / 4);
+		CHECK_EQ(s.target_vcn[5], ino / 4);
+		CHECK_EQ(s.target_vcn[6], (ino / 8) / 4096);
+		lsn_del_idx = s.lsn[2];
+		lsn_del_attr = s.lsn[3];
+		lsn_del_r = s.lsn[4];
 	}
 	/* All three touched records carry an MR_LSN at or past the
 	 * record that touched them — even though the file's record
@@ -5772,16 +6393,16 @@ out:
 	CHECK(mrlsn_rp != 0);
 	CHECK(mrlsn_rp >= lsn_del_r);
 
-	/* Replay copy 1: the create's two idempotent records
-	 * (SetNewAttributeSizes, SetBits) plus the unlink's
-	 * ClearBits — everything else is skipped on its MR_LSN
-	 * stamp or its effect (the record is already free). */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios, the $Reparse folio and the bitmap folio, so the
+	 * flush notification retired the create's and the unlink's
+	 * dirty pages alike. The link is already gone on the volume. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 3u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 	CHECK(!an.needs_chkdsk);
@@ -5885,17 +6506,19 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* The walk: exactly one transaction, 2 open + 12 data + Commit +
-	 * 3 dumps + Forget. The data records, in staging order: the
-	 * $MFT $DATA size extension, Initialize, $SD, $DATA,
-	 * $REPARSE_POINT, $R entry, $EA_INFORMATION, $EA, $FILE_NAME,
-	 * $SI flags, $I30 entry, SetBits. The $SI flags sit after the
-	 * $FILE_NAME: they are staged from the final ni->flags, which
-	 * only exists once fn->file_attributes is folded back into it.
+	 * 3 dumps + Forget, plus the sync's four DeleteDirtyClusters
+	 * records (the flush notification, Phase 4 step 2). The data
+	 * records, in staging order: the $MFT $DATA size extension,
+	 * Initialize, $SD, $DATA, $REPARSE_POINT, $R entry,
+	 * $EA_INFORMATION, $EA, $FILE_NAME, $SI flags, $I30 entry,
+	 * SetBits. The $SI flags sit after the $FILE_NAME: they are
+	 * staged from the final ni->flags, which only exists once
+	 * fn->file_attributes is folded back into it.
 	 */
 	set_fn_name("dev");
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 19);
-	if (s.n == 19) {
+	CHECK_EQ(s.n, 23);
+	if (s.n == 23) {
 		static const uint16_t want_op[12] = {
 			LOP_SetNewAttributeSizes,
 			LOP_InitializeFileRecordSegment, LOP_CreateAttribute,
@@ -5920,6 +6543,13 @@ out:
 		CHECK_EQ(s.redo_op[16], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[17], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[18], LOP_ForgetTransaction);
+		/* The sync's flush notification: four
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		for (i = 19; i < 23; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
 		/* The $R entry sits between the $REPARSE_POINT create
 		 * and the $EA ones; the $FILE_NAME create is the last
 		 * CreateAttribute but one — the $SI flags update follows
@@ -5988,9 +6618,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -6019,9 +6649,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(reparse_index_count_entries(snap2, rp_ino, 0x80000025u, ino), 1);
 
 	unlink(orig);
@@ -6200,10 +6830,12 @@ out:
 	 * $SI 36 bytes, the parent's $FILE_NAME. The bitmap comes
 	 * first and the pairs before the sizes, the truncate class's
 	 * order: the pairs must name the runs before the sizes that
-	 * count them, and the bitmap must agree with both. */
+	 * count them, and the bitmap must agree with both. The sync's
+	 * flush notification (Phase 4 step 2) appends four
+	 * DeleteDirtyClusters records after the overwrite's Forget. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 39);
-	if (s.n == 39) {
+	CHECK_EQ(s.n, 43);
+	if (s.n == 43) {
 		static const uint16_t want_setup[5] = {
 			LOP_SetBitsInNonresidentBitMap,
 			LOP_UpdateMappingPairs,
@@ -6264,6 +6896,15 @@ out:
 		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
+		/* The sync's flush notification (Phase 4 step 2):
+		 * four DeleteDirtyClusters records after the Forget,
+		 * one per flushed cluster, all with target attribute
+		 * 0. No intermediate sync runs between the create and
+		 * the writes, so the create's records stay live. */
+		for (i = 39; i < 43; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
 		lsn_fn = s.lsn[33];
 		/* The freed run is the old raw block, 16 clusters;
 		 * the new block is one cluster. */
@@ -6328,9 +6969,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 7u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -6359,9 +7000,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 7u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	orig_buf = malloc(200 * 1024);
 	got = malloc(200 * 1024);
 	if (orig_buf && got) {
@@ -6458,10 +7099,12 @@ out:
 	 * the setup's 8 KiB tail (stored raw, 2 clusters), so the
 	 * append rewrites that block — allocating fresh clusters
 	 * for it and punching the old tail — and writes block 4
-	 * fresh. */
+	 * fresh. The sync's flush notification (Phase 4 step 2)
+	 * appends four DeleteDirtyClusters records after the
+	 * append's Forget. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 39);
-	if (s.n == 39) {
+	CHECK_EQ(s.n, 43);
+	if (s.n == 43) {
 		static const uint16_t want_setup[5] = {
 			LOP_SetBitsInNonresidentBitMap,
 			LOP_UpdateMappingPairs,
@@ -6510,6 +7153,15 @@ out:
 		CHECK_EQ(s.redo_op[36], LOP_DirtyPageTableDump);
 		CHECK_EQ(s.redo_op[37], LOP_OpenAttributeTableDump);
 		CHECK_EQ(s.redo_op[38], LOP_ForgetTransaction);
+		/* The sync's flush notification (Phase 4 step 2):
+		 * four DeleteDirtyClusters records after the Forget,
+		 * one per flushed cluster, all with target attribute
+		 * 0. No intermediate sync runs between the create and
+		 * the writes, so the create's records stay live. */
+		for (i = 39; i < 43; i++) {
+			CHECK_EQ(s.redo_op[i], LOP_DeleteDirtyClusters);
+			CHECK_EQ(s.target_attr[i], 0u);
+		}
 		lsn_fn = s.lsn[33];
 		/* The freed run is the old tail block, 3 clusters:
 		 * the 8 KiB of incompressible tail is stored raw
@@ -6551,9 +7203,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 7u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -6578,9 +7230,9 @@ out:
 	CHECK_EQ(copy_file(snap, snap2), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap2, &an), 0);
-	CHECK_EQ(an.records_redone, 7u);
-	CHECK_EQ(an.mft_records_written, 2u);
-	CHECK_EQ(an.clusters_written, 2u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	orig_buf = malloc(264 * 1024);
 	got = malloc(264 * 1024);
 	if (orig_buf && got) {
@@ -6711,15 +7363,17 @@ out:
 	if (err) { unlink(orig); unlink(snap); return; }
 
 	/* The walk holds only the create's records — the conversion
-	 * write wrote no client records at all. 16 live: 2 opens +
+	 * write wrote no transaction records at all. 16 live: 2 opens +
 	 * sizes + Initialize + 5x CreateAttribute + AddIndexEntryRoot
-	 * + SetBits + Commit + 3 dumps + Forget. The other two tests
-	 * pin the same create at 14 live because on a fresh mkntfs
-	 * image its two opens precede oldest_lsn; the fixture's log
-	 * starts clean, so nothing is trimmed and the opens count. */
+	 * + SetBits + Commit + 3 dumps + Forget, plus the sync's four
+	 * DeleteDirtyClusters records (the flush notification, Phase 4
+	 * step 2). The other two tests pin the same create at 14 live
+	 * because on a fresh mkntfs image its two opens precede
+	 * oldest_lsn; the fixture's log starts clean, so nothing is
+	 * trimmed and the opens count. */
 	CHECK_EQ(walk_log(snap, &s), 0);
-	CHECK_EQ(s.n, 16);
-	if (s.n == 16) {
+	CHECK_EQ(s.n, 20);
+	if (s.n == 20) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.redo_op[2], LOP_SetNewAttributeSizes);
@@ -6728,16 +7382,28 @@ out:
 		CHECK_EQ(s.redo_op[10], LOP_SetBitsInNonresidentBitMap);
 		CHECK_EQ(s.redo_op[11], LOP_CommitTransaction);
 		CHECK_EQ(s.redo_op[15], LOP_ForgetTransaction);
+		/* The sync's flush notification: four
+		 * DeleteDirtyClusters records, one per flushed cluster,
+		 * all with target attribute 0. */
+		CHECK_EQ(s.redo_op[16], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[16], 0u);
+		CHECK_EQ(s.redo_op[17], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[17], 0u);
+		CHECK_EQ(s.redo_op[18], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[18], 0u);
+		CHECK_EQ(s.redo_op[19], LOP_DeleteDirtyClusters);
+		CHECK_EQ(s.target_attr[19], 0u);
 	}
 
-	/* Replay copy 1: the create's two redoable records only —
-	 * the $MFT $DATA size extension and the SetBits. */
+	/* Replay copy 1: nothing redoes — the sync flushed the $MFT
+	 * folios and the bitmap folio, so the flush notification
+	 * retired the create's dirty pages. */
 	CHECK_EQ(copy_file(snap, snap1), 0);
 	memset(&an, 0, sizeof(an));
 	CHECK_EQ(replay_path(snap1, &an), 0);
-	CHECK_EQ(an.records_redone, 2u);
-	CHECK_EQ(an.mft_records_written, 1u);
-	CHECK_EQ(an.clusters_written, 1u);
+	CHECK_EQ(an.records_redone, 0u);
+	CHECK_EQ(an.mft_records_written, 0u);
+	CHECK_EQ(an.clusters_written, 0u);
 	CHECK_EQ(an.transactions_committed, 0u);
 	CHECK_EQ(an.transactions_active, 0u);
 
@@ -6767,6 +7433,8 @@ int main(void)
 	tool_paths();
 	ntfs_set_logger(quiet_logger, NULL);
 	test_create_journaled();
+	test_flush_notify_retires_dirty_pages();
+	test_flush_notify_no_sync_no_retire();
 	test_mkdir_unjournaled();
 	test_mkdir_journaled();
 	test_create_in_root_unjournaled();
