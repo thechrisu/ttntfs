@@ -1648,8 +1648,13 @@ on every supported version. Per-release matrix: `docs/ENABLEMENT.md`
 (verified 26.3, 26.6.2, 27; re-verify on each new release — the
 script's version gate and the app's permission fallback are the
 tripwires). Stream D, 2026-11-28: the matrix is written
-(`docs/ENABLEMENT.md`); script hardening, the uninstall guard fix,
-and wiring the script tests into pre-push follow as separate commits.
+(`docs/ENABLEMENT.md`); `enable-module.sh` now refuses on 27+ (exit
+2, Settings route), falls back to Settings on a permission error,
+validates the plist shape, and fails loudly if `pluginkit` still
+reports the module off after enabling — test-enable-module.sh 14/14
+with negative controls (4/4 new checks fail on the old script). The
+uninstall guard fix and the ctest registration for the new uninstall
+tests follow as separate commits.
 
 ### 4.5 No CI signing — blocked (needs a paid Apple Developer account)
 The mount test cannot pass until the app is signed with the managed

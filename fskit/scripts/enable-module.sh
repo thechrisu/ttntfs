@@ -13,6 +13,17 @@
 #   fskit/scripts/enable-module.sh            # enable (also prunes stray copies)
 #   fskit/scripts/enable-module.sh --disable  # remove from the list
 #
+# Exit codes: 0 done, 1 failed (see the message — the list is left as it
+# was), 2 the list cannot be edited on this macOS version (see below).
+#
+# macOS 27 closes the direct-edit route: the list can no longer be read
+# or written by an app without Apple's private entitlement, so this
+# script refuses there and prints the System Settings route instead of
+# failing with a traceback (exit 2). The same fallback is taken when the
+# list is not readable/writable, since Apple could extend the
+# protection to a 26.x update. sw_vers is absent off macOS (the tests
+# run on Linux), so a missing sw_vers means "not gated".
+#
 # Order matters after a reinstall: copy the app, LAUNCH IT ONCE (LaunchServices
 # re-registers the bundle on first launch), then run this script. The agent
 # caches the extension's plugin UUID; every re-registration (install, first
@@ -25,6 +36,22 @@ ID=${NTFS_MODULE_ID:-ch.techtag.ntfs.extension}
 PLIST="$HOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
 MODE=enable
 [ "${1:-}" = "--disable" ] && MODE=disable
+
+SETTINGS_HINT="this macOS version enables third-party file systems only in System Settings → General → Login Items & Extensions. Under Extensions, choose By Category, then File System Extensions, and turn TT NTFS Native on there; the switch in the By App list does not stay on."
+
+# Version gate: on 27+ the list is unreadable/unwritable without Apple's
+# private entitlement, so editing it here would fail with a permission
+# error — or, worse, write a file the OS ignores. Refuse with the
+# instruction, like the app's ModuleEnabler does.
+if command -v sw_vers >/dev/null 2>&1; then
+    MACOS_MAJOR=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+    case "$MACOS_MAJOR" in ''|*[!0-9]*) MACOS_MAJOR=0 ;; esac
+    if [ "$MACOS_MAJOR" -ge 27 ]; then
+        echo "macOS $MACOS_MAJOR: $SETTINGS_HINT" >&2
+        [ "$MODE" = disable ] && echo "switch it off there; this script cannot remove the entry on this version." >&2
+        exit 2
+    fi
+fi
 
 # Refuse while one of our volumes is mounted: restarting fskit_agent drops it.
 # A mounted ttntfs volume looks like plain "ntfs ... fskit" in `mount`, which is
@@ -50,6 +77,16 @@ if [ -n "$serving" ]; then
     exit 1
 fi
 [ -f "$PLIST" ] || { echo "no $PLIST (open System Settings > Login Items & Extensions once)" >&2; exit 1; }
+
+# Permission fallback: if Apple protected the list on this build too,
+# the write below dies with a bare Python traceback under `set -e`.
+# Check first and fall back to the Settings route with the instruction,
+# like the app does on a permission error. The directory must be
+# writable too — the backup copy goes there.
+if [ ! -r "$PLIST" ] || [ ! -w "$PLIST" ] || [ ! -w "$(dirname "$PLIST")" ]; then
+    echo "cannot update the FSKit module list (permission denied): $SETTINGS_HINT" >&2
+    exit 2
+fi
 
 # Prune stray registrations. LaunchServices registers every copy of the bundle it
 # sees, including Xcode's build output, and System Settings then lists the
@@ -83,6 +120,9 @@ import plistlib, sys
 path, ident, mode = sys.argv[1:4]
 with open(path, 'rb') as f:
     modules = plistlib.load(f)
+if not isinstance(modules, list):
+    print(f"error: {path} is not a list of module IDs (found {type(modules).__name__}); refusing to edit it", file=sys.stderr)
+    sys.exit(1)
 if mode == 'enable' and ident not in modules:
     modules.append(ident)
 if mode == 'disable':
@@ -103,12 +143,25 @@ if [ "$MODE" = enable ]; then pluginkit -e use -i "$ID"; else pluginkit -e ignor
 STATE=$(pluginkit -m -i "$ID" | cut -c1-1)
 echo "pluginkit: ${STATE:-?} $ID   (+ enabled, - disabled)"
 
+# The state above is printed either way; make it a check too. A `-`
+# after enabling (or `+` after disabling) means the election did not
+# take, and exiting 0 would claim success while the module stays off.
+if [ "$MODE" = enable ] && [ "${STATE:-?}" = "-" ]; then
+    echo "FAILED: pluginkit still reports $ID as disabled" >&2
+    exit 1
+fi
+if [ "$MODE" = disable ] && [ "${STATE:-?}" = "+" ]; then
+    echo "FAILED: pluginkit still reports $ID as enabled" >&2
+    exit 1
+fi
+
 # Say what the state actually is rather than what was attempted. A silent early
 # exit once left the module disabled and the run looked successful.
 LISTED=$(python3 -c "
 import plistlib, sys
 with open(sys.argv[1], 'rb') as f:
-    print('yes' if sys.argv[2] in plistlib.load(f) else 'no')
+    modules = plistlib.load(f)
+print('yes' if isinstance(modules, list) and sys.argv[2] in modules else 'no')
 " "$PLIST" "$ID")
 if [ "$MODE" = enable ] && [ "$LISTED" != yes ]; then
     echo "FAILED: $ID is not in the enabled list" >&2

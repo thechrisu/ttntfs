@@ -84,7 +84,137 @@ prune_rc=$(
     echo REACHED_END' 2>/dev/null | tail -1
 )
 check "prune loop survives a stray copy with no appex" '[ "$prune_rc" = REACHED_END ]'
-rm -rf "$STUB"
+# --- 5. the macOS 27 gate, and the 26 path end to end --------------------
+# Full runs of the real script with stubs on PATH and a throwaway HOME,
+# so the version gate and the happy path are exercised, not just grepped.
+# Stubs: sw_vers reports $1, pgrep finds nothing, pluginkit reports the
+# election state $2 for -m and succeeds for everything else.
+mkstub() {
+    STUB=$(mktemp -d)
+    cat > "$STUB/sw_vers" <<EOF
+#!/bin/bash
+[ "\${1:-}" = "-productVersion" ] && echo "$1"
+exit 0
+EOF
+    cat > "$STUB/pgrep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+    cat > "$STUB/pluginkit" <<EOF
+#!/bin/bash
+[ "\${1:-}" = "-m" ] && { echo "$2   ch.techtag.ntfs.extension(1.0)"; exit 0; }
+exit 0
+EOF
+    chmod +x "$STUB/sw_vers" "$STUB/pgrep" "$STUB/pluginkit"
+}
+# shellcheck disable=SC2120
+# mkhome's callers pass zero or more entries; $@ is the API.
+mkhome() { # each arg becomes one entry in the initial enabled list
+    THOME=$(mktemp -d)
+    PLIST_F="$THOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
+    mkdir -p "$(dirname "$PLIST_F")"
+    python3 - "$PLIST_F" "$@" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], 'wb') as f:
+    plistlib.dump(sys.argv[2:], f)
+PY
+}
+plist_has_id() {
+    python3 -c "
+import plistlib, sys
+with open(sys.argv[1], 'rb') as f:
+    m = plistlib.load(f)
+print('yes' if isinstance(m, list) and sys.argv[2] in m else 'no')
+" "$1" ch.techtag.ntfs.extension
+}
+run_e2e() { # $1 = stub dir, $2 = home dir; remaining args passed to the script
+    _stub=$1; _home=$2; shift 2
+    HOME="$_home" PATH="$_stub:$PATH" bash "$SCRIPT" "$@" >"$_home/out.txt" 2>&1
+    echo $?
+}
+
+check "gate: refuses on macOS 27" \
+      'grep -q "sw_vers -productVersion" "$SCRIPT" && grep -q "\-ge 27" "$SCRIPT"'
+
+mkstub 26.6.2 +
+mkhome
+rc=$(run_e2e "$STUB" "$THOME")
+if [ "$rc" = 0 ] && grep -q "is now enabled" "$THOME/out.txt" && [ "$(plist_has_id "$PLIST_F")" = yes ]; then
+    ok "26.6.2: enable end to end"
+else bad "26.6.2: enable end to end (rc=$rc, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+rm -rf "$STUB" "$THOME"
+
+mkstub 27.0 +
+mkhome
+rc=$(run_e2e "$STUB" "$THOME")
+if [ "$rc" = 2 ] && grep -q "System Settings" "$THOME/out.txt" && [ "$(plist_has_id "$PLIST_F")" = no ]; then
+    ok "27.0: refuses with the Settings route, list untouched"
+else bad "27.0: refuses with the Settings route, list untouched (rc=$rc, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+rm -rf "$STUB" "$THOME"
+
+# No sw_vers at all (Linux): the gate must not fire.
+STUB=$(mktemp -d)
+cat > "$STUB/pgrep" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+cat > "$STUB/pluginkit" <<'EOF'
+#!/bin/bash
+[ "${1:-}" = "-m" ] && { echo "+   ch.techtag.ntfs.extension(1.0)"; exit 0; }
+exit 0
+EOF
+chmod +x "$STUB/pgrep" "$STUB/pluginkit"
+mkhome
+rc=$(run_e2e "$STUB" "$THOME")
+if [ "$rc" = 0 ] && [ "$(plist_has_id "$PLIST_F")" = yes ]; then
+    ok "no sw_vers: gate does not fire"
+else bad "no sw_vers: gate does not fire (rc=$rc, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+rm -rf "$STUB" "$THOME"
+
+# --- 6. a protected list falls back to Settings, not a traceback --------
+if [ "$(id -u)" -eq 0 ]; then
+    ok "protected list: skipped as root (permission bits do not bind root)"
+else
+    mkstub 26.6.2 +
+    mkhome
+    chmod 444 "$PLIST_F"
+    rc=$(run_e2e "$STUB" "$THOME")
+    if [ "$rc" = 2 ] && grep -q "System Settings" "$THOME/out.txt" && [ "$(plist_has_id "$PLIST_F")" = no ] && [ ! -e "$PLIST_F.bak" ]; then
+        ok "protected list: Settings route, list and backup untouched"
+    else bad "protected list: Settings route, list and backup untouched (rc=$rc, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+    chmod 644 "$PLIST_F"
+    rm -rf "$STUB" "$THOME"
+fi
+
+# --- 7. pluginkit disagreeing with the list is a failure, not a pass -----
+mkstub 26.6.2 -
+mkhome
+rc=$(run_e2e "$STUB" "$THOME")
+if [ "$rc" = 1 ] && grep -q "FAILED: pluginkit still reports" "$THOME/out.txt" && [ "$(plist_has_id "$PLIST_F")" = yes ]; then
+    ok "pluginkit '-': fails loudly, list updated"
+else bad "pluginkit '-': fails loudly, list updated (rc=$rc, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+rm -rf "$STUB" "$THOME"
+
+# --- 8. a plist that is not a list is refused, not mangled ----------------
+mkstub 26.6.2 +
+THOME=$(mktemp -d)
+PLIST_F="$THOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
+mkdir -p "$(dirname "$PLIST_F")"
+python3 - "$PLIST_F" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], 'wb') as f:
+    plistlib.dump({"modules": []}, f)
+PY
+rc=$(run_e2e "$STUB" "$THOME")
+SHAPE=$(python3 -c "
+import plistlib, sys
+with open(sys.argv[1], 'rb') as f:
+    print(type(plistlib.load(f)).__name__)
+" "$PLIST_F")
+if [ "$rc" = 1 ] && grep -q "not a list" "$THOME/out.txt" && [ "$SHAPE" = dict ]; then
+    ok "dict plist: refused, file unchanged"
+else bad "dict plist: refused, file unchanged (rc=$rc, shape=$SHAPE, out=$(cat "$THOME/out.txt" | tr '\n' '|'))"; fi
+rm -rf "$STUB" "$THOME"
 
 echo "  $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
