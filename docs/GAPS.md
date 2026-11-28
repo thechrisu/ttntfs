@@ -1492,11 +1492,35 @@ no longer creates attribute inodes for metadata files in the first
 place ($Volume's empty $DATA, $MFT, $LogFile, $UpCase are all ruled out
 by the record-level size check).
 
-### 2.2 No ACL / security-descriptor mapping — open, by design so far
+### 2.2 No ACL / security-descriptor mapping — open, design written (2026-11-27, stream B)
 Permissions are effectively ignored (`noowners` semantics, SIDs
 preserved, nothing enforced). Paragon and Tuxera map NTFS ACLs to
 Unix permissions. Decide the mapping first; the v1 stance is recorded
 in `docs/PORTING.md` §6.
+
+Design decided 2026-11-27 (stream B, `docs/ACL-DESIGN.md`): FSKit
+exposes no ACL surface at all (`FSItem.Attributes` has no ACL field,
+no get/set ACL op exists — Apple DTS says requesting it is
+reasonable), so a full Windows-SD ↔ macOS-ACL mapping cannot be
+surfaced through the filesystem interface. What §2.2 means in
+practice is **map the NTFS DACL to Unix mode bits**. v1 is the read
+path only: parse the file's SD from `$Secure:$SDS` by `security_id`,
+compute the effective access of a normal interactive Windows user
+(Everyone + Authenticated Users + Users + Interactive allow ACEs →
+owner bits; group SID → group bits; Everyone → other bits; deny ACEs
+for resolvable principals remove bits; unresolvable-SID denies
+ignored, fail-open), and report it via `mode_of()` — `$LXMOD` still
+wins when present, READONLY still clears write bits, anything
+unparseable falls back to today's `0777 & ~mask` behaviour and never
+fails the inode load. NULL DACL → `0777`; empty DACL deliberately
+falls back to today's behaviour (fail-open, recorded limitation —
+locking users out is the worse failure). Write path (chmod → DACL
+rewrite + `$Secure` allocation + `$SDH`/`$SII` updates) is designed
+but NOT implemented: it needs `$Secure` write machinery plus new
+journal builders for the `$SI` `security_id` change and the `$SDS` /
+index updates, which belong to the journal line. Enabling
+`CONFIG_NTFS_FS_POSIX_ACL` is a separate WSL-interop decision, not
+part of SD mapping (FSKit never calls `get_acl`/`set_acl`).
 
 ### 2.3 No TRIM for SSDs — open, re-examine (2026-11-26)
 Was blocked: no FSKit path to issue discards. Reopened by the
