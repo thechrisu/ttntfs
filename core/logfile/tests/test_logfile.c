@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <inttypes.h>
+#include <time.h>
 #include "ntfs_logfile.h"
 #include "logfile_layout.h"
 #include "ntfs_image.h"
@@ -372,6 +373,7 @@ struct memio {
 	uint8_t *buf;
 	uint64_t size;
 	int writes;
+	uint64_t bytes;		/* total bytes written through mem_write */
 };
 
 static int mem_read(void *ctx, uint64_t off, void *buf, size_t len)
@@ -390,6 +392,7 @@ static int mem_write(void *ctx, uint64_t off, const void *buf, size_t len)
 		return -EIO;
 	memcpy(m->buf + off, buf, len);
 	m->writes++;
+	m->bytes += len;
 	return 0;
 }
 
@@ -3119,6 +3122,7 @@ static int journal_setup(struct memio *m, struct ntfs_log_io *io,
 	memset(m->buf, 0xff, LSIZE);
 	m->size = LSIZE;
 	m->writes = 0;
+	m->bytes = 0;
 	memset(io, 0, sizeof(*io));
 	io->ctx = m;
 	io->size = LSIZE;
@@ -3541,7 +3545,10 @@ static void test_writer_periodic_checkpoint(void)
 	printf("test_writer_periodic_checkpoint\n");
 	run_periodic_checkpoint(2, &client2, &dumps2, &redone2, &second2,
 				&first_op2);
-	run_periodic_checkpoint(0, &client1, &dumps1, &redone1, &second1,
+	/* The second run pins the Phase 2 behaviour explicitly (every
+	 * commit checkpoints) rather than relying on the writer
+	 * default, which the Phase 4 step-3 flip moves to 128. */
+	run_periodic_checkpoint(1, &client1, &dumps1, &redone1, &second1,
 				&first_op1);
 	CHECK_EQ(client2, 62);
 	CHECK_EQ(dumps2, 9);
@@ -3553,6 +3560,106 @@ static void test_writer_periodic_checkpoint(void)
 	CHECK_EQ(second2, 5);
 	CHECK_EQ(redone1, 35);
 	CHECK_EQ(second1, 5);
+}
+
+/* Phase 4 step 3: write amplification + latency of the checkpoint
+ * policy (docs/JOURNAL-DESIGN.md §4.3). Six creates at every=1 (a
+ * checkpoint per commit) vs every=128 on fresh logs, measuring the
+ * device bytes written (the memio byte counter — restart pages
+ * included, since a checkpoint rewrites both restart pages) and
+ * the wall time of the commit loop. The byte count is the
+ * amplification number. The shape is not what a first guess says:
+ * a checkpoint is ~48 KiB (five records plus the 8 KiB of restart
+ * pages), but a create's own 11 records cost ~88 KiB — every
+ * record append flushes its page when the record ends, and a page
+ * already holding a record is tail-copied too (v1.x tail copy), so
+ * a record costs 4–8 KiB of device writes, not its own length.
+ * The checkpoint is ~35% of a create's log bytes at every=1, so
+ * the flip saves roughly a quarter of the log traffic (measured
+ * below), not a multiple of it; the per-record page flush is the
+ * dominant cost and is a separate optimisation, not this step.
+ * The wall time is the in-memory model only — no device latency —
+ * so it is printed, not asserted: the device-side win is the byte
+ * count. Six creates, not more: the parent's $INDEX_ROOT has room
+ * for ~7 entries before the replay's "entry past used" check
+ * refuses (the record is 1 KiB). The replay check pins the flip's
+ * replay consequence: at every=128 the walk from oldest_lsn still
+ * redoes every create (replay walks forward from the last
+ * checkpoint), 6 x 7 data records. */
+#define POLICY_MEASURE_N 6
+static void run_policy_measure(uint32_t every, uint64_t *bytes_out,
+			       double *ms_out, int *redone_out)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct timespec t0, t1;
+	uint64_t bytes0, flsn;
+	char name[8];
+	int i;
+
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_writer_set_checkpoint_every(w, every), 0);
+	bytes0 = m.bytes;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (i = 0; i < POLICY_MEASURE_N; i++) {
+		snprintf(name, sizeof(name), "t%d.txt", i);
+		CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+		CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC + i, name,
+				      DIR_REC, (uint64_t)-1), 0);
+		CHECK_EQ(ntfs_log_txn_commit(t, &flsn, NULL), 0);
+	}
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	*bytes_out = m.bytes - bytes0;
+	*ms_out = (double)(t1.tv_sec - t0.tv_sec) * 1000.0 +
+		(double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+	/* Crash: no clean close, no final checkpoint. */
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	*redone_out = res.records_redone;
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
+static void test_checkpoint_policy_amplification(void)
+{
+	uint64_t bytes1, bytes128;
+	double ms1, ms128;
+	int redone1, redone128;
+
+	printf("test_checkpoint_policy_amplification\n");
+	run_policy_measure(1, &bytes1, &ms1, &redone1);
+	run_policy_measure(128, &bytes128, &ms128, &redone128);
+	printf("    every=1:   %llu bytes, %.2f ms for %d creates (replayed %d)\n",
+	       (unsigned long long)bytes1, ms1, POLICY_MEASURE_N, redone1);
+	printf("    every=128: %llu bytes, %.2f ms for %d creates (replayed %d)\n",
+	       (unsigned long long)bytes128, ms128, POLICY_MEASURE_N,
+	       redone128);
+	/* The flip's win, in device bytes: a checkpoint costs ~48 KiB
+	 * (five records plus the restart pages), and five of the six
+	 * commits stop paying it — the per-record page flush (with
+	 * tail copy) still dominates both runs, so the saving is
+	 * roughly a quarter, not a multiple. Measured: every=1
+	 * 806,912 bytes vs every=128 585,728 for 6 creates. */
+	CHECK(bytes128 < bytes1);
+	/* At every=128 the replay still redoes every create: 7 data
+	 * records each. */
+	CHECK_EQ(redone128, POLICY_MEASURE_N * 7);
 }
 
 /* Walk collector for the DeleteDirtyClusters test: keeps the
@@ -4975,6 +5082,7 @@ int main(void)
 	test_writer_clean_close();
 	test_journal_create_commit();
 	test_writer_periodic_checkpoint();
+	test_checkpoint_policy_amplification();
 	test_writer_delete_dirty_clusters();
 	test_update_filename_root();
 	test_journal_create_mft_sizes();

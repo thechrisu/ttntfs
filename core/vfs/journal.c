@@ -207,6 +207,23 @@ void ntfs_journal_notify_flushed(struct ntfs_volume *vol,
 						      ranges, nranges);
 }
 
+/*
+ * ntfs_journal_set_checkpoint_every - set the checkpoint policy for
+ * this mount's writer (docs/JOURNAL-DESIGN.md §4.3): how many commits
+ * run between checkpoints. 0 clamps to 1 (every commit, the Phase 2
+ * behaviour). The driver default is NTFS_LOG_CHECKPOINT_EVERY_DEFAULT;
+ * the tests that pin per-commit checkpoint behaviour set it to 1
+ * explicitly, so they keep observing a checkpoint after each commit
+ * whatever the default is. Returns -ENODEV when journaling is
+ * inactive on this mount.
+ */
+int ntfs_journal_set_checkpoint_every(struct ntfs_volume *vol, uint32_t n)
+{
+	if (!vol || !vol->log_writer)
+		return -ENODEV;
+	return ntfs_log_writer_set_checkpoint_every(vol->log_writer, n);
+}
+
 /* ---- record scanning ---------------------------------------------------- */
 
 /*

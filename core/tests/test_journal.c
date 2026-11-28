@@ -168,6 +168,38 @@
  * whose internal headers collide with ntfscore.h. */
 extern const struct xattr_handler *const ntfs_xattr_handlers[];
 
+/* Checkpoint-policy hook: ntfs_journal_set_checkpoint_every() in
+ * core/vfs/journal.c. The tests that pin per-commit checkpoint
+ * behaviour (the flush-notification pair) set it to 1 explicitly,
+ * so they keep observing a checkpoint after each commit whatever
+ * the driver default is. Declared here rather than including
+ * journal.h, whose internal headers collide with ntfscore.h (the
+ * same shape as the $EA hook above and the handle mirror in
+ * test_links.c). */
+struct ntfs_volume;
+extern int ntfs_journal_set_checkpoint_every(struct ntfs_volume *vol,
+					     uint32_t n);
+
+/* The volume handle behind ntfscore.h's ntfs_volume_t
+ * (core/vfs/glue.h): its first two fields are sb and the core struct
+ * ntfs_volume *. Only the layout of those two fields is relied on. */
+struct ntfs_volume_handle_test {
+	struct super_block *sb;
+	struct ntfs_volume *vol;
+};
+
+/* Set the checkpoint policy for the mounted volume @vol (an
+ * ntfs_volume_t *). Returns the accessor's error. */
+static int set_checkpoint_every(ntfs_volume_t *vol, uint32_t n)
+{
+	struct ntfs_volume_handle_test *h =
+		(struct ntfs_volume_handle_test *)vol;
+
+	if (!h || !h->vol)
+		return -EINVAL;
+	return ntfs_journal_set_checkpoint_every(h->vol, n);
+}
+
 static int failures, checks;
 #define CHECK(cond) do {						\
 	checks++;							\
@@ -323,11 +355,11 @@ static int img_sync(void *ctx)
 }
 
 struct rec_seen {
-	uint64_t lsn[64];
-	uint16_t redo_op[64];
-	uint16_t target_attr[64];
-	uint64_t target_vcn[64];
-	uint16_t record_off[64];
+	uint64_t lsn[256];
+	uint16_t redo_op[256];
+	uint16_t target_attr[256];
+	uint64_t target_vcn[256];
+	uint16_t record_off[256];
 	int n;
 	/* $FILE_NAME create: its redo carries the name in UTF-16LE. */
 	int fn_name_hits;
@@ -523,7 +555,7 @@ static int collect_rec(const struct ntfs_log_record *r, void *ctx)
 	struct rec_seen *s = ctx;
 	size_t i;
 
-	if (r->record_type != LFS_RECORD_TYPE_CLIENT || s->n >= 64)
+	if (r->record_type != LFS_RECORD_TYPE_CLIENT || s->n >= 256)
 		return 0;
 	s->lsn[s->n] = r->lsn;
 	s->redo_op[s->n] = r->redo_op;
@@ -848,6 +880,21 @@ static int walk_log(const char *path, struct rec_seen *s)
 
 		ntfs_logfile_get_info(log, &info);
 		err = ntfs_logfile_walk(log, info.oldest_lsn, collect_rec, s);
+	}
+	/* Diagnostic aid for walk-count work (Phase 4 step 3): with
+	 * TTNTFS_DUMP_WALK set, print the walked records — index,
+	 * LSN, redo op, target attribute, vcn — so a count change can
+	 * be verified against the actual composition instead of
+	 * guessed. */
+	if (getenv("TTNTFS_DUMP_WALK")) {
+		int i;
+
+		fprintf(stderr, "walk %s: %d records\n", path, s->n);
+		for (i = 0; i < s->n; i++)
+			fprintf(stderr, "  [%d] lsn %llu op 0x%04x attr 0x%04x vcn %llu\n",
+				i, (unsigned long long)s->lsn[i],
+				s->redo_op[i], s->target_attr[i],
+				(unsigned long long)s->target_vcn[i]);
 	}
 	ntfs_logfile_close(log);
 out_img:
@@ -1706,6 +1753,11 @@ static void test_flush_notify_retires_dirty_pages(void)
 	err = ntfs_mount(dev, &mopts, &vol);
 	CHECK_EQ(err, 0);
 	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	/* Pin per-commit checkpoints for this test: it proves the
+	 * flush notification retires pages at the NEXT checkpoint,
+	 * and with the driver default (128, Phase 4 step 3) there
+	 * would be no checkpoint after k.txt's commit to observe. */
+	CHECK_EQ(set_checkpoint_every(vol, 1), 0);
 	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
@@ -1812,6 +1864,11 @@ static void test_flush_notify_no_sync_no_retire(void)
 	err = ntfs_mount(dev, &mopts, &vol);
 	CHECK_EQ(err, 0);
 	if (err) { ntfs_bdev_close(dev); unlink(orig); return; }
+	/* Pin per-commit checkpoints for this test, as in
+	 * test_flush_notify_retires_dirty_pages: its oldest_lsn
+	 * assertions are written against a checkpoint after each
+	 * commit. */
+	CHECK_EQ(set_checkpoint_every(vol, 1), 0);
 	CHECK_EQ(ntfs_volume_root(vol, &root), 0);
 	if (!root) { ntfs_unmount(vol); ntfs_bdev_close(dev); unlink(orig); return; }
 
