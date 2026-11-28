@@ -14,6 +14,10 @@
 # and only the app itself can call SMAppService.unregister(). If the bundle is
 # already gone, the record is orphaned and has to be removed by hand under
 # System Settings > General > Login Items & Extensions > Open at Login.
+#
+# On macOS 27+ the FSKit enabled-module list cannot be edited from a script
+# (same rule as enable-module.sh), so step 2 is skipped and the user is told
+# to remove the entry in System Settings. Everything else still runs.
 set -uo pipefail
 
 APP=${NTFS_APP:-/Applications/TT NTFS Native.app}
@@ -23,6 +27,16 @@ GROUP=${NTFS_GROUP:-group.ch.techtag.ntfs}
 FSKIT_LIST="$HOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 NAME_HINT=$(basename "$APP" .app)
+
+# Version gate (same rule as enable-module.sh): on 27+ the FSKit list is
+# protected from direct editing, so step 2 is skipped and the user is
+# told to remove the entry in System Settings. Everything else still runs.
+LIST_EDITABLE=1
+if command -v sw_vers >/dev/null 2>&1; then
+    MACOS_MAJOR=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+    case "$MACOS_MAJOR" in ''|*[!0-9]*) MACOS_MAJOR=0 ;; esac
+    [ "$MACOS_MAJOR" -ge 27 ] && LIST_EDITABLE=0
+fi
 
 TRACES=(
     "$APP"
@@ -38,7 +52,13 @@ TRACES=(
 if [ "${1:-}" != "--yes" ]; then
     echo "This will remove:"
     for t in "${TRACES[@]}"; do [ -e "$t" ] && echo "  $t"; done
-    echo "  the $ID entry in FSKit's enabled-module list"
+    if [ "$LIST_EDITABLE" = 1 ]; then
+        echo "  the $ID entry in FSKit's enabled-module list"
+    else
+        echo "  (macOS $MACOS_MAJOR cannot edit FSKit's enabled-module list from a script;"
+        echo "   you will need to remove the $ID entry by hand in System Settings,"
+        echo "   General > Login Items & Extensions > Extensions > File System Extensions)"
+    fi
     echo "  its LaunchServices and PlugInKit registrations"
     read -r -p "Continue? [y/N] " reply
     case "$reply" in [yY]*) ;; *) echo "aborted"; exit 1;; esac
@@ -46,8 +66,14 @@ fi
 
 # 1. Unmount anything our module is serving. It holds one fd on the block
 #    device while a volume is live; idle instances hold none.
+# Capture, then match. Piping into `grep -q` is what broke this guard in
+# enable-module.sh (c4ec674): grep exits at the first match, lsof takes
+# SIGPIPE, and `set -o pipefail` turns that into a failed pipeline, so the
+# `|| continue` fired even while a volume was being served and the
+# uninstall proceeded under a mounted volume.
 for pid in $(pgrep -f 'Contents/Extensions/NTFSExtension' 2>/dev/null); do
-    lsof -p "$pid" 2>/dev/null | grep -qE '/dev/r?disk' || continue
+    fds=$(lsof -p "$pid" 2>/dev/null || true)
+    case "$fds" in *'/dev/disk'*|*'/dev/rdisk'*) ;; *) continue;; esac
     echo "the module is serving a mounted volume; unmount it first:"
     mount | grep -E '\(ntfs[,)]' | sed 's/^/  /'
     echo "  diskutil unmount /dev/diskNsM"
@@ -55,12 +81,17 @@ for pid in $(pgrep -f 'Contents/Extensions/NTFSExtension' 2>/dev/null); do
 done
 
 # 2. Drop it from fskit_agent's list and restart the agent so it forgets.
-if [ -f "$FSKIT_LIST" ]; then
+if [ "$LIST_EDITABLE" = 0 ]; then
+    echo "macOS $MACOS_MAJOR: the FSKit enabled-module list cannot be edited from a script."
+    echo "Remove the $ID entry by hand in System Settings > General > Login Items & Extensions > Extensions > File System Extensions."
+elif [ -f "$FSKIT_LIST" ]; then
     python3 - "$FSKIT_LIST" "$ID" <<'PY'
 import plistlib, sys
 path, ident = sys.argv[1:3]
 with open(path, 'rb') as f:
     modules = plistlib.load(f)
+if not isinstance(modules, list):
+    sys.exit(f"refusing to edit {path}: not a list ({type(modules).__name__})")
 if ident in modules:
     modules = [m for m in modules if m != ident]
     with open(path, 'wb') as f:
@@ -115,6 +146,12 @@ done
 echo
 echo "done."
 echo
+if [ "$LIST_EDITABLE" = 0 ]; then
+    echo "And remove the $ID entry from System Settings > General >"
+    echo "Login Items & Extensions > Extensions > File System Extensions."
+    echo "This script cannot remove it on macOS $MACOS_MAJOR."
+    echo
+fi
 echo "If \"$NAME_HINT\" still appears under System Settings > General >"
 echo "Login Items & Extensions > Open at Login, select it and press \"-\"."
 echo "That record can only be removed by the app itself (via its \"Open at"

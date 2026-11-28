@@ -1652,9 +1652,14 @@ tripwires). Stream D, 2026-11-28: the matrix is written
 2, Settings route), falls back to Settings on a permission error,
 validates the plist shape, and fails loudly if `pluginkit` still
 reports the module off after enabling — test-enable-module.sh 14/14
-with negative controls (4/4 new checks fail on the old script). The
-uninstall guard fix and the ctest registration for the new uninstall
-tests follow as separate commits.
+with negative controls (4/4 new checks fail on the old script).
+`uninstall.sh` now has the same guard fix (capture-then-match, citing
+c4ec674 — the old `lsof | grep -q` proceeded under a mounted volume,
+reproduced in the negative control), the same 27 gate (skips the list
+edit, rest still runs), and the same plist-shape validation —
+test-uninstall.sh 6/6 with negative control 1/5 on the old script.
+The ctest registration for the new uninstall tests follows as the
+final commit.
 
 ### 4.5 No CI signing — blocked (needs a paid Apple Developer account)
 The mount test cannot pass until the app is signed with the managed
