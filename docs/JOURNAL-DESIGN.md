@@ -317,6 +317,144 @@ notification that retires dirty pages when their clusters reach the
 volume is step 2; the retry here is the safety valve, not the wrap
 fix.
 
+Step 2 (round 31): the flush notification. A checkpoint alone frees
+no log pages: the writer never removes dirty-page entries, so
+`first_lsn` stays pinned at the oldest entry's `oldest_lsn` and the
+log eventually fills. The fix is the flush notification: when
+clusters carrying journaled metadata reach the volume, the driver
+tells the writer, which appends a `DeleteDirtyClusters` record
+carrying the flushed `{lcn, len}` ranges and zeroes those slots in
+its in-memory dirty-page table (dropping entries that become
+all-zero). The next checkpoint's dump then omits the retired entries
+and `first_lsn` advances past the records they pinned, so the log
+can wrap. The replay already consumes the record: the analysis pass
+zeroes the same slots (and the redo pass shortens records by
+clusters deleted since), so a replay from an older checkpoint agrees
+with the writer's table.
+
+Why synchronous, not deferred. The notification is applied at flush
+time, in the writeback path, not queued for the next commit. A
+deferred drain cannot tell a flush that predates a re-dirty from one
+that follows it: the dirty-page entry carries no newest-LSN, and
+staging re-populates a zeroed slot with the same LCN values, so the
+entry is indistinguishable before and after a touch. A drain that
+runs after a re-dirty would retire a page whose new changes are
+still only in memory — and a later checkpoint would advance
+`first_lsn` past the records for them. The synchronous form has no
+such hole: the notify runs under the folio lock, after the write
+completes, while the page is clean; any later mutation must take
+the folio lock first, and its staging re-creates or re-populates the
+entry, so the notify can only ever retire changes that are already
+on the volume.
+
+Correctness cases. (a) The common case: a page flushed after its
+transaction committed — the flushed bytes include every logged
+change; retiring is safe. (b) A page flushed between two
+transactions touching it: the notify retires the first
+transaction's records (on disk); the second transaction's staging
+re-creates the entry with a fresh `oldest_lsn`. (c) A page flushed
+mid-transaction: only index-allocation folios can reach the disk
+then — the WAL gate defers `$MFT` folios (`ntfs_write_mft_block`,
+`log_txn_open > 0`) and `$MFT:$BITMAP` folios (`ntfs_write_folio`)
+and MFT records (`__ntfs_write_inode`) while a transaction is open.
+The flushed bytes include the transaction's changes (the mutation
+happened before the flush), so retiring is safe if the transaction
+commits; if it aborts, the uncommitted bytes are already on the
+volume with no undo records — a pre-existing WAL hole the notify
+does not create and does not change. (d) A page re-dirtied after the
+notify but before the next checkpoint: staging re-populates the
+entry, so the checkpoint's dump carries it again and `first_lsn`
+does not pass it.
+
+The writer lock. The notify arrives from writeback, outside any
+transaction, while commits serialize on the driver's `log_txn_lock`.
+The writer therefore gains its own lock — a recursive
+`pthread_mutex_t` in `struct ntfs_log_writer` (`<pthread.h>`; libc
+on glibc >= 2.34 and on macOS libSystem, so the writer stays
+libc-only and the Darwin preprocess check still passes). Every
+public writer/txn entry point takes it; the recursion is confined
+to the checkpoint/commit -> append nesting. Lock order:
+`log_txn_lock` -> writer lock, and folio lock -> writer lock; the
+writer lock never nests with anything (appends do device I/O only,
+staging is memory only), so no inversion is possible. The notify
+takes only the writer lock, never `log_txn_lock` — taking the
+driver's transaction lock from writeback would invert against a
+commit blocked on a folio lock.
+
+The emitter. `ntfs_log_writer_delete_dirty_clusters(w, ranges, n)`
+appends one client record (redo op `LOP_DeleteDirtyClusters`, undo
+`LOP_Noop`, tid `0x18` — the log-client bookkeeping tid the table
+dumps use — target attribute 0, no page LCNs, redo payload the
+`{u64 lcn, u64 len}` ranges) and zeroes the matching slots in the
+writer's dirty-page table, dropping entries that become all-zero. It
+appends nothing when no slot matches, so the driver may call it
+without first consulting the table. It never checkpoints or
+retries: an `-ENOSPC` (log full) is returned to the caller, which
+drops the notification — the entry stays, and a later flush or
+commit retries. Retirement is best-effort; correctness never
+depends on it (an unretired entry only costs log space).
+
+The reader. One change: the analysis pass skips transaction-table
+upkeep for `DeleteDirtyClusters`, as it already does for the table
+dumps — the record is log-client bookkeeping, not transaction
+activity, and upkeep would otherwise allocate a phantom ACTIVE
+transaction at its tid (the same shape as the close-checkpoint fix
+in Phase 2 step 3). The redo pass already shortens records by
+zeroed clusters and skips the record as an action, so no other
+reader change is needed.
+
+Driver hook. `ntfs_journal_notify_flushed(vol, attr_ni, byte_off,
+len)` (in `core/vfs/journal.c`, next to `attr_coords`): walks the
+attribute's runs for the byte range, builds the `(lcn, len)`
+ranges, and calls the emitter. Call sites, all after a successful
+synchronous write and while the folio lock is held:
+- `ntfs_write_mft_block`: per written MFT record — the record's
+  clusters, but only when no record overlapping those clusters is
+  still dirty (`NInoDirty` on the other records in the cluster; a
+  skipped record's inode is dirty, which is exactly why it was
+  skipped). The notify runs before `folio_unlock`, after the last
+  `submit_bio` — in this port `submit_bio` performs the I/O
+  immediately, so the bytes are durable on return; on a real async
+  kernel the notify must move to bio completion (or
+  `submit_bio_wait`).
+- `write_mft_record_nolock`: the same helper for the record just
+  written (the inode path — `__ntfs_write_inode` — and the alloc
+  rollback paths), at `done:`, while the folio is locked.
+- `ntfs_write_folio` (non-resident path): after a successful write
+  of an `AT_BITMAP` (`$MFT:$BITMAP`, `$Bitmap:$DATA`) or
+  `AT_INDEX_ALLOCATION` folio — the whole folio is the written
+  range. File data folios never notify (data is not journaled);
+  resident-attribute folios only copy bytes into the in-memory MFT
+  record, which is gated at its `$MFT` folio; compressed data
+  folios return early here (compress.c writes those blocks itself)
+  — the compressed-data flush hook is a follow-up, not this step.
+A notification for ranges matching no entry appends nothing, so a
+stale or duplicate notify is harmless.
+
+What step 2 does not do. Entries for attributes that no longer
+exist (a deleted file's `$INDEX_ALLOCATION` page, a freed cluster
+range) are never flushed again, so they are never notified and
+linger, pinning `first_lsn` — a slow leak, not corruption; a
+checkpoint-time reaper is the follow-up. The compressed-data flush
+hook is the other follow-up. The carried Phase 3 follow-ups (mkdir
+`$SI` flags, truncate sparse flags, xattr `$SI` snapshot, EA flags
+path, reader wart, live-driver `$FILE_NAME` times) are untouched
+by this step.
+
+Tests. `test_writer_delete_dirty_clusters` in
+`core/logfile/tests/test_logfile.c`: stage a create, commit, call
+the emitter for the create's `$MFT:$DATA` cluster, and assert the
+record walks as `DeleteDirtyClusters` with the right ranges, the
+writer's next checkpoint dumps no entry for it, `first_lsn`
+advances past the create's records, and a dry + real replay still
+redoes the create (the bytes are on the volume in the test's model
+— the emitter is the claim that they are). The driver test in
+`core/tests/test_journal.c`: create files, drive writeback, commit,
+checkpoint, and assert the dirty-page entries retire and
+`first_lsn` advances; the negative control (no writeback driven)
+asserts they do not. Crash sweep: the replay path is touched (the
+upkeep skip), so the sweep covers the notify record's cut points.
+
 ### 4.4 What the writer does not do
 
 - No data journaling (NTFS never journals file data).

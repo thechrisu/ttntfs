@@ -1283,9 +1283,41 @@ in the test, not the driver: an unbounded index-entry walk (now
 bounded by the record size) and the walk starting at the first
 commit's first LSN, which later checkpoints have correctly moved
 past `oldest_lsn` (the reader refuses anything before oldest).
-Next: Phase 4 step 2 (flush notification / dirty-page retirement),
-then step 3 (flip the default to 128 + driver walk-count updates +
-write-amplification and latency measurement).
+Phase 4, step 2 — flush notification / dirty-page retirement, design
+landed 2026-11-28 (round 31, docs only; implementation follows in
+the same round): the flush notification retires dirty pages when
+their clusters reach the volume, so a checkpointed page frees log
+space in-session and the log can wrap. Design in
+docs/JOURNAL-DESIGN.md §4.3: the notification is applied
+synchronously at flush time, in the writeback path, under the folio
+lock — never deferred to the next commit, because a deferred drain
+cannot tell a flush that predates a re-dirty from one that follows
+it (the dirty-page entry carries no newest-LSN, and staging
+re-populates a zeroed slot with the same LCN values). The writer
+gains a recursive pthread mutex (lock order `log_txn_lock` ->
+writer lock, folio lock -> writer lock, never the reverse) and a
+`ntfs_log_writer_delete_dirty_clusters()` emitter that appends one
+`DeleteDirtyClusters` record (redo payload `{u64 lcn, u64 len}`
+ranges, tid `0x18`) and zeroes the matching slots in the writer's
+dirty-page table, dropping entries that become all-zero; it appends
+nothing when no slot matches and never checkpoints or retries (an
+`-ENOSPC` is dropped, the entry stays, a later flush retries). The
+analysis pass skips transaction-table upkeep for
+`DeleteDirtyClusters` (log-client bookkeeping, like the table
+dumps — otherwise a phantom ACTIVE transaction; the redo pass
+already shortens by zeroed clusters). Driver hook
+`ntfs_journal_notify_flushed()` from `ntfs_write_mft_block` (per
+written record, only when no record overlapping its clusters is
+still dirty), `write_mft_record_nolock` (the inode path), and
+`ntfs_write_folio` for `AT_BITMAP` / `AT_INDEX_ALLOCATION` folios;
+file data never notifies, compressed-data flush is a follow-up, and
+entries for attributes that no longer exist linger (slow leak, a
+checkpoint-time reaper is the follow-up). In this port `submit_bio`
+performs the I/O immediately, so the bytes are durable when the
+writeback function returns; on a real async kernel the notify must
+move to bio completion.
+Next: Phase 4 step 3 (flip the default to 128 + driver walk-count
+updates + write-amplification and latency measurement).
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a
