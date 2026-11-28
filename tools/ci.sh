@@ -119,16 +119,22 @@ stage_ubsan() {
 # ci.sh sequence: the checks job on macos-26 runs the plain suite, and
 # this stage stays separately runnable in its dedicated job (joining it
 # would roughly double the checks job's macOS time).
-# Per-test timeout 180 s: the slowest test under ASan on Linux (links)
-# takes 20-95 s depending on host CPU contention on this shared box
-# (measured 2026-11-26, with and without the 4e646ecd4475 change alike:
-# 18-33 s quiet, 43-93 s loaded), so 180 s is ~2x headroom over the
-# slowest observed and a hang still becomes a failed test, never a
-# runaway. The old 60 s bound was set when the slowest test was ~20 s;
-# it started failing links on timeout alone once the box got loaded
-# (2026-11-26: six consecutive ASan failures, all links timeouts, no
-# assertion or ASan error; two live dumps showed the process running or
-# in normal I/O wait, progressing through the suite -- no deadlock). The stage asserts the suite actually executed: ctest must
+# Per-test timeout 300 s: the slowest test under ASan on Linux is now
+# test_crash (9,869 checks since the journal classes landed: 127 s on a
+# quiet box, 248 s under load, measured 2026-11-27/28), so 300 s is ~2.4x
+# headroom over the quiet runtime and ~1.2x over the loaded one; a hang
+# still becomes a failed test, never a runaway. The old 180 s bound was
+# set when the slowest test was links at 20-95 s (measured 2026-11-26,
+# with and without the 4e646ecd4475 change alike: 18-33 s quiet, 43-93 s
+# loaded); it started failing test_crash on timeout alone once the
+# journal classes grew the suite (rounds 28 and 29 and stream B, three
+# consecutive rounds, zero assertion failures, the crash suite passing
+# standalone every time). The 60 s bound before that was set when the
+# slowest test was ~20 s; it started failing links on timeout alone once
+# the box got loaded (2026-11-26: six consecutive ASan failures, all
+# links timeouts, no assertion or ASan error; two live dumps showed the
+# process running or in normal I/O wait, progressing through the suite
+# -- no deadlock). The stage asserts the suite actually executed: ctest must
 # report 100% passed over at least one test, and at least one test must
 # have a Passed line. That is the 2026-09-14 failure mode -- a run that
 # executes nothing must fail loudly, never read green. The summary line
@@ -143,7 +149,7 @@ stage_asan() {
 	cmake -S . -B build-asan -DNTFS_ASAN=ON -DNTFS_LOGFILE_ASAN=ON >/dev/null || return 1
 	cmake --build build-asan -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)" >/dev/null || return 1
 	local out rc
-	out=$(ctest --test-dir build-asan --timeout 180 --output-on-failure 2>&1)
+	out=$(ctest --test-dir build-asan --timeout 300 --output-on-failure 2>&1)
 	rc=$?
 	printf '%s\n' "$out"
 	[ $rc -eq 0 ] || return 1
