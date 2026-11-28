@@ -82,6 +82,7 @@
  *   both carry the same LSN, so either is a good state.
  */
 #include "logfile_internal.h"
+#include <pthread.h>
 
 #define LW_PAGE_SIZE LFS_DEFAULT_PAGE_SIZE	/* 4096; v1.1 writer only */
 #define LW_TAIL_SLOTS 2			/* v1.x keeps two tail copies */
@@ -106,6 +107,17 @@ struct ntfs_log_writer {
 	bool checkpointed;
 	bool in_checkpoint;		/* checkpoint appends: reserve-exempt */
 	bool closed;			/* clean close done: no more records */
+	/* Phase 4 step 2: guards all writer state (cursor, tables,
+	 * restart area). Recursive: checkpoint/commit nest appends.
+	 * Lock order: log_txn_lock -> lock, folio lock -> lock; the
+	 * lock never nests with anything (appends do device I/O only,
+	 * staging is memory only), so no inversion is possible. The
+	 * flush notification takes only this lock, never log_txn_lock
+	 * — taking the driver's transaction lock from writeback would
+	 * invert against a commit blocked on a folio lock. Every
+	 * public writer/txn entry point takes it; the internal
+	 * lw_append/lw_sync assume it is held. */
+	pthread_mutex_t lock;
 	uint32_t checkpoint_every;	/* commits between checkpoints (Phase 4);
 					   1 = every commit, the Phase 2 behaviour */
 	uint32_t commits_since_checkpoint;
@@ -183,6 +195,9 @@ static int lw_write_page(ntfs_logfile_t *log, uint32_t vbo, const uint8_t *page)
 		return err < 0 ? err : -EIO;
 	return 0;
 }
+
+/* Forward declarations: defined in the sync/append sections below. */
+static int lw_sync(ntfs_log_writer_t *w);
 
 /* ---- format ------------------------------------------------------------ */
 
@@ -371,6 +386,30 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 	}
 	memcpy(w->ra, log->ra, w->ra_len);
 
+	/* Phase 4 step 2: the writer lock (see the struct comment).
+	 * Initialised here, after the ra/page_buf allocations, so the
+	 * direct-free path above (which runs before it) has no mutex
+	 * to destroy; every failure path below frees via
+	 * ntfs_log_writer_free(), which destroys it. */
+	{
+		pthread_mutexattr_t attr;
+		bool attr_ok = pthread_mutexattr_init(&attr) == 0;
+		int merr = attr_ok ?
+			pthread_mutexattr_settype(&attr,
+						  PTHREAD_MUTEX_RECURSIVE) : -1;
+
+		if (!merr)
+			merr = pthread_mutex_init(&w->lock, &attr);
+		if (attr_ok)
+			pthread_mutexattr_destroy(&attr);
+		if (merr) {
+			free(w->ra);
+			free(w->page_buf);
+			free(w);
+			return -ENOMEM;
+		}
+	}
+
 	/*
 	 * Adopt the last checkpoint's tables, so a checkpoint written by
 	 * this session does not drop what an earlier session registered.
@@ -420,7 +459,7 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 		lf_put16(w->ra + RA_CLIENT_IN_USE_LIST, w->client_idx);
 		lf_put16(w->ra + RA_CLIENT_FREE_LIST, LFS_NO_CLIENT);
 		lf_put16(w->ra + RA_FLAGS, lf_get16(w->ra + RA_FLAGS) & ~RESTART_VOLUME_IS_CLEAN);
-		err = ntfs_log_writer_sync(w);
+		err = lw_sync(w);
 		if (err) {
 			ntfs_log_writer_free(w);
 			return err;
@@ -457,6 +496,7 @@ void ntfs_log_writer_free(ntfs_log_writer_t *w)
 {
 	if (!w)
 		return;
+	pthread_mutex_destroy(&w->lock);
 	lfs_table_free(&w->trtbl);
 	lfs_table_free(&w->dptbl);
 	lfs_table_free(&w->oatbl);
@@ -475,7 +515,9 @@ void ntfs_log_writer_free(ntfs_log_writer_t *w)
  * Both pages carry the same LSN, so a crash between the two writes
  * leaves either page as a good state.
  */
-int ntfs_log_writer_sync(ntfs_log_writer_t *w)
+/* Internal sync: assumes the writer lock is held (see the struct
+ * comment). The public ntfs_log_writer_sync() wraps it. */
+static int lw_sync(ntfs_log_writer_t *w)
 {
 	ntfs_logfile_t *log = w->log;
 	uint8_t *page;
@@ -511,6 +553,21 @@ int ntfs_log_writer_sync(ntfs_log_writer_t *w)
 	log->current_lsn = w->last_lsn;
 	log->last_lsn = w->last_lsn;
 	return 0;
+}
+
+/* Flush the restart area. Takes the writer lock; the internal
+ * lw_sync() (above) is what the append/checkpoint/close paths call
+ * with it held. */
+int ntfs_log_writer_sync(ntfs_log_writer_t *w)
+{
+	int err;
+
+	if (!w)
+		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	err = lw_sync(w);
+	pthread_mutex_unlock(&w->lock);
+	return err;
 }
 
 /* ---- append ------------------------------------------------------------ */
@@ -621,9 +678,11 @@ static uint32_t lw_reserve_pages(ntfs_log_writer_t *w)
 	return p;
 }
 
-int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t transaction_id,
-			   uint64_t undo_next_lsn, const void *data, uint32_t data_len,
-			   uint64_t *lsn_out)
+/* Internal append: assumes the writer lock is held (see the struct
+ * comment). The public ntfs_log_writer_append() wraps it. */
+static int lw_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t transaction_id,
+		     uint64_t undo_next_lsn, const void *data, uint32_t data_len,
+		     uint64_t *lsn_out)
 {
 	ntfs_logfile_t *log = w->log;
 	uint8_t *stage;
@@ -752,7 +811,7 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 			/* Establish "current_lsn == 0 iff no records":
 			 * the scan cannot recover records the restart area
 			 * never heard of (see the file header). */
-			err = ntfs_log_writer_sync(w);
+			err = lw_sync(w);
 			if (err)
 				return err;
 		}
@@ -760,6 +819,23 @@ int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t 
 	if (lsn_out)
 		*lsn_out = lsn;
 	return 0;
+}
+
+/* Append one record. Takes the writer lock; the internal lw_append()
+ * (above) is what the checkpoint/commit paths call with it held. */
+int ntfs_log_writer_append(ntfs_log_writer_t *w, uint32_t record_type, uint32_t transaction_id,
+			   uint64_t undo_next_lsn, const void *data, uint32_t data_len,
+			   uint64_t *lsn_out)
+{
+	int err;
+
+	if (!w)
+		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	err = lw_append(w, record_type, transaction_id, undo_next_lsn,
+			data, data_len, lsn_out);
+	pthread_mutex_unlock(&w->lock);
+	return err;
 }
 
 /* ---- open-attribute registration --------------------------------------- */
@@ -779,20 +855,29 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 {
 	uint8_t *e;
 	uint32_t off;
-	int err;
+	int err = 0;
 
-	if (w->failed)
-		return -EIO;
-	if (w->closed)
+	if (!w)
 		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->failed) {
+		err = -EIO;
+		goto out;
+	}
+	if (w->closed) {
+		err = -EINVAL;
+		goto out;
+	}
 	if (!w->oatbl.buf) {
 		err = lfs_table_init(&w->oatbl, OA1_SIZE, 16);
 		if (err)
-			return err;
+			goto out;
 	}
 	e = lfs_table_alloc(&w->oatbl);
-	if (!e)
-		return -ENOMEM;
+	if (!e) {
+		err = -ENOMEM;
+		goto out;
+	}
 	off = lfs_table_off(&w->oatbl, e);
 	lf_put32(e + OA1_TYPE, type);
 	lf_put64(e + OA1_FILE_REF,
@@ -808,8 +893,10 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 			while (cap < need)
 				cap *= 2;
 			nb = realloc(w->attr_names, cap);
-			if (!nb)
-				return -ENOMEM;
+			if (!nb) {
+				err = -ENOMEM;
+				goto out;
+			}
 			w->attr_names = nb;
 			w->attr_names_cap = cap;
 		}
@@ -820,7 +907,9 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 	}
 	if (attr_id_out)
 		*attr_id_out = off;
-	return 0;
+out:
+	pthread_mutex_unlock(&w->lock);
+	return err;
 }
 
 /* ---- checkpoint emission ----------------------------------------------- */
@@ -853,7 +942,7 @@ static int lw_dump_table(ntfs_log_writer_t *w, uint16_t op,
 	lf_put16(cdata + NR_UNDO_OFFSET, (uint16_t)total);
 	lf_put16(cdata + NR_UNDO_LENGTH, 0);
 	memcpy(cdata + hdr, data, len);
-	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0,
+	err = lw_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0,
 				     cdata, total, lsn_out);
 	free(cdata);
 	return err;
@@ -939,7 +1028,7 @@ static int lw_checkpoint_inner(ntfs_log_writer_t *w, uint64_t *lsn_out)
 	lf_put32(crst + CRST_DIRTY_PAGE_TABLE_LEN, dp_len);
 	lf_put64(crst + CRST_TRANSACTION_TABLE_LSN, tr_lsn);
 	lf_put32(crst + CRST_TRANSACTION_TABLE_LEN, tr_len);
-	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT_RESTART, 0, 0,
+	err = lw_append(w, LFS_RECORD_TYPE_CLIENT_RESTART, 0, 0,
 				     crst, sizeof(crst), &rlsn);
 	if (err)
 		return err;
@@ -971,7 +1060,7 @@ static int lw_checkpoint_inner(ntfs_log_writer_t *w, uint64_t *lsn_out)
 		if (ol && ol < w->first_lsn)
 			w->first_lsn = ol;
 	}
-	err = ntfs_log_writer_sync(w);
+	err = lw_sync(w);
 	if (err)
 		return err;
 	if (lsn_out)
@@ -983,15 +1072,23 @@ int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out)
 {
 	int err;
 
-	if (w->failed)
-		return -EIO;
-	if (w->closed)
+	if (!w)
 		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->failed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EIO;
+	}
+	if (w->closed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EINVAL;
+	}
 	w->in_checkpoint = true;
 	err = lw_checkpoint_inner(w, lsn_out);
 	w->in_checkpoint = false;
 	if (!err)
 		w->commits_since_checkpoint = 0;
+	pthread_mutex_unlock(&w->lock);
 	return err;
 }
 
@@ -1004,10 +1101,157 @@ int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out)
  * ntfs_log_txn_commit), so a fresh log always gains one. */
 int ntfs_log_writer_set_checkpoint_every(ntfs_log_writer_t *w, uint32_t n)
 {
-	if (!w || w->closed)
+	if (!w)
 		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->closed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EINVAL;
+	}
 	w->checkpoint_every = n ? n : 1;
+	pthread_mutex_unlock(&w->lock);
 	return 0;
+}
+
+/* ---- flush notification (Phase 4 step 2) ------------------------------ */
+
+/* Forward declaration: defined in the transactions section below. */
+static int txn_build_crec(uint16_t redo_op, uint16_t undo_op,
+			  uint32_t target_attr, uint16_t lcns,
+			  uint16_t record_off, uint16_t attr_off,
+			  uint16_t cluster_off, uint64_t target_vcn,
+			  const uint64_t *page_lcns, const void *redo,
+			  uint16_t redo_len, const void *undo, uint16_t undo_len,
+			  uint8_t **out, uint32_t *out_len);
+
+/*
+ * Retire dirty pages whose clusters reached the volume (docs/
+ * JOURNAL-DESIGN.md §4.3 step 2): append one DeleteDirtyClusters
+ * record carrying the flushed {lcn, len} ranges, then zero those
+ * slots in the writer's dirty-page table and drop entries that
+ * become all-zero, so the next checkpoint's dump omits them and
+ * first_lsn can advance past the records they pinned.
+ *
+ * The record is appended raw: no checkpoint, no retry. A refused
+ * append (-ENOSPC when the log is full) leaves the table untouched
+ * — the caller drops the notification and a later flush retries.
+ * Retirement is best-effort; correctness never depends on it (an
+ * unretired entry only costs log space). When no slot matches, the
+ * function appends nothing and returns 0, so the driver may call
+ * it without first consulting the table and a stale or duplicate
+ * notification is harmless.
+ *
+ * Caller contract: the ranges are the clusters of one synchronous
+ * write that has completed (the bytes are durable), and a range's
+ * lcn + len does not overflow. The call runs under the folio lock
+ * for the flushed page, so no mutation of that page can interleave
+ * between the write and this call; any later mutation re-creates
+ * or re-populates the entry via staging (txn_dirty_page), so the
+ * zeroing can only ever retire changes already on the volume.
+ * Takes only the writer lock, never log_txn_lock.
+ */
+int ntfs_log_writer_delete_dirty_clusters(ntfs_log_writer_t *w,
+					  const struct ntfs_log_range *ranges,
+					  uint32_t nranges)
+{
+	uint8_t *payload, *c;
+	uint32_t i, n;
+	bool any = false;
+	uint8_t *e;
+	int err = 0;
+
+	if (!w || !ranges || !nranges || nranges > 0xffffu / LR_RANGE_SIZE)
+		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->failed || w->closed) {
+		err = w->failed ? -EIO : -EINVAL;
+		goto out;
+	}
+	/* Does any slot match? */
+	e = NULL;
+	while ((e = lfs_table_next(&w->dptbl, e)) && !any) {
+		uint32_t cnt = lf_get32(e + DP1_LCNS_FOLLOW), j;
+
+		for (j = 0; j < cnt; j++) {
+			uint64_t l = lf_get64(e + DP1_PAGE_LCNS + 8 * j);
+
+			if (!l)
+				continue;
+			for (i = 0; i < nranges; i++) {
+				if (l >= ranges[i].lcn &&
+				    l < ranges[i].lcn + ranges[i].len) {
+					any = true;
+					break;
+				}
+			}
+			if (any)
+				break;
+		}
+	}
+	if (!any)
+		goto out;
+	/* Build the record: redo op DeleteDirtyClusters, no undo, no
+	 * target attribute and no page LCNs — the payload is the ranges
+	 * themselves. tid 0x18 is the log-client bookkeeping tid the
+	 * table dumps use; the record names no transaction, and the
+	 * analysis pass skips transaction-table upkeep for it. */
+	payload = malloc((size_t)nranges * LR_RANGE_SIZE);
+	if (!payload) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < nranges; i++) {
+		lf_put64(payload + (size_t)i * LR_RANGE_SIZE, ranges[i].lcn);
+		lf_put64(payload + (size_t)i * LR_RANGE_SIZE + 8, ranges[i].len);
+	}
+	err = txn_build_crec(LOP_DeleteDirtyClusters, LOP_Noop, 0, 0, 0, 0,
+			     0, 0, NULL, payload,
+			     (uint16_t)(nranges * LR_RANGE_SIZE),
+			     NULL, 0, &c, &n);
+	free(payload);
+	if (err)
+		goto out;
+	err = lw_append(w, LFS_RECORD_TYPE_CLIENT, 0x18, 0, c, n, NULL);
+	free(c);
+	if (err)
+		goto out;
+	/* The record is durable: zero the matching slots, and drop
+	 * entries that become all-zero. */
+	e = NULL;
+	while ((e = lfs_table_next(&w->dptbl, e))) {
+		uint32_t cnt = lf_get32(e + DP1_LCNS_FOLLOW), j;
+
+		for (j = 0; j < cnt; j++) {
+			uint64_t l = lf_get64(e + DP1_PAGE_LCNS + 8 * j);
+
+			if (!l)
+				continue;
+			for (i = 0; i < nranges; i++) {
+				if (l >= ranges[i].lcn &&
+				    l < ranges[i].lcn + ranges[i].len) {
+					lf_put64(e + DP1_PAGE_LCNS + 8 * j, 0);
+					break;
+				}
+			}
+		}
+	}
+	e = NULL;
+	while ((e = lfs_table_next(&w->dptbl, e))) {
+		uint32_t cnt = lf_get32(e + DP1_LCNS_FOLLOW), j;
+		bool empty = true;
+
+		for (j = 0; j < cnt; j++) {
+			if (lf_get64(e + DP1_PAGE_LCNS + 8 * j)) {
+				empty = false;
+				break;
+			}
+		}
+		if (empty)
+			lfs_table_free_idx(&w->dptbl, lfs_table_off(&w->dptbl, e));
+	}
+out:
+	pthread_mutex_unlock(&w->lock);
+	return err;
 }
 
 /* ---- clean close ------------------------------------------------------- */
@@ -1035,23 +1279,35 @@ int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out)
 	uint64_t rlsn;
 	int err;
 
-	if (w->failed)
-		return -EIO;
-	if (w->closed)
+	if (!w)
 		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->failed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EIO;
+	}
+	if (w->closed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EINVAL;
+	}
 	err = ntfs_log_writer_checkpoint(w, &rlsn);
-	if (err)
+	if (err) {
+		pthread_mutex_unlock(&w->lock);
 		return err;
+	}
 	lf_put16(w->ra + RA_FLAGS,
 		 lf_get16(w->ra + RA_FLAGS) | RESTART_VOLUME_IS_CLEAN);
 	lf_put16(w->ra + RA_CLIENT_IN_USE_LIST, LFS_NO_CLIENT);
 	lf_put16(w->ra + RA_CLIENT_FREE_LIST, w->client_idx);
-	err = ntfs_log_writer_sync(w);
-	if (err)
+	err = lw_sync(w);
+	if (err) {
+		pthread_mutex_unlock(&w->lock);
 		return err;
+	}
 	w->closed = true;
 	if (lsn_out)
 		*lsn_out = rlsn;
+	pthread_mutex_unlock(&w->lock);
 	return 0;
 }
 
@@ -1204,25 +1460,36 @@ int ntfs_log_txn_begin(ntfs_log_writer_t *w, ntfs_log_txn_t **out)
 	int err;
 
 	*out = NULL;
-	if (!w || w->failed || w->closed)
-		return w ? -EIO : -EINVAL;
+	if (!w)
+		return -EINVAL;
+	pthread_mutex_lock(&w->lock);
+	if (w->failed || w->closed) {
+		pthread_mutex_unlock(&w->lock);
+		return -EIO;
+	}
 	if (!w->trtbl.buf) {
 		err = lfs_table_init(&w->trtbl, TR_SIZE, 8);
-		if (err)
+		if (err) {
+			pthread_mutex_unlock(&w->lock);
 			return err;
+		}
 	}
 	t = calloc(1, sizeof(*t));
-	if (!t)
+	if (!t) {
+		pthread_mutex_unlock(&w->lock);
 		return -ENOMEM;
+	}
 	e = lfs_table_alloc(&w->trtbl);
 	if (!e) {
 		free(t);
+		pthread_mutex_unlock(&w->lock);
 		return -ENOMEM;
 	}
 	t->w = w;
 	t->tid = lfs_table_off(&w->trtbl, e);
 	e[TR_STATE] = TRANSACTION_ACTIVE;
 	*out = t;
+	pthread_mutex_unlock(&w->lock);
 	return 0;
 }
 
@@ -1245,23 +1512,30 @@ static int txn_add(ntfs_log_txn_t *t, uint16_t redo_op, uint16_t undo_op,
 
 	if (!t || t->done)
 		return -EINVAL;
+	/* Staging mutates the writer's dirty-page table
+	 * (txn_dirty_page), so it takes the writer lock — the staging
+	 * choke point for all ntfs_log_txn_*() builders. */
+	pthread_mutex_lock(&t->w->lock);
 	err = txn_build_crec(redo_op, undo_op, target_attr, lcns, record_off,
 			     attr_off, cluster_off, target_vcn, page_lcns,
 			     redo, redo_len, undo, undo_len, &c, &n);
 	if (err)
-		return err;
+		goto out;
 	err = txn_stage(t, c, n);
 	free(c);
 	if (err)
-		return err;
+		goto out;
 	err = txn_dirty_page(t, target_attr, target_vcn, page_lcns, lcns);
 	if (err)
-		return err;
+		goto out;
 	if (undo_len) {
 		t->undo_records++;
 		t->undo_bytes += undo_len;
 	}
-	return 0;
+	err = 0;
+out:
+	pthread_mutex_unlock(&t->w->lock);
+	return err;
 }
 
 int ntfs_log_txn_init_record(ntfs_log_txn_t *t, uint32_t mft_attr,
@@ -1514,11 +1788,11 @@ static int txn_append_retry(ntfs_log_writer_t *w, uint32_t type, uint32_t tid,
 {
 	int err;
 
-	err = ntfs_log_writer_append(w, type, tid, undo_next, data, len,
+	err = lw_append(w, type, tid, undo_next, data, len,
 				     lsn_out);
 	if (err == -ENOSPC && w->commits_since_checkpoint > 0) {
 		if (ntfs_log_writer_checkpoint(w, NULL) == 0)
-			err = ntfs_log_writer_append(w, type, tid, undo_next,
+			err = lw_append(w, type, tid, undo_next,
 						     data, len, lsn_out);
 	}
 	return err;
@@ -1690,6 +1964,12 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 		return -EINVAL;
 	w = t->w;
 	t->done = true;
+	/* The whole commit appends under the writer lock: the staged
+	 * records, the open records, Commit, the periodic checkpoint
+	 * and Forget all mutate the writer's cursor and tables, and
+	 * the flush notification (Phase 4 step 2) takes the same lock
+	 * from writeback. */
+	pthread_mutex_lock(&w->lock);
 	if (!t->nstaged) {
 		/* Nothing was ever staged: free the empty entry. */
 		lfs_table_free_idx(&w->trtbl, t->tid);
@@ -1698,6 +1978,7 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 		if (last_lsn_out)
 			*last_lsn_out = 0;
 		txn_free(t);
+		pthread_mutex_unlock(&w->lock);
 		return 0;
 	}
 	/* The open records come first: replay's analysis needs the
@@ -1783,6 +2064,7 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 	if (last_lsn_out)
 		*last_lsn_out = clsn ? clsn : t->last_lsn;
 	txn_free(t);
+	pthread_mutex_unlock(&w->lock);
 	return err;
 }
 
@@ -1795,7 +2077,9 @@ int ntfs_log_txn_abort(ntfs_log_txn_t *t)
 	w = t->w;
 	t->done = true;
 	/* Nothing was ever appended: staging was in memory only. */
+	pthread_mutex_lock(&w->lock);
 	lfs_table_free_idx(&w->trtbl, t->tid);
+	pthread_mutex_unlock(&w->lock);
 	txn_free(t);
 	return 0;
 }

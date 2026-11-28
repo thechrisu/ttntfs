@@ -1588,9 +1588,15 @@ static int analysis_pass(struct replay *r, uint64_t *rlsn_out)
 		 * ACTIVE and report a phantom active transaction with
 		 * nothing to undo. The dumps are handled by the
 		 * checkpoint-load path (and hit the switch's default
-		 * case here), so they need no upkeep at all. */
+		 * case here), so they need no upkeep at all.
+		 * DeleteDirtyClusters is log-client bookkeeping too
+		 * (the flush notification, Phase 4 step 2): it carries
+		 * the same 0x18 tid by construction but names no
+		 * transaction, so upkeep would resurrect a forgotten
+		 * transaction as a phantom ACTIVE one at that tid. */
 		tr = NULL;
-		if (!op_is_table_dump(redo_op)) {
+		if (!op_is_table_dump(redo_op) &&
+		    redo_op != LOP_DeleteDirtyClusters) {
 			if (!lfs_table_entry_ok(&log->trtbl, tid)) {
 				tr = lfs_table_alloc_at(&log->trtbl, tid);
 				if (!tr) {

@@ -331,6 +331,21 @@ int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out);
  * the periodic policy at 128 once the driver flips it. The first commit
  * always checkpoints regardless of this setting. */
 int ntfs_log_writer_set_checkpoint_every(ntfs_log_writer_t *w, uint32_t n);
+/* A flushed cluster range for ntfs_log_writer_delete_dirty_clusters(). */
+struct ntfs_log_range { uint64_t lcn, len; };
+/* Phase 4 step 2: retire dirty pages whose clusters reached the volume
+ * (the flush notification, docs/JOURNAL-DESIGN.md §4.3). Appends one
+ * DeleteDirtyClusters record carrying @ranges and zeroes those slots in
+ * the writer's dirty-page table, dropping entries that become all-zero,
+ * so the next checkpoint's dump omits them and first_lsn can advance.
+ * Appends nothing when no slot matches (returns 0); never checkpoints
+ * or retries — a refused append (-ENOSPC) leaves the table untouched
+ * and the caller drops the notification. Caller contract: the ranges
+ * are the clusters of one synchronous write that has completed, and a
+ * range's lcn + len does not overflow. Takes only the writer lock. */
+int ntfs_log_writer_delete_dirty_clusters(ntfs_log_writer_t *w,
+					  const struct ntfs_log_range *ranges,
+					  uint32_t nranges);
 int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out);
 int ntfs_log_writer_sync(ntfs_log_writer_t *w);
 void ntfs_log_writer_free(ntfs_log_writer_t *w);

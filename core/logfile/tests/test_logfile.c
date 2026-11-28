@@ -3555,6 +3555,283 @@ static void test_writer_periodic_checkpoint(void)
 	CHECK_EQ(second1, 5);
 }
 
+/* Walk collector for the DeleteDirtyClusters test: keeps the
+ * DeleteDirtyClusters record (there must be exactly one) and the
+ * last DirtyPageTableDump payload, copied out (the walk pointers
+ * are only valid during the callback). */
+struct ddc_seen {
+	uint64_t ddc_lsn;
+	uint64_t ddc_lcn, ddc_len;
+	int ddc_n;
+	uint8_t dp_dump[4096];
+	uint32_t dp_dump_len;
+	uint64_t dp_dump_lsn;
+};
+
+static int collect_ddc(const struct ntfs_log_record *r, void *ctx)
+{
+	struct ddc_seen *s = ctx;
+
+	if (r->record_type != LFS_RECORD_TYPE_CLIENT)
+		return 0;
+	if (r->redo_op == LOP_DeleteDirtyClusters) {
+		s->ddc_n++;
+		s->ddc_lsn = r->lsn;
+		if (r->redo_len >= LR_RANGE_SIZE && r->redo) {
+			const uint8_t *rg = r->redo;
+
+			s->ddc_lcn = lf_get64(rg);
+			s->ddc_len = lf_get64(rg + 8);
+		}
+	}
+	if (r->redo_op == LOP_DirtyPageTableDump && r->redo) {
+		s->dp_dump_lsn = r->lsn;
+		s->dp_dump_len = r->redo_len < sizeof(s->dp_dump) ?
+			r->redo_len : (uint32_t)sizeof(s->dp_dump);
+		memcpy(s->dp_dump, r->redo, s->dp_dump_len);
+	}
+	return 0;
+}
+
+/* One create + optional flush notification, crash-simulated, then
+ * replayed. Returns the replay counts and the volume facts the
+ * caller asserts on: the parent's $INDEX_ROOT entry count, the
+ * $MFT:$BITMAP byte for bit 40, and whether the new record is in
+ * use. The control (notify = 0) redoes all 7 data records; with
+ * the notification for the new record's $MFT:$DATA cluster (LCN
+ * 26, vcn 10) the 4 records touching it are skipped and only the
+ * 2 parent records + the SetBits redo. */
+static void run_ddc_case(int notify, int *redone_out, int *second_out,
+			 int *active_out, int *committed_out,
+			 int *parent_entries_out, int *bmp5_out,
+			 int *new_in_use_out)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	uint64_t first_lsn;
+	struct ntfs_log_range range;
+	uint8_t got[VRS];
+	uint16_t dir_ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+	uint16_t p, nentries = 0;
+	int err;
+
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+	if (notify) {
+		/* The new record's $MFT:$DATA cluster: vcn 10, LCN 26. */
+		range.lcn = MFT_LCN + NEW_REC * VRS / VCS;
+		range.len = 1;
+		CHECK_EQ(ntfs_log_writer_delete_dirty_clusters(w, &range, 1), 0);
+	}
+	/* Crash: no clean close, no final checkpoint. */
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	*redone_out = res.records_redone;
+	*active_out = res.transactions_active;
+	*committed_out = res.transactions_committed;
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res), 0);
+	*redone_out = res.records_redone;
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	/* Second replay: the MFT ops are skipped (later MR_LSN), the
+	 * SetBits re-applies. */
+	err = ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res);
+	CHECK_EQ(err, 0);
+	*second_out = res.records_redone;
+	ntfs_logfile_close(log);
+
+	/* Parent $INDEX_ROOT entry count. */
+	CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+	CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+	p = dir_ir_off + AT_RESIDENT_SIZE + 16 + 16;
+	while ((unsigned)p + 16 <= VRS) {
+		uint16_t elen = lf_get16(got + p + 8);
+		uint16_t eflags = lf_get16(got + p + 12);
+
+		if (elen == 0)
+			break;
+		if (eflags & 2)	/* INDEX_ENTRY_END */
+			break;
+		nentries++;
+		p += elen;
+	}
+	*parent_entries_out = nentries;
+	*bmp5_out = v.disk[MFTBMP_LCN * VCS + 5];
+	CHECK_EQ(v_read_mft(&v, NEW_REC, got), 0);
+	if (memcmp(got, "FILE", 4) == 0) {
+		CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+		*new_in_use_out = !!(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	} else {
+		/* Never written to the model: the create's records
+		 * were skipped, so the record is all zeros. */
+		*new_in_use_out = 0;
+	}
+
+	free(v.disk);
+	free(buf);
+}
+
+/* Phase 4 step 2: the flush notification (docs/JOURNAL-DESIGN.md
+ * §4.3). The emitter appends one DeleteDirtyClusters record and
+ * retires the dirty-page entry, so the next checkpoint's dump
+ * omits it and oldest_lsn advances past the records it pinned;
+ * a replay from the older checkpoint then skips the retired
+ * records (their clusters are on the volume) instead of redoing
+ * them, and no phantom transaction appears at the record's tid.
+ *
+ * The create's 7 data records touch three pages: the new record's
+ * $MFT:$DATA cluster (LCN 26, vcn 10 — Initialize + 3
+ * CreateAttribute), the parent's $MFT:$DATA cluster (LCN 24, vcn
+ * 8 — AddIndexEntryRoot + $SI update) and the $MFT:$BITMAP
+ * cluster (LCN 41 — SetBits). Notifying only LCN 26 retires just
+ * the first page: the walk sees one DeleteDirtyClusters record
+ * with range {26, 1}, the next checkpoint's DirtyPageTableDump
+ * omits (0x18, vcn 10) but keeps (0x18, vcn 8) and (0x40, vcn
+ * 0), and oldest_lsn advances to the AddIndexEntryRoot record —
+ * the earliest surviving entry's oldest LSN. The replay cases
+ * prove the reader side: without the notification the create
+ * redoes 7 records and the file exists; with it, 3 redo, the
+ * parent entry and the bitmap bit are still applied, and the new
+ * record is not created in the model (its bytes are on the
+ * volume, not in the model — the emitter is the claim that they
+ * are). A notification for a range matching no entry appends
+ * nothing. */
+static void test_writer_delete_dirty_clusters(void)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct ntfs_logfile_info info;
+	struct ddc_seen s;
+	struct rec_seen rs;
+	uint64_t first_lsn, add_index_lsn = 0;
+	struct ntfs_log_range range;
+	int i, redone, second, active, committed, entries, bmp5, in_use;
+	int redone0, second0, active0, committed0, entries0, bmp50, in_use0;
+
+	printf("test_writer_delete_dirty_clusters\n");
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+	CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC, "t.txt", DIR_REC,
+			      (uint64_t)-1), 0);
+	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
+
+	/* A notification for a range matching no entry appends
+	 * nothing and returns 0. */
+	range.lcn = MFTBMP_LCN + 100;
+	range.len = 1;
+	CHECK_EQ(ntfs_log_writer_delete_dirty_clusters(w, &range, 1), 0);
+
+	/* Retire the new record's $MFT:$DATA cluster. */
+	range.lcn = MFT_LCN + NEW_REC * VRS / VCS;
+	range.len = 1;
+	CHECK_EQ(range.lcn, 26u);
+	CHECK_EQ(ntfs_log_writer_delete_dirty_clusters(w, &range, 1), 0);
+
+	/* The walk from the commit's first LSN sees exactly one
+	 * DeleteDirtyClusters record, with range {26, 1}, and finds
+	 * the AddIndexEntryRoot record's LSN (the earliest surviving
+	 * entry's oldest LSN). */
+	memset(&s, 0, sizeof(s));
+	memset(&rs, 0, sizeof(rs));
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_ddc, &s), 0);
+	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &rs), 0);
+	CHECK_EQ(s.ddc_n, 1);
+	CHECK_EQ(s.ddc_lcn, 26u);
+	CHECK_EQ(s.ddc_len, 1u);
+	for (i = 0; i < rs.n; i++) {
+		if (rs.redo_op[i] == LOP_AddIndexEntryRoot) {
+			add_index_lsn = rs.lsn[i];
+			break;
+		}
+	}
+	CHECK(add_index_lsn != 0);
+
+	/* The next checkpoint's DirtyPageTableDump omits the retired
+	 * entry but keeps the parent's page and the bitmap page, and
+	 * oldest_lsn advances to the AddIndexEntryRoot record. */
+	CHECK_EQ(ntfs_log_writer_checkpoint(w, NULL), 0);
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+	log = open_log(&m, &io);
+	ntfs_logfile_get_info(log, &info);
+	CHECK_EQ(info.oldest_lsn, add_index_lsn);
+	memset(&s, 0, sizeof(s));
+	CHECK_EQ(ntfs_logfile_walk(log, info.oldest_lsn, collect_ddc, &s), 0);
+	ntfs_logfile_close(log);
+	{
+		/* The test log is 4K clusters / 4K pages, so a
+		 * dirty-page entry covers one cluster (per_page = 1)
+		 * and is DP1_SIZE + 8 bytes. */
+		uint32_t esize = DP1_SIZE + 8;
+		uint32_t nslots = (s.dp_dump_len - RT_HEADER_SIZE) / esize;
+		bool seen_parent = false, seen_bitmap = false;
+		uint32_t k;
+
+		CHECK(s.dp_dump_len > RT_HEADER_SIZE);
+		for (k = 0; k < nslots; k++) {
+			const uint8_t *e = s.dp_dump + RT_HEADER_SIZE + k * esize;
+
+			if (lf_get32(e) != RT_ENTRY_ALLOCATED)
+				continue;
+			CHECK(!(lf_get32(e + DP1_TARGET_ATTR) == 0x18u &&
+				lf_get64(e + DP1_VCN) == 10));
+			if (lf_get32(e + DP1_TARGET_ATTR) == 0x18u &&
+			    lf_get64(e + DP1_VCN) == 8)
+				seen_parent = true;
+			if (lf_get32(e + DP1_TARGET_ATTR) == 0x40u &&
+			    lf_get64(e + DP1_VCN) == 0)
+				seen_bitmap = true;
+		}
+		CHECK(seen_parent);
+		CHECK(seen_bitmap);
+	}
+	free(buf);
+
+	/* The replay cases: control redoes 7, the notification 3. */
+	run_ddc_case(0, &redone0, &second0, &active0, &committed0,
+		     &entries0, &bmp50, &in_use0);
+	CHECK_EQ(redone0, 7);
+	CHECK_EQ(second0, 1);
+	CHECK_EQ(active0, 0);
+	CHECK_EQ(committed0, 0);
+	CHECK_EQ(entries0, 1);
+	CHECK_EQ(bmp50, 0x01);
+	CHECK(in_use0);
+	run_ddc_case(1, &redone, &second, &active, &committed,
+		     &entries, &bmp5, &in_use);
+	CHECK_EQ(redone, 3);
+	CHECK_EQ(second, 1);
+	CHECK_EQ(active, 0);
+	CHECK_EQ(committed, 0);
+	CHECK_EQ(entries, 1);
+	CHECK_EQ(bmp5, 0x01);
+	CHECK(!in_use);
+}
 
 /* UpdateFileNameRoot: a committed transaction that only rewrites the
  * duplicated $FILE_NAME fields (alloc/data sizes, flags) of an entry
@@ -4698,6 +4975,7 @@ int main(void)
 	test_writer_clean_close();
 	test_journal_create_commit();
 	test_writer_periodic_checkpoint();
+	test_writer_delete_dirty_clusters();
 	test_update_filename_root();
 	test_journal_create_mft_sizes();
 	test_journal_create_close_dumps_no_phantom();
