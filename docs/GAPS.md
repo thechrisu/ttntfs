@@ -1658,8 +1658,10 @@ c4ec674 — the old `lsof | grep -q` proceeded under a mounted volume,
 reproduced in the negative control), the same 27 gate (skips the list
 edit, rest still runs), and the same plist-shape validation —
 test-uninstall.sh 6/6 with negative control 1/5 on the old script.
-The ctest registration for the new uninstall tests follows as the
-final commit.
+The uninstall tests are registered in ctest (`uninstall_script`,
+next to `enable_module_script`), so they run in pre-push and under
+ASan. That is the whole of §4.4 that is doable without Apple; what
+remains is Apple-blocked (see below).
 
 ### 4.5 No CI signing — blocked (needs a paid Apple Developer account)
 The mount test cannot pass until the app is signed with the managed

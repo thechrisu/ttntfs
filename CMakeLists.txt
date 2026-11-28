@@ -289,6 +289,12 @@ if(NTFS_BUILD_TESTS)
   add_test(NAME enable_module_script
            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/fskit/scripts/tests/test-enable-module.sh)
 
+  # uninstall.sh: same two failure modes (pipefail guard, macOS 27 list edit).
+  # Registered the same way, so the tests run in `ci.sh --quick` and under
+  # ASan instead of only when someone remembers to run the file by hand.
+  add_test(NAME uninstall_script
+           COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/fskit/scripts/tests/test-uninstall.sh)
+
   # The $LogFile module keeps its own CMake project so it can be built alone.
   # Pull its tests in here as well: for a day they existed but were never run by
   # `ctest --test-dir build`, which is how a stale header that aborted ntfslog,
