@@ -1,0 +1,313 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * SD -> Unix mode mapping (docs/ACL-DESIGN.md §2).
+ *
+ * Pure functions: no I/O, no globals, so the parser is testable offline
+ * on synthetic SDs. Every offset/length is validated against the buffer
+ * before it is dereferenced; a crafted SD returns an error, never an
+ * out-of-bounds read.
+ */
+
+#include <linux/fs.h>
+#include <linux/string.h>
+
+#include "layout.h"
+#include "security.h"
+
+/* ---- SIDs --------------------------------------------------------------- */
+
+/* A SID is 8 bytes + 4 per sub-authority. Windows caps the count at 15. */
+#define NTFS_SID_MAX_SUB_AUTHORITIES 15
+
+static size_t ntfs_sid_len(const struct ntfs_sid *sid)
+{
+	return 8 + 4 * sid->sub_authority_count;
+}
+
+/*
+ * Validate the SID at @off (@len bytes remain in the buffer) and return
+ * its length, or 0 when it is malformed. The SID header itself must fit
+ * before sub_authority_count is read.
+ */
+static size_t ntfs_sid_valid(const u8 *buf, size_t off, size_t len)
+{
+	const struct ntfs_sid *sid;
+	size_t need;
+
+	if (off + 8 > len)
+		return 0;
+	sid = (const struct ntfs_sid *)(buf + off);
+	if (sid->revision != 1)
+		return 0;
+	if (sid->sub_authority_count > NTFS_SID_MAX_SUB_AUTHORITIES)
+		return 0;
+	need = ntfs_sid_len(sid);
+	if (off + need > len)
+		return 0;
+	return need;
+}
+
+static bool ntfs_sid_equal(const u8 *buf, size_t off, size_t len,
+			   const struct ntfs_sid *want, size_t want_len)
+{
+	size_t have_len;
+
+	if (!want)
+		return false;
+	have_len = ntfs_sid_valid(buf, off, len);
+	if (!have_len || have_len != want_len)
+		return false;
+	return !memcmp(buf + off, want, want_len);
+}
+
+/*
+ * Build a well-known SID into @out (a 16-byte scratch: revision +
+ * authority + up to 2 sub-authorities covers every SID used here) and
+ * return its length. Authority is the 48-bit big-endian value in the
+ * last bytes of identifier_authority.value[].
+ */
+static size_t ntfs_sid_known(u8 *out, u32 authority, u32 sub0, u32 sub1,
+			     int nsub)
+{
+	struct ntfs_sid *sid = (struct ntfs_sid *)out;
+
+	sid->revision = 1;
+	sid->sub_authority_count = nsub;
+	memset(sid->identifier_authority.value, 0, 6);
+	sid->identifier_authority.value[5] = authority & 0xff;
+	if (nsub > 0)
+		sid->sub_authority[0] = cpu_to_le32(sub0);
+	if (nsub > 1)
+		sid->sub_authority[1] = cpu_to_le32(sub1);
+	return 8 + 4 * nsub;
+}
+
+/* Classes an ACE's SID can belong to. One ACE can match several: an
+ * Everyone ACE grants the mounting user (owner class) and everyone
+ * else (other class) at once. */
+#define SD_CLS_OWNER		0x01	/* the SD's owner SID / Creator Owner */
+#define SD_CLS_GROUP		0x02	/* the SD's group SID / Creator Group */
+#define SD_CLS_EVERYONE	0x04	/* S-1-1-0 */
+#define SD_CLS_INTERACTIVE	0x08	/* Authenticated Users / Users / Interactive */
+
+static unsigned int ntfs_sid_classify(const u8 *buf, size_t off, size_t len,
+				      const struct ntfs_sid *owner,
+				      size_t owner_len,
+				      const struct ntfs_sid *group,
+				      size_t group_len)
+{
+	unsigned int cls = 0;
+	u8 known[16];
+	size_t known_len;
+
+	if (ntfs_sid_equal(buf, off, len, owner, owner_len))
+		cls |= SD_CLS_OWNER;
+	if (ntfs_sid_equal(buf, off, len, group, group_len))
+		cls |= SD_CLS_GROUP;
+
+	/* Creator Owner (S-1-3-0) applies to the creator: the owner. */
+	known_len = ntfs_sid_known(known, 3, 0, 0, 1);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_OWNER;
+	/* Creator Group (S-1-3-1) applies to the creator's group. */
+	known_len = ntfs_sid_known(known, 3, 1, 0, 1);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_GROUP;
+
+	/* Everyone (S-1-1-0) is also an interactive principal. */
+	known_len = ntfs_sid_known(known, 1, 0, 0, 1);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_EVERYONE | SD_CLS_INTERACTIVE;
+	/* Authenticated Users (S-1-5-11). */
+	known_len = ntfs_sid_known(known, 5, 11, 0, 1);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_INTERACTIVE;
+	/* Users (S-1-5-32-545). */
+	known_len = ntfs_sid_known(known, 5, 32, 545, 2);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_INTERACTIVE;
+	/* Interactive (S-1-5-4). */
+	known_len = ntfs_sid_known(known, 5, 4, 0, 1);
+	if (ntfs_sid_equal(buf, off, len, (struct ntfs_sid *)known, known_len))
+		cls |= SD_CLS_INTERACTIVE;
+	return cls;
+}
+
+/* ---- access masks -------------------------------------------------------- */
+
+/*
+ * Map a Windows access mask to rwx bits (0-7). Only data-access rights
+ * map: READ_CONTROL / WRITE_DAC / WRITE_OWNER / DELETE / SYNCHRONIZE
+ * and bare attribute rights do not grant data access, so they map to
+ * nothing. FILE_DELETE_CHILD grants write on directories (delete a
+ * child) and nothing on files, where it is meaningless.
+ */
+static unsigned int ntfs_mask_to_rwx(u32 mask, bool is_dir)
+{
+	unsigned int rwx = 0;
+
+	if (mask & le32_to_cpu(GENERIC_ALL))
+		return 7;
+	if (mask & (le32_to_cpu(GENERIC_READ) |
+		    le32_to_cpu(FILE_READ_DATA)))
+		rwx |= 4;
+	if (mask & (le32_to_cpu(GENERIC_WRITE) |
+		    le32_to_cpu(FILE_WRITE_DATA) |
+		    le32_to_cpu(FILE_APPEND_DATA) |
+		    le32_to_cpu(FILE_WRITE_EA) |
+		    le32_to_cpu(FILE_WRITE_ATTRIBUTES) |
+		    (is_dir ? le32_to_cpu(FILE_DELETE_CHILD) : 0)))
+		rwx |= 2;
+	if (mask & (le32_to_cpu(GENERIC_EXECUTE) |
+		    le32_to_cpu(FILE_EXECUTE)))
+		rwx |= 1;
+	return rwx;
+}
+
+/* ---- the DACL walk -------------------------------------------------------- */
+
+int ntfs_sd_dacl_mode(const void *sd, size_t len, bool is_dir,
+		      unsigned int *mode_out)
+{
+	const struct security_descriptor_relative *hdr;
+	const struct ntfs_sid *owner_sid = NULL, *group_sid = NULL;
+	size_t owner_len = 0, group_len = 0;
+	u16 control;
+	u32 dacl_off;
+	const struct ntfs_acl *dacl;
+	u16 acl_size, ace_count;
+	size_t pos, acl_end;
+	unsigned int owner_allow = 0, owner_deny = 0;
+	unsigned int group_allow = 0, group_deny = 0;
+	unsigned int other_allow = 0, other_deny = 0;
+	bool group_seen = false;
+	unsigned int owner, group, other;
+	u16 i;
+
+	if (!sd || !mode_out)
+		return -EINVAL;
+	if (len < sizeof(*hdr))
+		return -EINVAL;
+
+	hdr = (const struct security_descriptor_relative *)sd;
+	if (hdr->revision != 1)
+		return -EINVAL;
+	control = le16_to_cpu(hdr->control);
+	if (!(control & le16_to_cpu(SE_SELF_RELATIVE)))
+		return -EINVAL;
+
+	/* Owner / group SIDs: offset 0 means absent. */
+	if (hdr->owner) {
+		u32 off = le32_to_cpu(hdr->owner);
+
+		owner_len = ntfs_sid_valid((const u8 *)sd, off, len);
+		if (!owner_len)
+			return -EINVAL;
+		owner_sid = (const struct ntfs_sid *)((const u8 *)sd + off);
+	}
+	if (hdr->group) {
+		u32 off = le32_to_cpu(hdr->group);
+
+		group_len = ntfs_sid_valid((const u8 *)sd, off, len);
+		if (!group_len)
+			return -EINVAL;
+		group_sid = (const struct ntfs_sid *)((const u8 *)sd + off);
+	}
+
+	/* No DACL at all, or an explicitly NULL DACL: full access. */
+	if (!(control & le16_to_cpu(SE_DACL_PRESENT)) || !hdr->dacl) {
+		*mode_out = 0777;
+		return 0;
+	}
+	dacl_off = le32_to_cpu(hdr->dacl);
+	if (dacl_off + sizeof(*dacl) > len)
+		return -EINVAL;
+	dacl = (const struct ntfs_acl *)((const u8 *)sd + dacl_off);
+	if (dacl->revision != 2 && dacl->revision != 4)
+		return -EINVAL;
+	acl_size = le16_to_cpu(dacl->size);
+	if (acl_size < sizeof(*dacl) || dacl_off + acl_size > len)
+		return -EINVAL;
+	ace_count = le16_to_cpu(dacl->ace_count);
+	acl_end = dacl_off + acl_size;
+
+	/* An explicitly empty DACL denies everybody. v1 does not report
+	 * 0000 for it (docs/ACL-DESIGN.md §2.1): -ENODATA tells the caller
+	 * to fall back to today's behaviour instead. */
+	if (ace_count == 0)
+		return -ENODATA;
+
+	pos = dacl_off + sizeof(*dacl);
+	for (i = 0; i < ace_count; i++) {
+		const struct ntfs_ace *ace;
+		u16 ace_size;
+		u32 mask;
+		unsigned int cls, rwx;
+		size_t sid_off, sid_len;
+
+		if (pos + 4 > acl_end)
+			return -EINVAL;
+		ace = (const struct ntfs_ace *)((const u8 *)sd + pos);
+		ace_size = le16_to_cpu(ace->size);
+		/* Header (4) + mask (4) + at least an empty SID. */
+		if (ace_size < 8 || pos + ace_size > acl_end)
+			return -EINVAL;
+		/* ACEs are 4-byte aligned; a size that is not a multiple
+		 * of 4 cannot be a well-formed ACE stream. */
+		if (ace_size & 3)
+			return -EINVAL;
+
+		if (ace->flags & INHERIT_ONLY_ACE)
+			goto next;
+		if (ace->type != ACCESS_ALLOWED_ACE_TYPE &&
+		    ace->type != ACCESS_DENIED_ACE_TYPE)
+			goto next; /* audit/alarm/object ACEs: not modelled */
+
+		sid_off = pos + 8;
+		sid_len = ntfs_sid_valid((const u8 *)sd, sid_off,
+					 pos + ace_size);
+		if (!sid_len)
+			return -EINVAL;
+
+		mask = le32_to_cpu(ace->mask);
+		rwx = ntfs_mask_to_rwx(mask, is_dir);
+		if (!rwx)
+			goto next;
+		cls = ntfs_sid_classify((const u8 *)sd, sid_off,
+					pos + ace_size, owner_sid, owner_len,
+					group_sid, group_len);
+		if (ace->type == ACCESS_ALLOWED_ACE_TYPE) {
+			if (cls & (SD_CLS_OWNER | SD_CLS_INTERACTIVE))
+				owner_allow |= rwx;
+			if (cls & SD_CLS_GROUP) {
+				group_allow |= rwx;
+				group_seen = true;
+			}
+			if (cls & SD_CLS_EVERYONE)
+				other_allow |= rwx;
+		} else {
+			if (cls & (SD_CLS_OWNER | SD_CLS_INTERACTIVE))
+				owner_deny |= rwx;
+			if (cls & SD_CLS_GROUP) {
+				group_deny |= rwx;
+				group_seen = true;
+			}
+			if (cls & SD_CLS_EVERYONE)
+				other_deny |= rwx;
+		}
+next:
+		pos += ace_size;
+	}
+
+	/* Windows evaluates denies against allows regardless of order:
+	 * allowed minus denied, per class. */
+	owner = owner_allow & ~owner_deny;
+	other = other_allow & ~other_deny;
+	if (group_seen)
+		group = group_allow & ~group_deny;
+	else
+		group = other; /* nothing said about the group: as other */
+
+	*mode_out = (owner << 6) | (group << 3) | other;
+	return 0;
+}

@@ -170,6 +170,18 @@ if(NTFS_BUILD_TESTS)
   set_tests_properties(mount PROPERTIES
     ENVIRONMENT "NTFS_IMAGES=${CMAKE_CURRENT_SOURCE_DIR}/tools/images;NTFS_PATCH_ATTRDEF_SIZE=${CMAKE_CURRENT_SOURCE_DIR}/tools/mkfixtures/patch_attrdef_size.py")
 
+  # SD -> Unix mode mapping (docs/ACL-DESIGN.md §2). The parser is pure,
+  # so this runs on synthetic SDs only: typical Windows DACLs, NULL and
+  # empty DACLs, deny/inherit-only/object ACEs, generic-right mapping,
+  # and a malformed case for every boundary the parser validates.
+  add_executable(test_sd core/tests/test_sd.c)
+  target_link_libraries(test_sd ntfscore ntfsplatform)
+  target_include_directories(test_sd PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/ntfs
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+  add_test(NAME sd COMMAND test_sd)
+
   # Volume geometry: 4Kn sectors, cluster sizes on either side of the sector
   # size, and a 16 TiB sparse volume whose metadata sits past the 32-bit byte
   # mark. Builds its own images with mkntfs and checks them with ntfsck -n.
