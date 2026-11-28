@@ -435,10 +435,11 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 		w->checkpoint_lsn = lf_get64(cr + CR_CLIENT_RESTART_LSN);
 		w->checkpointed = w->checkpoint_lsn != 0;
 		w->first_lsn = lf_get64(cr + CR_OLDEST_LSN);
-		/* Phase 4 step 1: the checkpoint policy lives here, not in
-		 * the commit path — 1 keeps the Phase 2 behaviour (a
-		 * checkpoint per commit) until the default flips. */
-		w->checkpoint_every = 1;
+		/* Phase 4 step 3: the default is the periodic policy
+		 * (NTFS_LOG_CHECKPOINT_EVERY_DEFAULT, 128) — the first
+		 * commit always checkpoints, and a commit checkpoints
+		 * again once the counter reaches the policy. */
+		w->checkpoint_every = NTFS_LOG_CHECKPOINT_EVERY_DEFAULT;
 		w->commits_since_checkpoint = 0;
 	}
 	w->seq = log->seq_num;

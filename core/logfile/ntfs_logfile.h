@@ -326,9 +326,15 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 			      const uint16_t *name, uint16_t name_len,
 			      uint32_t *attr_id_out);
 int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out);
+/* Phase 4 step 3: the default checkpoint policy — 128 commits between
+ * checkpoints (docs/JOURNAL-DESIGN.md §4.3). The first commit always
+ * checkpoints regardless, so a log never has no checkpoint to walk
+ * from. Measured (test_checkpoint_policy_amplification): 6 creates
+ * write 806,912 bytes at every=1 vs 585,728 at every=128 (27% less),
+ * replay redoes all 42 data records at both. */
+#define NTFS_LOG_CHECKPOINT_EVERY_DEFAULT 128
 /* Phase 4 step 1: how often a commit carries a checkpoint. n == 0 clamps
- * to 1 (every commit, the Phase 2 behaviour); the design (§4.3) starts
- * the periodic policy at 128 once the driver flips it. The first commit
+ * to 1 (every commit, the Phase 2 behaviour). The first commit
  * always checkpoints regardless of this setting. */
 int ntfs_log_writer_set_checkpoint_every(ntfs_log_writer_t *w, uint32_t n);
 /* A flushed cluster range for ntfs_log_writer_delete_dirty_clusters(). */

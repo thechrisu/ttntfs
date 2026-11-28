@@ -1345,8 +1345,54 @@ only the transaction-table entry; the stale entries carry
 `oldest_lsn == 0` and do not pin `first_lsn`, but are dumped at
 every checkpoint until a flush notifies them away) — belongs with
 the checkpoint-time reaper follow-up, not this commit.
-Next: Phase 4 step 3 (flip the default to 128 + driver walk-count
-updates + write-amplification and latency measurement).
+Phase 4, step 3 — flip the checkpoint default to 128, landed
+2026-11-28 (round 32, two commits): prep (commit `ccd16847`) adds
+the driver `ntfs_journal_set_checkpoint_every()`, pins the two
+flush-notification tests to every=1, adds the `TTNTFS_DUMP_WALK`
+env-gated walk dump, a logfile `memio.bytes` counter, and the
+measurement test `test_checkpoint_policy_amplification` (6 creates
+at every=1 vs 128); the flip defines
+`NTFS_LOG_CHECKPOINT_EVERY_DEFAULT` = 128 in
+`core/logfile/ntfs_logfile.h` and sets `w->checkpoint_every` from
+it in `core/logfile/logfile_write.c` (was `1`). The first commit
+still checkpoints. Measured, in-memory model (byte counts
+deterministic across runs, wall time varies): every=1 writes
+806,912 bytes in 0.12–0.20 ms for 6 creates; every=128 writes
+585,728 bytes in 0.09–0.14 ms — a saving of 221,184 bytes (27%).
+A checkpoint is ~48 KiB (five records plus the restart pages),
+~35% of a create's ~134 KiB, but the per-record page flush
+dominates both runs (with the v1.x tail copy, `lw_flush_page`
+writes the page twice when it already holds a record), so the
+saving is a quarter, not a multiple. Replay redoes all 42 data
+records at both settings. Evidence: journal suite 2534 checks, 0
+failures (was 2074 — the driver walk-count rewrite touches 21
+tests: at 128 only the first transaction checkpoints, so later
+transactions lose their dumps and the create's 19 records stay in
+every walk whose operation follows it, because retirement is not a
+checkpoint — a sync retires dirty pages but does not move
+`oldest_lsn`, only a checkpoint does; `test_create_journaled` is
+unchanged at 19, the mkdir of "sub" being unjournaled; one count
+went down, EA-remove-last 18 → 16, because at every=1 the
+remove's checkpoint pinned `oldest_lsn` at the set's `$SI` record
+and dropped the set's Open); logfile suite 13576 checks, 0
+failures (was 13531 — `test_update_filename_root` 7 → 4 and
+`test_journal_unlink_commit` 11 → 8, the non-first transactions
+losing their dumps; 6 fewer checks, the removed dump assertions);
+crash suite 8507 checks, 0 failures (was 10560 — fewer checks
+because the sweeps cut at record boundaries and the flip removes
+the dump records from every non-first transaction, so fewer cut
+points; 28 sweeps, no skips, 0 still bad after replay in every
+sweep). `test_crash.c` needed no update — the sweeps are
+landmark-driven, not walk-count-driven. Design in
+docs/JOURNAL-DESIGN.md §4.3 (Step 3 paragraph). The carried
+follow-ups are unchanged by this step (checkpoint-time reaper for
+aborted transactions' leaked dirty-page entries and dead-attribute
+entries, compressed-data flush hook, mkdir `$SI` flags, truncate
+sparse flags, xattr `$SI` snapshot, EA flags path, reader wart,
+live-driver `$FILE_NAME` times).
+Next: Phase 5 (Windows round trip, blocked — needs a Windows
+machine); §2.2 ACL merge when the journal line is quiet; §4.4;
+§5.2 follow-ups; §5.3 pin move.
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

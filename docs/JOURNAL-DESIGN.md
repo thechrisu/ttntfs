@@ -482,6 +482,50 @@ second replay is a no-op. Journal suite 2074 checks, 0 failures
 suite 10560 checks, 0 failures (was 9869 — the notify's extra log
 writes lengthen every sweep's sync tail).
 
+Step 3 (round 32): the flip. The default is now 128 —
+`NTFS_LOG_CHECKPOINT_EVERY_DEFAULT` in `core/logfile/ntfs_logfile.h`
+(the macro did not exist before; step 1's mechanism took the value
+from the call site), and `core/logfile/logfile_write.c` sets
+`w->checkpoint_every` from it (was `1`). The first commit still
+checkpoints, so the first transaction's dumps are always there and
+`oldest_lsn` starts at its first open. Measured by
+`test_checkpoint_policy_amplification` (6 creates, in-memory model;
+byte counts deterministic, wall time varies): every=1 writes
+806,912 bytes in 0.12–0.20 ms; every=128 writes 585,728 bytes in
+0.09–0.14 ms — a saving of 221,184 bytes (27%). A checkpoint is
+~48 KiB (five records plus the restart pages), ~35% of a create's
+~134 KiB, but the per-record page flush dominates both runs (with
+the v1.x tail copy, `lw_flush_page` writes the page twice when it
+already holds a record), so the saving is a quarter, not a
+multiple. Replay redoes all 42 data records at both settings —
+the flip costs nothing in recovery work for these six creates.
+
+What the flip does to the walks. At 128 only the first
+transaction checkpoints; later transactions lose their three
+dumps, and the first transaction's opens stay in the walk because
+no later checkpoint recomputes `first_lsn`. Retirement is not a
+checkpoint: a sync retires dirty pages (step 2) but does not move
+`oldest_lsn` — only a checkpoint does — so a create's 19 records
+stay in every walk whose operation follows it, and the driver
+walk-count expectations in `test_journal.c` were rewritten
+accordingly (21 tests; journal suite 2534 checks, 0 failures, was
+2074). Tests whose only journaled transaction is the create are
+unchanged: the mkdir of "sub" in the root is unjournaled (the
+root's `$INDEX_ROOT` entry lands in the `$INDEX_ALLOCATION` block,
+which Phase 2 cannot describe), so `test_create_journaled` still
+holds 19 records. One count went down, not up: EA-remove-last
+18 → 16 — at every=1 the remove's checkpoint pinned `oldest_lsn`
+at the set's `$SI` record and dropped the set's Open record; at
+128 there is no later checkpoint, so the set's Open stays.
+`test_crash.c` needed no update: the sweeps are landmark-driven
+(per-cut replay success, zero ACTIVE, ntfsck clean, second replay
+no-op), not walk-count-driven — still run after the flip to
+confirm no sweep breaks (crash suite 8507 checks, 0 failures, was
+10560: fewer checks because the sweeps cut at record boundaries
+and the flip removes the three dump records from every non-first
+transaction, so there are fewer cut points — 28 sweeps, no
+skips, 0 still bad after replay in every sweep).
+
 ### 4.4 What the writer does not do
 
 - No data journaling (NTFS never journals file data).

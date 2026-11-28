@@ -3993,7 +3993,9 @@ static void test_update_filename_root(void)
 	CHECK_EQ(ntfs_log_txn_commit(t, &first_lsn, NULL), 0);
 
 	/* The update: one open ($MFT:$DATA) + the filename record +
-	 * Commit + 3 dumps + Forget = 7 records. */
+	 * Commit + Forget = 4 records. At the 128 default the
+	 * update's commit does not checkpoint (only the create's
+	 * first commit does), so there are no dumps. */
 	CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
 	CHECK_EQ(ntfs_log_txn_update_filename_root(t, 0x18, pvcn, 0,
 						  ppage_lcn, dir_ir_off, 56,
@@ -4005,17 +4007,14 @@ static void test_update_filename_root(void)
 	log = open_log(&m, &io);
 	memset(&s, 0, sizeof(s));
 	CHECK_EQ(ntfs_logfile_walk(log, first_lsn2, collect_rec, &s), 0);
-	CHECK_EQ(s.n, 7);
-	if (s.n == 7) {
+	CHECK_EQ(s.n, 4);
+	if (s.n == 4) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[0], 0x18u);
 		CHECK_EQ(s.redo_op[1], LOP_UpdateFileNameRoot);
 		CHECK_EQ(s.target_attr[1], 0x18u);
 		CHECK_EQ(s.redo_op[2], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[3], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[4], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[5], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[6], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[3], LOP_ForgetTransaction);
 	}
 	ntfs_logfile_close(log);
 
@@ -4847,13 +4846,14 @@ static void test_journal_unlink_commit(void)
 	/* Walk from the unlink's first record: the create's checkpoint
 	 * advanced the oldest LSN past the create's records, so a walk
 	 * from the create's first LSN is refused -EINVAL. The unlink
-	 * carries 11 records: 2 open + 4 data + Commit + 3 dumps +
-	 * Forget. */
+	 * carries 8 records: 2 open + 4 data + Commit + Forget. At
+	 * the 128 default its commit does not checkpoint (only the
+	 * create's first commit does), so there are no dumps. */
 	log = open_log(&m, &io);
 	memset(&s, 0, sizeof(s));
 	CHECK_EQ(ntfs_logfile_walk(log, first_lsn, collect_rec, &s), 0);
-	CHECK_EQ(s.n, 11);
-	if (s.n == 11) {
+	CHECK_EQ(s.n, 8);
+	if (s.n == 8) {
 		CHECK_EQ(s.redo_op[0], LOP_OpenNonresidentAttribute);
 		CHECK_EQ(s.target_attr[0], 0x18u);
 		CHECK_EQ(s.redo_op[1], LOP_OpenNonresidentAttribute);
@@ -4863,10 +4863,7 @@ static void test_journal_unlink_commit(void)
 		CHECK_EQ(s.redo_op[4], LOP_DeallocateFileRecordSegment);
 		CHECK_EQ(s.redo_op[5], LOP_ClearBitsInNonresidentBitMap);
 		CHECK_EQ(s.redo_op[6], LOP_CommitTransaction);
-		CHECK_EQ(s.redo_op[7], LOP_TransactionTableDump);
-		CHECK_EQ(s.redo_op[8], LOP_DirtyPageTableDump);
-		CHECK_EQ(s.redo_op[9], LOP_OpenAttributeTableDump);
-		CHECK_EQ(s.redo_op[10], LOP_ForgetTransaction);
+		CHECK_EQ(s.redo_op[7], LOP_ForgetTransaction);
 		for (i = 0; i < s.n; i++) {
 			if (s.redo_op[i] == LOP_DeleteIndexEntryRoot)
 				lsn_del_idx = s.lsn[i];
