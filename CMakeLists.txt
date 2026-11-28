@@ -332,6 +332,17 @@ if(NTFS_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
 
+  # Read-only-mount variant (GAPS.md §5.2, stream E): the same source
+  # built with NTFS_FUZZ_READONLY -- the bdev opens read-only and the
+  # mount carries NTFS_MOUNT_RDONLY with no replay, so the driver's
+  # own geometry parse is reached without replay running first.
+  add_executable(ntfs_fuzz_standalone_ro core/fuzz/fuzz_mount.c)
+  target_compile_definitions(ntfs_fuzz_standalone_ro PRIVATE NTFS_FUZZ_STANDALONE NTFS_FUZZ_READONLY)
+  target_link_libraries(ntfs_fuzz_standalone_ro ntfscore ntfsplatform)
+  target_include_directories(ntfs_fuzz_standalone_ro PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+
   # Dirty-$LogFile seed generator (GAPS.md §5.2): mounts a fresh image
   # with this driver, journals five creates, snapshots while mounted.
   # It builds in the plain build dir (not the fuzz build): the seed it
@@ -354,6 +365,15 @@ if(NTFS_BUILD_TESTS)
       -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
     target_link_libraries(ntfs_fuzz ntfscore ntfsplatform)
     target_include_directories(ntfs_fuzz PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
+    # Read-only-mount libFuzzer variant (GAPS.md §5.2, stream E).
+    add_executable(ntfs_fuzz_ro core/fuzz/fuzz_mount.c)
+    target_compile_definitions(ntfs_fuzz_ro PRIVATE NTFS_FUZZ_READONLY)
+    target_link_options(ntfs_fuzz_ro PRIVATE
+      -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
+    target_link_libraries(ntfs_fuzz_ro ntfscore ntfsplatform)
+    target_include_directories(ntfs_fuzz_ro PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/core/include
       ${CMAKE_CURRENT_SOURCE_DIR}/platform/include)
   endif()

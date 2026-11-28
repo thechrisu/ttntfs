@@ -1701,7 +1701,13 @@ $LogFile replay, bounded walk), `tools/fuzz/mkseeds.c` (3 deterministic
 `tools/fuzz/mkdirtyseed.c` (stream E: a 4th seed, `seed-dirty-log.img`,
 built by this driver -- five journaled creates, snapshot while still
 mounted, so the $LogFile holds one checkpointed transaction and four
-uncheckpointed ones), `tools/fuzz.sh`
+uncheckpointed ones), plus a read-only-mount variant (stream E:
+`ntfs_fuzz_ro` / `ntfs_fuzz_standalone_ro` mount with
+NTFS_MOUNT_RDONLY and no replay, so the driver's own geometry parse
+is reached without replay running first; `tools/fuzz.sh check` runs
+it over the seeds and the regression images with per-image
+expectations, and the weekly workflow runs a second mutation step
+with it), `tools/fuzz.sh`
 (seeds / check / regression / build / run), CI workflow
 `.github/workflows/fuzz.yml` (weekly Sunday 03:00 UTC + dispatch,
 ubuntu-latest, own concurrency group `fuzz-${{ github.ref }}` so it can
@@ -1749,12 +1755,15 @@ per journaled create, while the restart page from the last checkpoint
 (after the first create) records current_lsn 0x40a33 -- and the
 newest record ends at LSN 0x40c53, so four transactions lie beyond
 the checkpoint and replay must redo them. The clean seed's $LogFile
-holds 0 RCRD records (control).
+holds 0 RCRD records (control). Read-only variant (stream E):
+`tools/fuzz.sh check` -- all 4 seeds mount read-only, and the
+regression per-image expectations hold (leak-logfile-runs mounts
+read-only, the other two fail); `tools/fuzz.sh regression` clean for
+both binaries (2 binaries x 3 images); a 120 s read-only mutation
+run: 591 exec, 4 exec/s, 67 new units, 0 crashes / timeouts / OOMs.
 
-Follow-ups (not done): a read-only-mount fuzz variant (the target
-mounts RW with replay, so `ntfs_fill_super()`'s own geometry parse
-is only reached after replay accepts the image). The dirty-$LogFile
-seed landed with stream E (see above).
+Follow-ups (not done): longer runs (see below). The read-only-mount
+variant landed with stream E (see above).
 
 ### 5.3 Upstream tracking has no automation — done 2026-11-25
 Tier 0/1 files must stay diffable against upstream Linux `fs/ntfs`

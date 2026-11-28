@@ -40,6 +40,14 @@
  *                  the regression images also run through the libFuzzer
  *                  binary in CI; see tools/fuzz.sh regression.)
  *
+ * Read-only variant (stream E, GAPS.md §5.2): -DNTFS_FUZZ_READONLY
+ * builds the same source as a second target (ntfs_fuzz_ro /
+ * ntfs_fuzz_standalone_ro) that opens the image read-only and mounts
+ * with NTFS_MOUNT_RDONLY and no replay. That reaches the driver's own
+ * geometry parse (ntfs_fill_super / parse_ntfs_boot_sector) without
+ * $LogFile replay running first -- the path the boot-cpr regression
+ * came through, and one the RW target never exercises.
+ *
  * The driver's log goes to a no-op sink here: a corrupted image can log
  * on nearly every operation, and under libFuzzer that would drown the
  * output. (NTFS_LOG_LEVEL would do the same, but a sink is deterministic
@@ -249,12 +257,22 @@ static int fuzz_one(const uint8_t *data, size_t size)
 	}
 
 	int mounted = 0;
+#ifdef NTFS_FUZZ_READONLY
+	/* Read-only variant: no replay, so the driver's own geometry
+	 * parse is reached without $LogFile replay running first. */
+	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, true);
+#else
 	struct ntfs_bdev *dev = ntfs_bdev_open_path(path, false);
+#endif
 	if (!dev)
 		goto out_unlink;
 	{
 		struct ntfs_mount_options o = {
+#ifdef NTFS_FUZZ_READONLY
+			.flags = NTFS_MOUNT_RDONLY,
+#else
 			.flags = NTFS_MOUNT_REPLAY_JOURNAL,
+#endif
 			.uid = 0, .gid = 0, .fmask = 022, .dmask = 022,
 		};
 		ntfs_volume_t *vol = NULL;

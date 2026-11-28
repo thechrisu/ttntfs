@@ -10,15 +10,29 @@
 #                                (tools/fuzz/regression/): the leak checks
 #                                the standalone cannot see; what the CI fuzz
 #                                job runs before the mutation run
-#   tools/fuzz.sh build          build the libFuzzer binary (Clang only)
+#   tools/fuzz.sh build          build the libFuzzer binaries (Clang only)
 #   tools/fuzz.sh run [SECONDS]  mutate the corpus with libFuzzer
 #                                (default 300s; 0 = until killed)
+#   tools/fuzz.sh run-ro [SECONDS]  same, with the read-only-mount
+#                                variant (ntfs_fuzz_ro; see below)
 #
 # The target is core/fuzz/fuzz_mount.c: mount a byte buffer as an NTFS
 # image (read-write, with $LogFile replay, on a throwaway copy), walk it,
 # read files/symlinks/xattrs. ASan+UBSan catch what the parser gets
 # wrong; libFuzzer's coverage guidance is what reaches the deep branches
 # a blind mutator never would.
+#
+# Read-only variant (stream E, GAPS.md §5.2): the same source built
+# with -DNTFS_FUZZ_READONLY (ntfs_fuzz_ro / ntfs_fuzz_standalone_ro)
+# opens the image read-only and mounts with NTFS_MOUNT_RDONLY and no
+# replay. That reaches the driver's own geometry parse without $LogFile
+# replay running first -- the path the boot-cpr regression came
+# through, and one the RW target never exercises. `check` runs the RO
+# standalone over the seeds too (they must mount), and over the
+# regression images with per-image expectations: leak-logfile-runs
+# MOUNTS read-only (the half-decoded run list is only parsed during
+# replay, which RO skips), while leak-volume-label and ubsan-boot-cpr
+# still fail. `regression` runs both libFuzzer binaries.
 #
 # Corpus: tools/fuzz/corpus/, generated, not committed (.gitignore).
 # Three clean seeds from tools/fuzz/mkseeds.c (4 MiB images, dense on
@@ -132,27 +146,57 @@ cmd_check() {
 		cmake -S "$NTFS_ROOT" -B "$NTFS_ROOT/build" >/dev/null || return 1
 		cmake --build "$NTFS_ROOT/build" --target ntfs_fuzz_standalone -j"$(nproc 2>/dev/null || echo 4)" || return 1
 	fi
+	if [ ! -x "$NTFS_ROOT/build/ntfs_fuzz_standalone_ro" ]; then
+		echo "==> building read-only standalone fuzz runner"
+		cmake -S "$NTFS_ROOT" -B "$NTFS_ROOT/build" >/dev/null || return 1
+		cmake --build "$NTFS_ROOT/build" --target ntfs_fuzz_standalone_ro -j"$(nproc 2>/dev/null || echo 4)" || return 1
+	fi
 	echo "==> corpus check: $(ls "$CORPUS"/*.img | wc -l) seeds"
 	# shellcheck disable=SC2086
 	TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone" "$CORPUS"/*.img || return 1
+	echo "==> corpus check (read-only): $(ls "$CORPUS"/*.img | wc -l) seeds"
+	# shellcheck disable=SC2086
+	TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone_ro" "$CORPUS"/*.img || return 1
 	echo "==> regression check: $(ls "$REGRESSION"/*.img | wc -l) images (must fail to mount)"
 	# shellcheck disable=SC2086
-	TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone" --expect-fail "$REGRESSION"/*.img
+	TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone" --expect-fail "$REGRESSION"/*.img || return 1
+	# Read-only regression expectations differ per image: the
+	# logfile-runs run list is only parsed during replay, which the
+	# read-only mount skips, so that image mounts read-only; the
+	# other two still fail. Check each one individually.
+	echo "==> regression check (read-only): per-image expectations"
+	local img rc=0
+	for img in "$REGRESSION"/*.img; do
+		case "$(basename "$img")" in
+			leak-logfile-runs.img)
+				TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone_ro" "$img" >/dev/null 2>&1 || {
+					echo "read-only regression: $img must mount, but it did not" >&2; rc=1; }
+				;;
+			*)
+				TMPDIR="${TMPDIR:-/tmp}" "$NTFS_ROOT/build/ntfs_fuzz_standalone_ro" "$img" >/dev/null 2>&1 && {
+					echo "read-only regression: $img must fail to mount, but it mounted" >&2; rc=1; }
+				;;
+		esac
+	done
+	return $rc
 }
 
 # ASan+LSan regression check: one run of each regression image through
-# the libFuzzer binary. Exits 77 with a LeakSanitizer report if a fixed
-# leak comes back. Needs Clang (cmd_build builds the binary if absent).
+# both libFuzzer binaries (RW and read-only). Exits 77 with a
+# LeakSanitizer report if a fixed leak comes back. Needs Clang
+# (cmd_build builds the binaries if absent).
 cmd_regression() {
 	ensure_seeds || return 1
 	ensure_regression || return 1
-	if [ ! -x "$FUZZ_BUILD/ntfs_fuzz" ]; then
+	if [ ! -x "$FUZZ_BUILD/ntfs_fuzz" ] || [ ! -x "$FUZZ_BUILD/ntfs_fuzz_ro" ]; then
 		cmd_build || return 1
 	fi
-	local img rc=0
-	for img in "$REGRESSION"/*.img; do
-		echo "==> regression: $img"
-		TMPDIR="${TMPDIR:-/tmp}" "$FUZZ_BUILD/ntfs_fuzz" "$img" -runs=1 || rc=1
+	local img rc=0 bin
+	for bin in "$FUZZ_BUILD/ntfs_fuzz" "$FUZZ_BUILD/ntfs_fuzz_ro"; do
+		for img in "$REGRESSION"/*.img; do
+			echo "==> regression: $(basename "$bin") $img"
+			TMPDIR="${TMPDIR:-/tmp}" "$bin" "$img" -runs=1 || rc=1
+		done
 	done
 	return $rc
 }
@@ -162,28 +206,28 @@ cmd_build() {
 	ensure_cmake || return 1
 	echo "==> configuring fuzz build (CC=clang, -DNTFS_FUZZ=ON)"
 	CC=clang cmake -S "$NTFS_ROOT" -B "$FUZZ_BUILD" -DNTFS_FUZZ=ON || return 1
-	echo "==> building ntfs_fuzz"
-	cmake --build "$FUZZ_BUILD" --target ntfs_fuzz -j"$(nproc 2>/dev/null || echo 4)" || return 1
+	echo "==> building ntfs_fuzz ntfs_fuzz_ro"
+	cmake --build "$FUZZ_BUILD" --target ntfs_fuzz ntfs_fuzz_ro -j"$(nproc 2>/dev/null || echo 4)" || return 1
 }
 
 cmd_run() {
-	local seconds="${1:-300}"
+	local seconds="${1:-300}" bin="${2:-$FUZZ_BUILD/ntfs_fuzz}" prefix="${3:-$CRASHES/}"
 	ensure_seeds || return 1
-	if [ ! -x "$FUZZ_BUILD/ntfs_fuzz" ]; then
+	if [ ! -x "$bin" ]; then
 		cmd_build || return 1
 	fi
 	mkdir -p "$CRASHES"
-	echo "==> libFuzzer for ${seconds}s (0 = until killed), corpus $CORPUS"
+	echo "==> libFuzzer ($(basename "$bin")) for ${seconds}s (0 = until killed), corpus $CORPUS"
 	echo "    crashes -> $CRASHES (non-empty after a run means findings)"
-	TMPDIR="${TMPDIR:-/tmp}" "$FUZZ_BUILD/ntfs_fuzz" "$CORPUS" \
+	TMPDIR="${TMPDIR:-/tmp}" "$bin" "$CORPUS" \
 		-max_len="$MAX_LEN" -timeout=10 -max_total_time="$seconds" \
-		-artifact_prefix="$CRASHES/" -print_final_stats=1
+		-artifact_prefix="$prefix" -print_final_stats=1
 	local rc=$?
 	if [ "$rc" -ne 0 ]; then
 		echo "fuzz run exited $rc -- see $CRASHES for artifacts" >&2
 		return $rc
 	fi
-	if ls "$CRASHES"/crash-* "$CRASHES"/timeout-* "$CRASHES"/oom-* >/dev/null 2>&1; then
+	if ls "$CRASHES"/crash-* "$CRASHES"/ro-crash-* "$CRASHES"/timeout-* "$CRASHES"/ro-timeout-* "$CRASHES"/oom-* "$CRASHES"/ro-oom-* >/dev/null 2>&1; then
 		echo "findings in $CRASHES -- triage before the next run" >&2
 		return 1
 	fi
@@ -197,5 +241,6 @@ case "${1:-}" in
 	regression) cmd_regression ;;
 	build) cmd_build ;;
 	run)   cmd_run "${2:-300}" ;;
+	run-ro) cmd_run "${2:-300}" "$FUZZ_BUILD/ntfs_fuzz_ro" "$CRASHES/ro-" ;;
 	*)     usage ;;
 esac

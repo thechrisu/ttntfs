@@ -96,9 +96,15 @@ jobs:
       - name: Fuzz regression (ASan+LSan leak checks)
         run: tools/fuzz.sh regression
 
-      # Then the mutation run. Fails on any crash, timeout, OOM, or leak.
+      # Then the mutation runs, RW and read-only (stream E). The RO
+      # variant reaches the driver's own geometry parse without
+      # $LogFile replay running first. Both fail on any crash,
+      # timeout, OOM, or leak.
       - name: Fuzz the parser
         run: tools/fuzz.sh run ${{ inputs.seconds || '300' }}
+
+      - name: Fuzz the parser (read-only mount)
+        run: tools/fuzz.sh run-ro ${{ inputs.seconds || '300' }}
 
       - name: Crash artifacts
         if: failure()
