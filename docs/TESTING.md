@@ -50,10 +50,12 @@ tools/ci.sh --list       # what it will run
 * **`crash`** (217) — the write ordering, asserted by mapping a sync's device
   writes back to `$MFT`/`$Bitmap`, then 55 interrupted operations checked with
   `ntfsck`.
-* **`faults`** (370) — injected read, write and flush failures at fourteen
+* **`faults`** (424) — injected read, write and flush failures at fourteen
   points, plus a volume filled to `ENOSPC`. A write into a hole whose data
   the device refuses must leave the hole a hole on the disk and in the
-  page cache, without losing an earlier write in the same page (finding 29).
+  page cache, without losing an earlier write in the same page (finding 29),
+  and an allocation whose mapping pairs cannot be written must not stay in the
+  run list (U20).
 * **`geometry`** (1271) — 4Kn sectors, cluster sizes either side of the sector
   size, a 16 TiB sparse volume, and writes into holes, which must read back
   zeroes around them after a remount on every cluster size, and give their

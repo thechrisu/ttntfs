@@ -904,8 +904,8 @@ same mount and after a remount, the file keeps two zeroed clusters, and
 `ntfsck -n` is clean. No test in the tree reaches them.
 
 A range never takes in what a call that fails may have left behind. That is
-the call's to clean up, and freeing it here could free clusters another file
-has taken since. The first open item below is where the call falls short.
+the call's to clean up, which it does since U20, and freeing it here could free
+clusters another file has taken since.
 
 Two tests. Each fails without the fix and passes with it, on main's allocator
 and with the allocator branch's `lcnalloc.c` and `runlist.c` (U13-U17):
@@ -946,21 +946,13 @@ allocator fills the stream's one hole entirely or, with `-ENOSPC`, refuses it
 before anything is mapped. Another file allocating between the calls could
 leave it part filled.
 
+`ntfs_attr_map_cluster()` itself, when its mapping-pairs update failed, freed the
+clusters (before U14, only the first of two runs) and left them in the run list,
+where `release_holes()` could write them into the attribute. Found by reading while fixing this path; it is U20, fixed by
+backporting mainline's rollback.
+
 Still open:
 
-* **From reading the code: `ntfs_attr_map_cluster()` keeps clusters it has
-  freed.** When `ntfs_attr_update_mapping_pairs()` fails after the allocation,
-  `ntfs_cluster_free()` clears the bits of the run the call reports in
-  `$Bitmap`. It leaves the run in the run list, because `__ntfs_cluster_free()`
-  never changes the run list. The next mapping-pairs update writes the run into
-  the attribute, over clusters another file can then allocate. That next update
-  can be `do_write()`'s truncate, or `release_holes()` giving back the holes
-  before it. Without U14 it is worse. When the allocator returned the request
-  in two runs, only the first is freed, and the second stays allocated and
-  mapped with its old contents, where `release_holes()` cannot know of it. Same
-  in v7.1. The call needs to free every run it allocated and punch them out of
-  the run list. No test reaches it: the update has to fail after the allocator
-  has succeeded.
 * **From reading the code: `ntfs_attr_fallocate()` drops a failed zeroing.** It
   tests `if (err > 0)` after `ntfs_dio_zero_range()`, which returns a negative
   errno, so on an I/O error the clusters it maps under `initialized_size` keep
