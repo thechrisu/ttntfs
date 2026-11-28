@@ -505,6 +505,30 @@ int ntfs_ea_pair_exists_vfs(struct inode *vi)
 }
 
 /*
+ * Test hook: remove the $LXMOD EA from a file. The VFS handler gates
+ * $LX* names for every caller through it (ntfs_is_reserved_lxattr),
+ * so the test cannot strip the per-file mode the driver writes on
+ * every create -- and without stripping it, mode_of() returns the
+ * $LXMOD mode and the $SD mode is never observed. The §2.2 ACL test
+ * needs a file with a security descriptor and no $LXMOD, the state
+ * Windows leaves. This calls the same ntfs_set_ea() removal the
+ * handler uses, under the same mrec_lock; it deliberately bypasses
+ * the handler's reserved-name gate and its journal transaction (the
+ * test unmounts cleanly afterwards, which flushes the dirty record).
+ * Returns 0 or a negative errno.
+ */
+int ntfs_ea_remove_lxmod_vfs(struct inode *vi)
+{
+	int err;
+
+	mutex_lock(&NTFS_I(vi)->mrec_lock);
+	err = ntfs_set_ea(vi, "$LXMOD", sizeof("$LXMOD") - 1, NULL, 0,
+			  XATTR_REPLACE, NULL);
+	mutex_unlock(&NTFS_I(vi)->mrec_lock);
+	return err;
+}
+
+/*
  * Check for the presence of an EA "$LXDEV" (used by WSL)
  * and return its value as a device address
  */

@@ -1533,9 +1533,27 @@ second copy. The cache holds computed perm bits per
 (`security_id`, `is_dir`) — keyed by both, not by id alone, because
 `FILE_DELETE_CHILD` maps differently for directories. Pinned by
 `test_sd_lookup` in `core/tests/test_mount.c` (256 → 0440, 257 →
-0660, unknown/0 ids fail, second lookup is a cache hit). Still to
-land: the inode-load hook + `mode_of()` (commit 2), then the write
-path (v2, needs `$Secure` write machinery + new journal builders).
+0660, unknown/0 ids fail, second lookup is a cache hit).
+
+Wiring, commit 2 (2026-11-28, round 34): the inode-load hook +
+`mode_of()` landed, so a file's Unix mode now actually comes from
+its SD. `ntfs_read_locked_inode` reads `security_id` from `$SI` v3
+(72 bytes; the driver still creates v1.2, 48 bytes) and stores the
+parsed perm bits in `ni->sd_perm` under a new `NI_HasSDMode` flag
+(`core/ntfs/inode.h`, `core/vfs/inode.c`); `mode_of()` precedence is
+now symlink → `$LXMOD` → SD → masks, with the READONLY /
+read-only-mount clearing unchanged (`core/vfs/api.c`). Fail-open
+throughout: any lookup error leaves the flag clear and the masks
+decide; `$Secure` itself and inodes loaded before `vol->secure_ino`
+is set are skipped. Pinned end to end by `test_sdmode_wiring` in
+`core/tests/test_links.c`: driver-created file + dir, `$LXMOD`
+stripped via the `ntfs_ea_remove_lxmod_vfs` test hook in
+`core/ntfs/ea.c` (the VFS handler gates `$LX*` for every caller, so
+the test cannot strip it through the handler), `$SI` grown to v3
+and patched to 256/257 by `tools/mkfixtures/patch_sdmode.py`, then
+remounted — file reads 0440, dir 0660, unpatched control stays
+0755. Still to land: the write path (v2, needs `$Secure` write
+machinery + new journal builders).
 
 ### 2.3 No TRIM for SSDs — open, re-examine (2026-11-26)
 Was blocked: no FSKit path to issue discards. Reopened by the

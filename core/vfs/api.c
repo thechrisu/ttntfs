@@ -40,6 +40,7 @@
 #include "mft.h"
 #include "dir.h"
 #include "reparse.h"
+#include "security.h"	/* PORT: §2.2 ACL wiring (NInoHasSDMode) */
 #include "vfs.h"
 #include "journal.h"	/* PORT: Phase 3 setattr journaling */
 #undef ntfs_attr
@@ -165,7 +166,9 @@ static int item_type_of(struct inode *vi)
  * noowners semantics (docs/PORTING.md §6): uid/gid are the mount's, the
  * permission bits come from the masks and the READONLY attribute -- unless
  * the file carries a per-file $LXMOD mode (upstream 4d730a4dd78c), which
- * takes precedence over the mount masks. A symlink is always 0777.
+ * takes precedence over the mount masks, or a mode from its $SD security
+ * descriptor (§2.2 ACL wiring, docs/ACL-DESIGN.md §2.3), which takes
+ * precedence over the masks but not over $LXMOD. A symlink is always 0777.
  */
 static uint32_t mode_of(struct inode *vi)
 {
@@ -178,6 +181,8 @@ static uint32_t mode_of(struct inode *vi)
 		perm = 0777;
 	else if (NInoHasLXMOD(ni))
 		perm = vi->i_mode & 07777;
+	else if (NInoHasSDMode(ni))
+		perm = ni->sd_perm;
 	else if (S_ISDIR(vi->i_mode))
 		perm = 0777 & ~vol->dmask;
 	else

@@ -1085,7 +1085,7 @@ static void test_sd_lookup(void)
 					 .uid = 0, .gid = 0,
 					 .fmask = 022, .dmask = 022 };
 	unsigned int mode;
-	unsigned long hits, misses;
+	unsigned long hits, misses, h0, m0;
 	int err;
 
 	if (copy_fixture("basic-4k.img") != 0) {
@@ -1105,18 +1105,30 @@ static void test_sd_lookup(void)
 	}
 	vol = ((struct ntfs_volume_handle_test *)handle)->vol;
 
+	/* The mount itself warms the cache: mkntfs gives the metadata
+	 * files security_ids (records 1/2/6/8/10 carry 256, 9/11 carry
+	 * 257, confirmed by parsing the image directly) and the
+	 * inode-load hook looks them up as they load. Pin deltas, not
+	 * absolute counts. */
+	ntfs_sd_cache_stats(vol, &hits, &misses);
+	h0 = hits;
+	m0 = misses;
+
 	/* 256: Administrators read-only -> 0440. */
 	mode = 0777;
 	CHECK(ntfs_sd_mode(vol, 256, false, &mode) == 0);
 	CHECK(mode == 0440);
 	/* A second lookup of the same id is a cache hit, same answer. */
-	ntfs_sd_cache_stats(vol, &hits, &misses);
-	CHECK(hits == 0 && misses == 1);
 	mode = 0777;
 	CHECK(ntfs_sd_mode(vol, 256, false, &mode) == 0);
 	CHECK(mode == 0440);
 	ntfs_sd_cache_stats(vol, &hits, &misses);
-	CHECK(hits == 1 && misses == 1);
+	/* Two lookups, one id: exactly two counter events, at least one
+	 * a hit (the second lookup cannot miss -- the first one cached
+	 * it), at most one a miss. */
+	CHECK(hits - h0 + (misses - m0) == 2);
+	CHECK(hits - h0 >= 1);
+	CHECK(misses - m0 <= 1);
 	/* 257: Administrators read+write -> 0660, for a file and for a
 	 * directory (no FILE_DELETE_CHILD here, so the same bits). */
 	mode = 0777;

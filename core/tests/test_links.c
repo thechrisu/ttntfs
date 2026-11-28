@@ -962,6 +962,160 @@ static int dt_type_of(const char *name)
 	return -1;
 }
 
+/* ---- $SD security descriptor -> Unix mode (§2.2 ACL wiring) ---------- */
+
+/* §2.2 ACL test hook (ea.c): remove $LXMOD from a file. Declared here
+ * rather than including ea.h, whose internal headers collide with
+ * ntfscore.h (same reason as ntfs_xattr_handlers above). */
+int ntfs_ea_remove_lxmod_vfs(struct inode *vi);
+
+/* MFT number of a path, via ntfsinfo (same idiom as
+ * test_windows_dir_links). */
+static long sdmode_mftno(const char *path)
+{
+	const char *info = getenv("NTFS_NTFSINFO");
+	char cmd[PATH_MAX * 2 + 256];
+	char line[64];
+	FILE *p;
+	long mftno = -1;
+
+	if (!info)
+		return -1;
+	snprintf(cmd, sizeof(cmd),
+		 "%s -F /%s %s 2>/dev/null | grep -m1 'Dumping Inode' | grep -oE '[0-9]+' | head -1",
+		 info, path, scratch);
+	p = popen(cmd, "r");
+	if (p && fgets(line, sizeof(line), p)) mftno = strtol(line, NULL, 10);
+	if (p) pclose(p);
+	return mftno;
+}
+
+/*
+ * The driver creates $SI as version 1.2 (48 bytes), which has no
+ * security_id slot, and writes $LXMOD on every create -- so a
+ * driver-created file can never carry an SD, and even a patched one
+ * would still read back its $LXMOD mode. tools/mkfixtures/
+ * patch_sdmode.py grows $SI to version 3 (72 bytes) and sets the id,
+ * the way Windows would on first touch; the hook above strips $LXMOD
+ * first, leaving the state Windows leaves: an SD and no $LXMOD. The
+ * image's $SDS holds ids 256 (Administrators read-only) and 257
+ * (Administrators read+write) -- see test_sd_lookup in test_mount.c
+ * for the hand-derived expectations. A file patched to 256 must read
+ * back as 0440, a directory patched to 257 as 0660, and an unpatched
+ * control file must stay on the mount masks (0755 with fmask 022).
+ * With the inode-load hook removed, the patched entries read back
+ * as 0755; with mode_of() still on masks, same.
+ */
+static void test_sdmode_wiring(void)
+{
+	const char *py = getenv("NTFS_PATCH_SDMODE");
+	struct vol v;
+	ntfs_inode_t *d = NULL, *f = NULL, *c = NULL, *l = NULL;
+	struct ntfs_attr at;
+	char cmd[PATH_MAX * 2 + 256];
+	long mftno;
+	int rc;
+
+	printf("test_sdmode_wiring\n");
+	if (!py || !*py || access(py, R_OK) != 0) {
+		fprintf(stderr, "SKIP test_sdmode_wiring: NTFS_PATCH_SDMODE not set\n");
+		return;
+	}
+	if (copy_fixture("basic-4k.img") != 0) {
+		fprintf(stderr, "SKIP test_sdmode_wiring: no fixture\n");
+		return;
+	}
+
+	/* Phase 1: create a file and a directory with the driver. Create
+	 * stores $LXMOD (0644 here), so strip it: without the strip the
+	 * $LXMOD mode would mask the SD entirely. */
+	if (vol_up(&v, 022, 022, 501, 20)) { unlink(scratch); return; }
+	CHECK(ntfs_mkdir(v.root, "sdir", 0755, &d) == 0);
+	CHECK(ntfs_create(v.root, "sfile.txt", 0100644, &f) == 0);
+	CHECK(ntfs_create(v.root, "cfile.txt", 0100644, &c) == 0);
+	if (f) {
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & 07777) == 0644,
+			  "sfile pre-strip mode %o, expected 0644 ($LXMOD)",
+			  at.mode & 07777);
+		CHECK(ntfs_ea_remove_lxmod_vfs((struct inode *)f) == 0);
+		CHECK(ntfs_getattr(f, &at) == 0);
+		CHECK_MSG((at.mode & 07777) == 0755,
+			  "sfile post-strip mode %o, expected 0755 (masks)",
+			  at.mode & 07777);
+		ntfs_inode_put(f); f = NULL;
+	}
+	if (d) {
+		CHECK(ntfs_ea_remove_lxmod_vfs((struct inode *)d) == 0);
+		CHECK(ntfs_getattr(d, &at) == 0);
+		CHECK_MSG((at.mode & 07777) == 0755,
+			  "sdir post-strip mode %o, expected 0755 (masks)",
+			  at.mode & 07777);
+		ntfs_inode_put(d); d = NULL;
+	}
+	if (c) {
+		CHECK(ntfs_ea_remove_lxmod_vfs((struct inode *)c) == 0);
+		ntfs_inode_put(c); c = NULL;
+	}
+	vol_down(&v);
+
+	/* Phase 2: give the file security_id 256 and the directory 257,
+	 * the way Windows would on first touch. */
+	mftno = sdmode_mftno("sfile.txt");
+	CHECK_MSG(mftno > 0, "could not find the MFT number of sfile.txt");
+	if (mftno > 0) {
+		snprintf(cmd, sizeof(cmd), "python3 %s %s %ld 256 >/dev/null 2>&1",
+			 py, scratch, mftno);
+		rc = system(cmd);
+		CHECK_MSG(rc == 0, "patch_sdmode.py failed for sfile.txt (rc %d)", rc);
+	}
+	mftno = sdmode_mftno("sdir");
+	CHECK_MSG(mftno > 0, "could not find the MFT number of sdir");
+	if (mftno > 0) {
+		snprintf(cmd, sizeof(cmd), "python3 %s %s %ld 257 >/dev/null 2>&1",
+			 py, scratch, mftno);
+		rc = system(cmd);
+		CHECK_MSG(rc == 0, "patch_sdmode.py failed for sdir (rc %d)", rc);
+	}
+
+	/* Phase 3: remount and read the modes back. */
+	if (vol_up(&v, 022, 022, 501, 20)) {
+		fprintf(stderr, "FAIL test_sdmode_wiring: remount failed\n");
+		failures++; checks++; unlink(scratch); return;
+	}
+	CHECK(ntfs_lookup(v.root, "sfile.txt", &l) == 0);
+	if (l) {
+		CHECK(ntfs_getattr(l, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFREG,
+			  "sfile type %o is not S_IFREG", at.mode & S_IFMT);
+		CHECK_MSG((at.mode & 07777) == 0440,
+			  "sfile mode %o, expected 0440", at.mode & 07777);
+		ntfs_inode_put(l); l = NULL;
+	}
+	CHECK(ntfs_lookup(v.root, "sdir", &l) == 0);
+	if (l) {
+		CHECK(ntfs_getattr(l, &at) == 0);
+		CHECK_MSG((at.mode & S_IFMT) == S_IFDIR,
+			  "sdir type %o is not S_IFDIR", at.mode & S_IFMT);
+		CHECK_MSG((at.mode & 07777) == 0660,
+			  "sdir mode %o, expected 0660", at.mode & 07777);
+		ntfs_inode_put(l); l = NULL;
+	}
+	CHECK(ntfs_lookup(v.root, "cfile.txt", &l) == 0);
+	if (l) {
+		CHECK(ntfs_getattr(l, &at) == 0);
+		CHECK_MSG((at.mode & 07777) == 0755,
+			  "cfile mode %o, expected 0755 (unpatched control)",
+			  at.mode & 07777);
+		ntfs_inode_put(l); l = NULL;
+	}
+	vol_down(&v);
+	/* The patched $SI (v3, 72 bytes) is standard Windows layout; the
+	 * volume must still be clean for ntfsck. */
+	fsck_clean("sdmode wiring");
+	unlink(scratch);
+}
+
 static void test_interix_symlinks(void)
 {
 	static const uint16_t uni_units[] =
@@ -4569,6 +4723,7 @@ int main(void)
 	test_symlink_tag_choice();
 	test_reparse_index_failure_propagates();
 	test_windows_dir_links();
+	test_sdmode_wiring();
 	test_interix_symlinks();
 	test_symlink_ea_migration();
 	test_symlink_to_directory_is_a_directory_record();

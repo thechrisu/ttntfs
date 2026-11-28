@@ -19,6 +19,7 @@
 #include "ea.h"
 #include "attrib.h"
 #include "object_id.h"
+#include "security.h"	/* PORT: §2.2 ACL wiring (ntfs_sd_mode) */
 #include "journal.h"	/* PORT: Phase 3 truncate journaling */
 #include "vfs.h"	/* PORT */
 
@@ -763,6 +764,40 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	 */
 	inode_set_atime_to_ts(vi, ntfs2utc(si->last_access_time));
 	ni->flags = si->file_attributes;
+
+	/*
+	 * PORT (§2.2 ACL wiring, docs/ACL-DESIGN.md §2.3): remember the
+	 * mode the file's security descriptor grants, for mode_of().
+	 * $SI is version 3 (72 bytes) when the file has a security_id;
+	 * the driver creates version 1.2 (48 bytes), so a driver-created
+	 * file has no SD and keeps the mask mode. Fail-open: any lookup
+	 * error leaves the flag clear and the masks decide, exactly as
+	 * before. Set AND clear: the inode may be re-loaded after the
+	 * $SI was changed. Skipped for $Secure itself (its own SD would
+	 * recurse into the $SDS lookup while $Secure is still loading)
+	 * and while vol->secure_ino is not yet set (metadata inodes
+	 * loaded during mount, before super.c sets it).
+	 */
+	if (!a->non_resident &&
+	    le32_to_cpu(a->data.resident.value_length) >=
+		    offsetof(struct standard_information, ver.v3.security_id) +
+		    sizeof(__le32)) {
+		u32 security_id = le32_to_cpu(si->ver.v3.security_id);
+		unsigned int perm;
+
+		if (security_id && vol->secure_ino &&
+		    vi->i_ino != FILE_Secure &&
+		    ntfs_sd_mode(vol, security_id,
+				  !!(m->flags & MFT_RECORD_IS_DIRECTORY),
+				  &perm) == 0) {
+			ni->sd_perm = perm;
+			NInoSetHasSDMode(ni);
+		} else {
+			NInoClearHasSDMode(ni);
+		}
+	} else {
+		NInoClearHasSDMode(ni);
+	}
 
 	/* Find the attribute list attribute if present. */
 	ntfs_attr_reinit_search_ctx(ctx);

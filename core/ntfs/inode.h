@@ -156,6 +156,13 @@ struct ntfs_inode {
 	 */
 	bool target_volume_abs;
 	__le32 reparse_tag;
+	/*
+	 * PORT (§2.2 ACL wiring): the perm bits (0000-0777, no type bits)
+	 * from the file's $SD security descriptor, valid only when
+	 * NI_HasSDMode is set. mode_of() uses it in place of the mount
+	 * masks; the driver never writes it back (the write path is v2).
+	 */
+	unsigned int sd_perm;
 };
 
 /*
@@ -193,6 +200,9 @@ struct ntfs_inode {
  * NI_BeingCreated		ntfs inode is being created.
  * NI_HasEA			ntfs inode has EA attribute.
  * NI_HasLXMOD			ntfs inode has a $LXMOD EA (per-file mode).
+ * NI_HasSDMode			ntfs inode has a mode from its $SD security
+ *				descriptor (docs/ACL-DESIGN.md §2.3); @sd_perm
+ *				holds the perm bits.
  * NI_RunlistDirty		runlist need to be updated.
  */
 enum {
@@ -214,6 +224,7 @@ enum {
 	NI_BeingCreated,
 	NI_HasEA,
 	NI_HasLXMOD,
+	NI_HasSDMode,
 	NI_DirRecord,		/* MFT_RECORD_IS_DIRECTORY, whatever i_mode says */
 	NI_RunlistDirty,
 };
@@ -275,6 +286,7 @@ TAS_NINO_FNS(FileNameDirty)
 NINO_FNS(BeingDeleted)
 NINO_FNS(HasEA)
 NINO_FNS(HasLXMOD)
+NINO_FNS(HasSDMode)
 NINO_FNS(DirRecord)
 NINO_FNS(RunlistDirty)
 
