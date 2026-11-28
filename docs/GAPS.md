@@ -1242,7 +1242,50 @@ Follow-ups, not this class: the truncate class shares the
 flags-source shape for handler-flagged sparse files (its mapped-`$SI`
 undo would clear SPARSE from the entry after a refresh); the mkdir
 class never stages a `$SI` flags update (see above).
-Next: Phase 4.
+Phase 4, step 1 — periodic checkpoints, landed 2026-11-28 (commit,
+this round): the mechanism, not the flip. `ntfs_log_writer_set_
+checkpoint_every()` sets how many commits run between checkpoints
+(0 clamps to 1, the Phase 2 behaviour); the first commit always
+checkpoints, and a successful checkpoint resets the counter.
+`ntfs_log_txn_commit` checkpoints iff no checkpoint exists yet or
+the counter reached the policy. A refused append is side-effect-free
+(the reserve/wrap pre-check runs before any staging), so the commit
+path retries once after checkpointing when the log fills to the
+reserve with uncheckpointed commits pending (`txn_append_retry`, at
+the four commit-path append sites); a checkpoint never passes an
+active transaction's first record or a dirty page's oldest LSN, so
+records already appended for the transaction stay live, and a second
+failure fails the commit to unjournaled. The Phase 2 comment that a
+committed-but-uncheckpointed transaction is invisible to replay was
+wrong in general: replay walks forward from the last checkpoint
+through every later record, building the transaction and dirty-page
+tables as it goes — only a log with no checkpoint at all replays
+nothing, which the first-commit rule prevents. The default stays 1;
+flipping it to 128 (the design §4.3 start) needs the driver
+walk-count updates and is step 3. Finding, not this step: a
+checkpoint alone does not free log pages in-session — the writer
+never removes dirty-page entries and no `DeleteDirtyClusters`
+emitter exists — so on a long-lived mount the log eventually fills
+and journaling degrades to unjournaled (safe, but the journal stops
+working). The flush notification that retires dirty pages when their
+clusters reach the volume is step 2; the retry here is the safety
+valve, not the wrap fix. Evidence: `test_writer_periodic_checkpoint`
+in `core/logfile/tests/test_logfile.c` — five creates at every=2 and
+at the default, crash-simulated: the walk from `oldest_lsn` sees 62
+client records / 9 dumps at every=2 and 68 / 15 at the default; the
+first walked record is commit 1's `InitializeFileRecordSegment` in
+both runs (commit 1's 2 open records sit before `oldest_lsn`); dry
+and real replays redo all 35 data records in both runs, records
+40..44 in use, bitmap bits 40..44 set, five entries in the parent's
+`$INDEX_ROOT`, second replay redoes 5. Logfile suite 13460 checks,
+0 failures. The test itself caught two things en route, both fixed
+in the test, not the driver: an unbounded index-entry walk (now
+bounded by the record size) and the walk starting at the first
+commit's first LSN, which later checkpoints have correctly moved
+past `oldest_lsn` (the reader refuses anything before oldest).
+Next: Phase 4 step 2 (flush notification / dirty-page retirement),
+then step 3 (flip the default to 128 + driver walk-count updates +
+write-amplification and latency measurement).
 
 ### 1.3 Replay atomicity — proven at the engine level (2026-11-26)
 Gate for §1.2 Phase 0 (as before) and, since 2026-11-26, also a

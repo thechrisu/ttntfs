@@ -3348,6 +3348,214 @@ static void test_journal_create_commit(void)
 }
 
 
+/* Walk counter for the periodic-checkpoint test: the 64-slot rec_seen
+ * collector is too small for five creates, and this test counts
+ * checkpoints, not individual records. first_op is the redo op of the
+ * first client record the walk sees. */
+struct rec_count {
+	int client;
+	int dumps;
+	uint16_t first_op;
+};
+
+static int count_rec(const struct ntfs_log_record *r, void *ctx)
+{
+	struct rec_count *c = ctx;
+
+	if (r->record_type != LFS_RECORD_TYPE_CLIENT)
+		return 0;
+	c->client++;
+	if (c->client == 1)
+		c->first_op = r->redo_op;
+	if (r->redo_op == LOP_TransactionTableDump ||
+	    r->redo_op == LOP_DirtyPageTableDump ||
+	    r->redo_op == LOP_OpenAttributeTableDump)
+		c->dumps++;
+	return 0;
+}
+
+/* One five-create run at a given checkpoint policy (@every == 0 leaves
+ * the default: a checkpoint per commit). Commits 1..5 on records 40..44
+ * (names t0.txt..t4.txt, parent 32), then a crash: the writer is freed
+ * without a clean close, so no final checkpoint lands. The walk counts
+ * the client records and the checkpoint dumps; the dry and real replays
+ * must redo all 35 data records, and the volume must show all five
+ * records in use, bits 40..44 set, and five entries in the parent's
+ * $INDEX_ROOT.
+ *
+ * The walk starts at the log's oldest_lsn, not at the first commit's
+ * first_lsn: by the time the log reopens, later checkpoints have
+ * advanced oldest_lsn past commit 1's two open records. That is correct
+ * oldest accounting, not lost data — the open records belong to a
+ * forgotten transaction and the checkpoint's open-attribute dump
+ * carries their state, so replay never needs them — but it means the
+ * walk sees 2 fewer records than the log holds. The first record the
+ * walk does see must be commit 1's InitializeFileRecordSegment, which
+ * pins exactly which two records precede oldest. */
+static void run_periodic_checkpoint(uint32_t every, int *client_out,
+				    int *dumps_out, int *redone_out,
+				    int *second_out, uint16_t *first_op_out)
+{
+	uint8_t *buf = malloc(LSIZE);
+	struct memio m;
+	struct ntfs_log_io io;
+	ntfs_logfile_t *log;
+	ntfs_log_writer_t *w;
+	ntfs_log_txn_t *t;
+	struct vol v;
+	struct ntfs_log_apply ap;
+	struct ntfs_log_replay_result res;
+	struct rec_count c;
+	uint64_t first_lsn = 0, flsn;
+	char name[8];
+	uint8_t got[VRS];
+	int i, err;
+
+	m.buf = buf;
+	CHECK_EQ(journal_setup(&m, &io, &log, &w), 0);
+	if (every)
+		CHECK_EQ(ntfs_log_writer_set_checkpoint_every(w, every), 0);
+	for (i = 0; i < 5; i++) {
+		snprintf(name, sizeof(name), "t%d.txt", i);
+		CHECK_EQ(ntfs_log_txn_begin(w, &t), 0);
+		CHECK_EQ(stage_create(t, 0x18, 0x40, NEW_REC + i, name,
+				      DIR_REC, (uint64_t)-1), 0);
+		CHECK_EQ(ntfs_log_txn_commit(t, &flsn, NULL), 0);
+		if (i == 0)
+			first_lsn = flsn;
+	}
+	/* Crash: no clean close, no final checkpoint. */
+	ntfs_log_writer_free(w);
+	ntfs_logfile_close(log);
+
+	log = open_log(&m, &io);
+	memset(&c, 0, sizeof(c));
+	{
+		struct ntfs_logfile_info info;
+
+		ntfs_logfile_get_info(log, &info);
+		CHECK(info.oldest_lsn > first_lsn);
+		CHECK_EQ(ntfs_logfile_walk(log, info.oldest_lsn, count_rec, &c), 0);
+	}
+	*client_out = c.client;
+	*dumps_out = c.dumps;
+	*first_op_out = c.first_op;
+	ntfs_logfile_close(log);
+
+	vol_init(&v);
+	vol_apply(&v, &ap);
+	log = open_log(&m, &io);
+	CHECK_EQ(ntfs_logfile_replay(log, &ap, true, &res), 0);
+	CHECK_EQ(res.records_redone, 35);
+	CHECK_EQ(res.transactions_committed, 0);
+	CHECK_EQ(res.transactions_active, 0);
+	CHECK_EQ(res.plan_len, 35);
+	CHECK(!res.needs_chkdsk);
+	ntfs_logfile_close(log);
+
+	CHECK_EQ(ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res), 0);
+	CHECK_EQ(res.records_redone, 35);
+	CHECK(!res.needs_chkdsk);
+	*redone_out = res.records_redone;
+	ntfs_logfile_close(log);
+
+	/* All five records in use, bits 40..44 set, nothing else. */
+	for (i = 0; i < 5; i++) {
+		CHECK_EQ(v_read_mft(&v, NEW_REC + i, got), 0);
+		CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+		CHECK(lf_get16(got + MR_FLAGS) & MFT_RECORD_IN_USE);
+	}
+	CHECK_EQ(v.disk[MFTBMP_LCN * VCS + 5], 0x1f);
+	for (i = 0; i < (int)VCS; i++) {
+		if (i == 5)
+			continue;
+		CHECK_EQ(v.disk[MFTBMP_LCN * VCS + i], 0);
+	}
+
+	/* Parent $INDEX_ROOT holds five entries: the index length grew by
+	 * five entries over the empty directory, and walking the entries
+	 * from the entries offset reaches the END entry after five. */
+	{
+		uint8_t fn_val[128], entry[256];
+		uint32_t fn_vlen, entry_len, index_len;
+		uint16_t ir_off = 0x38 + LF_ALIGN8(AT_RESIDENT_SIZE + 0x30);
+		uint16_t p = ir_off + AT_RESIDENT_SIZE + 16 + 16;
+		uint16_t nentries = 0;
+
+		CHECK_EQ(v_read_mft(&v, DIR_REC, got), 0);
+		CHECK_EQ(ntfs_log_fixup_post_read(got, VRS, 512, NULL), 0);
+		fn_vlen = build_fn_value(fn_val, DIR_REC, "t0.txt");
+		entry_len = build_index_entry(entry, NEW_REC | (1ULL << 48),
+					      fn_val, fn_vlen);
+		index_len = lf_get32(got + ir_off + AT_RESIDENT_SIZE + 16 + 4);
+		CHECK_EQ(index_len, 32 + 5 * entry_len);
+		while (p + 16 <= VRS) {
+			uint16_t elen = lf_get16(got + p + 8);
+			uint16_t eflags = lf_get16(got + p + 12);
+
+			if (elen == 0)
+				break;
+			if (eflags & 2)	/* INDEX_ENTRY_END */
+				break;
+			nentries++;
+			p += elen;
+		}
+		CHECK_EQ(nentries, 5);
+	}
+
+	/* Second replay: the MFT ops are skipped (later MR_LSN), the five
+	 * SetBits re-apply. */
+	err = ntfs_logfile_replay(log = open_log(&m, &io), &ap, false, &res);
+	CHECK_EQ(err, 0);
+	CHECK_EQ(res.records_redone, 5);
+	CHECK_EQ(res.mft_records_written, 0);
+	*second_out = res.records_redone;
+	ntfs_logfile_close(log);
+
+	free(v.disk);
+	free(buf);
+}
+
+/* Phase 4 step 1: checkpoints are periodic, not per commit
+ * (docs/JOURNAL-DESIGN.md §4.3). Replay walks forward from the last
+ * checkpoint through every later record, building the transaction and
+ * dirty-page tables as it goes, so a committed transaction without its
+ * own checkpoint still redoes — the only invisible case is a log with
+ * no checkpoint at all, which the first commit always prevents.
+ *
+ * Each create is 11 client records (2 open + 7 data + Commit +
+ * Forget), plus 3 table dumps when it checkpoints. At every=2 the
+ * checkpoints land after commits 1 (first-commit rule), 2 and 4:
+ * 5*11 + 3*3 = 64 client records, 9 dumps; the walk from oldest_lsn
+ * sees 62 of them (commit 1's 2 open records precede oldest). The
+ * default (every=1) checkpoints all five: 5*11 + 5*3 = 70 records,
+ * 15 dumps; the walk sees 68. Both runs must redo all 35 data
+ * records and leave the same volume: the policy changes how many
+ * checkpoint records the log carries, never what replays. */
+static void test_writer_periodic_checkpoint(void)
+{
+	int client2, dumps2, redone2, second2;
+	int client1, dumps1, redone1, second1;
+	uint16_t first_op2, first_op1;
+
+	printf("test_writer_periodic_checkpoint\n");
+	run_periodic_checkpoint(2, &client2, &dumps2, &redone2, &second2,
+				&first_op2);
+	run_periodic_checkpoint(0, &client1, &dumps1, &redone1, &second1,
+				&first_op1);
+	CHECK_EQ(client2, 62);
+	CHECK_EQ(dumps2, 9);
+	CHECK_EQ(first_op2, LOP_InitializeFileRecordSegment);
+	CHECK_EQ(client1, 68);
+	CHECK_EQ(dumps1, 15);
+	CHECK_EQ(first_op1, LOP_InitializeFileRecordSegment);
+	CHECK_EQ(redone2, 35);
+	CHECK_EQ(second2, 5);
+	CHECK_EQ(redone1, 35);
+	CHECK_EQ(second1, 5);
+}
+
+
 /* UpdateFileNameRoot: a committed transaction that only rewrites the
  * duplicated $FILE_NAME fields (alloc/data sizes, flags) of an entry
  * in the parent's $INDEX_ROOT replays to the new values, and an
@@ -4489,6 +4697,7 @@ int main(void)
 	test_writer_wrap_readback();
 	test_writer_clean_close();
 	test_journal_create_commit();
+	test_writer_periodic_checkpoint();
 	test_update_filename_root();
 	test_journal_create_mft_sizes();
 	test_journal_create_close_dumps_no_phantom();

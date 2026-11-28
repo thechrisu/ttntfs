@@ -106,6 +106,9 @@ struct ntfs_log_writer {
 	bool checkpointed;
 	bool in_checkpoint;		/* checkpoint appends: reserve-exempt */
 	bool closed;			/* clean close done: no more records */
+	uint32_t checkpoint_every;	/* commits between checkpoints (Phase 4);
+					   1 = every commit, the Phase 2 behaviour */
+	uint32_t commits_since_checkpoint;
 
 	/* Restart tables, maintained in memory and dumped by checkpoint().
 	 * Phase 1: only the open-attribute table is populated (by
@@ -393,6 +396,11 @@ int ntfs_log_writer_open(ntfs_logfile_t *log, ntfs_log_writer_t **out)
 		w->checkpoint_lsn = lf_get64(cr + CR_CLIENT_RESTART_LSN);
 		w->checkpointed = w->checkpoint_lsn != 0;
 		w->first_lsn = lf_get64(cr + CR_OLDEST_LSN);
+		/* Phase 4 step 1: the checkpoint policy lives here, not in
+		 * the commit path — 1 keeps the Phase 2 behaviour (a
+		 * checkpoint per commit) until the default flips. */
+		w->checkpoint_every = 1;
+		w->commits_since_checkpoint = 0;
 	}
 	w->seq = log->seq_num;
 	if (!log->current_lsn)
@@ -982,7 +990,24 @@ int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out)
 	w->in_checkpoint = true;
 	err = lw_checkpoint_inner(w, lsn_out);
 	w->in_checkpoint = false;
+	if (!err)
+		w->commits_since_checkpoint = 0;
 	return err;
+}
+
+/* Phase 4 step 1: how often a commit carries a checkpoint. The default
+ * is 1 (every commit, the Phase 2 behaviour); the design (§4.3) starts
+ * the periodic policy at 128 once the driver flips it. 0 clamps to 1:
+ * a checkpoint is what makes the log replayable at all (a log with no
+ * checkpoint replays nothing), so "never checkpoint" is not a policy.
+ * The first commit always checkpoints regardless of this setting (see
+ * ntfs_log_txn_commit), so a fresh log always gains one. */
+int ntfs_log_writer_set_checkpoint_every(ntfs_log_writer_t *w, uint32_t n)
+{
+	if (!w || w->closed)
+		return -EINVAL;
+	w->checkpoint_every = n ? n : 1;
+	return 0;
 }
 
 /* ---- clean close ------------------------------------------------------- */
@@ -1471,6 +1496,34 @@ out:
 	return err;
 }
 
+/* Append one record on the commit path, checkpointing once and retrying
+ * if the log is full to the reserve with uncheckpointed commits pending.
+ * A refused append is side-effect-free (the reserve/wrap pre-check runs
+ * before any staging), so the retry is safe. A checkpoint never passes
+ * an active transaction's first record or a dirty page's oldest LSN
+ * (lw_checkpoint_inner), so records already appended for this
+ * transaction stay live; it frees only the pages before the oldest live
+ * record. If the retry still fails, the commit fails and the caller
+ * falls back to unjournaled — never a corrupt log. (Without a flush
+ * notification the checkpoint may free nothing: dirty-page entries pin
+ * first_lsn until their pages reach the volume. That is Phase 4 step 2;
+ * this helper is the safety valve, not the wrap fix.) */
+static int txn_append_retry(ntfs_log_writer_t *w, uint32_t type, uint32_t tid,
+			    uint64_t undo_next, const void *data, uint32_t len,
+			    uint64_t *lsn_out)
+{
+	int err;
+
+	err = ntfs_log_writer_append(w, type, tid, undo_next, data, len,
+				     lsn_out);
+	if (err == -ENOSPC && w->commits_since_checkpoint > 0) {
+		if (ntfs_log_writer_checkpoint(w, NULL) == 0)
+			err = ntfs_log_writer_append(w, type, tid, undo_next,
+						     data, len, lsn_out);
+	}
+	return err;
+}
+
 /* Append one staged record; update the transaction-table entry. */
 static int txn_append_one(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len,
 			  uint64_t *lsn_out)
@@ -1480,8 +1533,8 @@ static int txn_append_one(ntfs_log_txn_t *t, const uint8_t *rec, uint32_t len,
 	uint64_t lsn;
 	int err;
 
-	err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT, t->tid,
-				     t->last_lsn, rec, len, &lsn);
+	err = txn_append_retry(w, LFS_RECORD_TYPE_CLIENT, t->tid,
+			       t->last_lsn, rec, len, &lsn);
 	if (err)
 		return err;
 	e = w->trtbl.buf + t->tid;
@@ -1606,8 +1659,8 @@ static int txn_append_open_records(ntfs_log_txn_t *t)
 					     name, name_len, &ce, &n);
 			if (err)
 				break;
-			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
-						     t->tid, 0, ce, n, &lsn);
+			err = txn_append_retry(w, LFS_RECORD_TYPE_CLIENT,
+					     t->tid, 0, ce, n, &lsn);
 			free(ce);
 			if (err)
 				break;
@@ -1674,9 +1727,9 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 				     0, 0, 0, 0, NULL, NULL, 0, NULL, 0,
 				     &ce, &n);
 		if (!err) {
-			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
-						     t->tid, t->last_lsn, ce,
-						     n, &clsn);
+			err = txn_append_retry(w, LFS_RECORD_TYPE_CLIENT,
+					       t->tid, t->last_lsn, ce,
+					       n, &clsn);
 			free(ce);
 		}
 	}
@@ -1685,14 +1738,21 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 		e[TR_STATE] = TRANSACTION_COMMITTED;
 		lf_put64(e + TR_PREV_LSN, clsn);
 		lf_put64(e + TR_UNDO_NEXT_LSN, t->last_lsn);
-		/* The checkpoint is what makes the records replayable (see
-		 * the header comment): it dumps the transaction state and
-		 * the dirty pages, and replay walks from it. Phase 4 may
-		 * relax this to a periodic checkpoint once the log has one;
-		 * for Phase 2 every commit carries its own, because a
-		 * committed-but-uncheckpointed transaction is invisible to
-		 * replay. */
-		err = ntfs_log_writer_checkpoint(w, NULL);
+		/* Phase 4 step 1: the checkpoint is periodic, not per
+		 * commit (docs/JOURNAL-DESIGN.md §4.3). Replay walks forward
+		 * from the last checkpoint through every later record,
+		 * building the transaction and dirty-page tables as it
+		 * goes, so a committed transaction without its own
+		 * checkpoint still redoes — the only invisible case is a
+		 * log with no checkpoint at all, which the first commit
+		 * always prevents. (The Phase 2 comment that said a
+		 * committed-but-uncheckpointed transaction is invisible
+		 * was wrong in general; the proof is
+		 * test_writer_periodic_checkpoint.) */
+		w->commits_since_checkpoint++;
+		if (!w->checkpointed ||
+		    w->commits_since_checkpoint >= w->checkpoint_every)
+			err = ntfs_log_writer_checkpoint(w, NULL);
 	}
 	if (!err) {
 		/* Forget: the entry is freed for future checkpoints. The
@@ -1705,9 +1765,9 @@ int ntfs_log_txn_commit(ntfs_log_txn_t *t, uint64_t *first_lsn_out,
 				     0, 0, 0, 0, NULL, NULL, 0, NULL, 0,
 				     &ce, &n);
 		if (!err) {
-			err = ntfs_log_writer_append(w, LFS_RECORD_TYPE_CLIENT,
-						     t->tid, t->last_lsn, ce,
-						     n, NULL);
+			err = txn_append_retry(w, LFS_RECORD_TYPE_CLIENT,
+					       t->tid, t->last_lsn, ce,
+					       n, NULL);
 			free(ce);
 		}
 		if (!err)

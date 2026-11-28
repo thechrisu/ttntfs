@@ -326,6 +326,11 @@ int ntfs_log_writer_open_attr(ntfs_log_writer_t *w, uint32_t type,
 			      const uint16_t *name, uint16_t name_len,
 			      uint32_t *attr_id_out);
 int ntfs_log_writer_checkpoint(ntfs_log_writer_t *w, uint64_t *lsn_out);
+/* Phase 4 step 1: how often a commit carries a checkpoint. n == 0 clamps
+ * to 1 (every commit, the Phase 2 behaviour); the design (§4.3) starts
+ * the periodic policy at 128 once the driver flips it. The first commit
+ * always checkpoints regardless of this setting. */
+int ntfs_log_writer_set_checkpoint_every(ntfs_log_writer_t *w, uint32_t n);
 int ntfs_log_writer_close(ntfs_log_writer_t *w, uint64_t *lsn_out);
 int ntfs_log_writer_sync(ntfs_log_writer_t *w);
 void ntfs_log_writer_free(ntfs_log_writer_t *w);
@@ -336,10 +341,12 @@ void ntfs_log_writer_free(ntfs_log_writer_t *w);
  * ntfs_log_txn_*() builders stage NTFS client records in memory — each
  * describing one sub-mutation with its redo and its undo — and commit()
  * appends them in order, then a CommitTransaction record, then a
- * checkpoint (which is what makes the records replayable: replay walks
- * from the last checkpoint, and the checkpoint's table dumps carry the
- * transaction state and the dirty pages), then a ForgetTransaction
- * record. abort() writes nothing at all.
+ * checkpoint when the periodic policy says so (Phase 4: every N commits,
+ * and always on the first commit — replay walks forward from the last
+ * checkpoint through every later record, so a committed transaction
+ * without its own checkpoint still redoes; only a log with no checkpoint
+ * at all replays nothing), then a ForgetTransaction record. abort()
+ * writes nothing at all.
  *
  * Crash contract: the records are appended synchronously, one by one,
  * so a crash mid-commit leaves a transaction with records but no
