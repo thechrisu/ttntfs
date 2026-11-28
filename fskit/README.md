@@ -123,7 +123,7 @@ load an extension whose provisioning profile does not carry it.
    fails with a permission error, issue #2); the button becomes **Open System
    Settings** and the app waits for FSClient to report the module enabled. There
    the switch works under Extensions → By Category → File System Extensions; the
-   one in the By App list does not stay on (reported on #2, 2026-11-20). The System Settings switch
+   one in the By App list does not stay on (reported on #2, 2026-11-20). The per-release behaviour matrix lives in `docs/ENABLEMENT.md`. The System Settings switch
    (General → Login Items & Extensions → File System Extensions ⓘ) does **not**
    work on macOS 26.3 or 26.6.2: LoginItems.appex calls fskitd as an unentitled
    `FSClient` (it lacks `com.apple.private.LiveFS.connection`, which only the

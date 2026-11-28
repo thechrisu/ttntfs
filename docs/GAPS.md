@@ -1644,7 +1644,12 @@ The System Settings toggle is broken for third-party modules on
 unsandboxed with Developer ID); on macOS 27 the app can no longer edit
 the list and must wait for the user in Settings. Track Apple's
 behaviour per release; keep `fskit/scripts/enable-module.sh` working
-on every supported version.
+on every supported version. Per-release matrix: `docs/ENABLEMENT.md`
+(verified 26.3, 26.6.2, 27; re-verify on each new release — the
+script's version gate and the app's permission fallback are the
+tripwires). Stream D, 2026-11-28: the matrix is written
+(`docs/ENABLEMENT.md`); script hardening, the uninstall guard fix,
+and wiring the script tests into pre-push follow as separate commits.
 
 ### 4.5 No CI signing — blocked (needs a paid Apple Developer account)
 The mount test cannot pass until the app is signed with the managed
